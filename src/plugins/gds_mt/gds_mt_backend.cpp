@@ -282,6 +282,27 @@ nixlGdsMtEngine::deregisterMem (nixlBackendMD *meta) {
 }
 
 nixl_status_t
+nixlGdsMtEngine::checkXferDirection (const nixl_xfer_op_t &operation,
+                                     const nixl_meta_dlist_t &local,
+                                     const nixl_meta_dlist_t &remote) const {
+    const nixl_meta_dlist_t &files = (local.getType() == FILE_SEG) ? local : remote;
+    if (files.getType() != FILE_SEG) {
+        return NIXL_SUCCESS;
+    }
+    for (int i = 0; i < files.descCount(); ++i) {
+        const auto *md = static_cast<const nixlGdsMtMetadata *>(files[i].metadataP);
+        const auto *file_data = md ? std::get_if<FileSegData>(&md->data_) : nullptr;
+        if (file_data && file_data->handle &&
+            !nixl::fileDirectionOk(file_data->handle->file_fd, operation)) {
+            NIXL_ERROR << "GDS_MT: write to read-only (ro) file registration '"
+                       << file_data->handle->file_fd.path() << "' rejected";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
 nixlGdsMtEngine::prepXfer (const nixl_xfer_op_t &operation,
                            const nixl_meta_dlist_t &local,
                            const nixl_meta_dlist_t &remote,

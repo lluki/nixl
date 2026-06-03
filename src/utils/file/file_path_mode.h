@@ -83,11 +83,26 @@ public:
         return path_;
     }
 
+    // Permissive default for fd-mode (we never knew the user fd's mode); false
+    // only for a path-mode `ro:` registration.
+    bool
+    writable() const noexcept {
+        return writable_;
+    }
+
 private:
     int fd_ = -1;
     bool owned_ = false;
+    bool writable_ = true;
     std::string path_;
 };
+
+// True if `op` is permitted given the file's access mode: writes require a
+// writable (rw) registration; reads are always allowed.
+inline bool
+fileDirectionOk(const FileFd &fd, nixl_xfer_op_t op) {
+    return op != NIXL_WRITE || fd.writable();
+}
 
 } // namespace nixl
 

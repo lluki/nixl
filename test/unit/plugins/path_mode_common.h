@@ -128,6 +128,76 @@ doRoundtrip(nixlAgent &agent,
     return ok;
 }
 
+// Register `path` read-only (ro:) and assert WRITE is rejected at createXferReq
+// while READ is accepted. Balanced register/deregister so the fd baseline is
+// unaffected.
+inline bool
+checkReadOnlyEnforced(nixlAgent &agent,
+                      const char *agent_name,
+                      const std::string &path,
+                      size_t size) {
+    nixl_reg_dlist_t file_descs(FILE_SEG);
+    nixlBlobDesc fd;
+    fd.addr = 0;
+    fd.len = size;
+    fd.devId = 0;
+    fd.metaInfo = std::string("ro:") + path;
+    file_descs.addDesc(fd);
+    if (agent.registerMem(file_descs) != NIXL_SUCCESS) {
+        return false;
+    }
+
+    void *buf = allocDram(size);
+    nixl_reg_dlist_t buf_descs(DRAM_SEG);
+    nixlBlobDesc bd;
+    bd.addr = reinterpret_cast<uintptr_t>(buf);
+    bd.len = size;
+    bd.devId = 0;
+    buf_descs.addDesc(bd);
+
+    bool ok = false;
+    if (buf && agent.registerMem(buf_descs) == NIXL_SUCCESS) {
+        nixl_xfer_dlist_t bx = buf_descs.trim();
+        nixl_xfer_dlist_t fx = file_descs.trim();
+        nixlXferReqH *wreq = nullptr;
+        nixlXferReqH *rreq = nullptr;
+        nixl_status_t w = agent.createXferReq(NIXL_WRITE, bx, fx, agent_name, wreq);
+        nixl_status_t r = agent.createXferReq(NIXL_READ, bx, fx, agent_name, rreq);
+        ok = (w == NIXL_ERR_INVALID_PARAM) && (r == NIXL_SUCCESS);
+        if (wreq) {
+            agent.releaseXferReq(wreq);
+        }
+        if (rreq) {
+            agent.releaseXferReq(rreq);
+        }
+        agent.deregisterMem(buf_descs);
+    }
+    if (buf) {
+        free(buf);
+    }
+    if (agent.deregisterMem(file_descs) != NIXL_SUCCESS) {
+        ok = false;
+    }
+    return ok;
+}
+
+// A ro: registration of a missing `path` must fail gracefully, not crash.
+inline bool
+checkMissingFileRejected(nixlAgent &agent, const std::string &path) {
+    nixl_reg_dlist_t file_descs(FILE_SEG);
+    nixlBlobDesc fd;
+    fd.addr = 0;
+    fd.len = 4096;
+    fd.devId = 0;
+    fd.metaInfo = std::string("ro:") + path;
+    file_descs.addDesc(fd);
+    if (agent.registerMem(file_descs) == NIXL_SUCCESS) {
+        agent.deregisterMem(file_descs);
+        return false;
+    }
+    return true;
+}
+
 // 0 on success or SKIP (backend unavailable), 1 on hard failure.
 inline int
 runPathModeSmoke(const char *agent_name,
@@ -161,6 +231,22 @@ runPathModeSmoke(const char *agent_name,
     // Warm-up absorbs backends' lazy-init fds (e.g. libhf3fs's hf3fs_iorcreate) into baseline.
     if (!doRoundtrip(agent, agent_name, path_a, path_b, size, nullptr)) {
         std::cerr << backend_name << " path-mode warm-up FAILED" << std::endl;
+        std::remove(path_a.c_str());
+        std::remove(path_b.c_str());
+        return 1;
+    }
+
+    if (!checkReadOnlyEnforced(agent, agent_name, path_a, size)) {
+        std::cerr << backend_name << " path-mode RO enforcement FAILED" << std::endl;
+        std::remove(path_a.c_str());
+        std::remove(path_b.c_str());
+        return 1;
+    }
+
+    const std::string missing = std::string(file_path) + ".missing";
+    std::remove(missing.c_str());
+    if (!checkMissingFileRejected(agent, missing)) {
+        std::cerr << backend_name << " path-mode missing-file check FAILED" << std::endl;
         std::remove(path_a.c_str());
         std::remove(path_b.c_str());
         return 1;

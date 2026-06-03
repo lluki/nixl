@@ -814,6 +814,15 @@ nixlAgent::makeXferReq (const nixl_xfer_op_t &operation,
         handle->telemetry.descCount = handle->initiatorDescs.descCount();
     }
 
+    nixl_status_t dir_status = handle->engine->checkXferDirection(
+        handle->backendOp, handle->initiatorDescs, handle->targetDescs);
+    if (dir_status != NIXL_SUCCESS) {
+        NIXL_ERROR_FUNC << "operation not permitted for the registered descriptors on backend '"
+                        << backend->getType() << "'";
+        data->addErrorTelemetry(dir_status);
+        return dir_status;
+    }
+
     ret = handle->engine->prepXfer(handle->backendOp,
                                    handle->initiatorDescs,
                                    handle->targetDescs,
@@ -942,6 +951,15 @@ nixlAgent::createXferReq(const nixl_xfer_op_t &operation,
                         << "' does not support notifications";
         data->addErrorTelemetry(NIXL_ERR_BACKEND);
         return NIXL_ERR_BACKEND;
+    }
+
+    nixl_status_t dir_status =
+        handle->engine->checkXferDirection(operation, handle->initiatorDescs, handle->targetDescs);
+    if (dir_status != NIXL_SUCCESS) {
+        NIXL_ERROR_FUNC << "operation not permitted for the registered descriptors on backend '"
+                        << handle->engine->getType() << "'";
+        data->addErrorTelemetry(dir_status);
+        return dir_status;
     }
 
     handle->notifMsg = opt_args.notifMsg;

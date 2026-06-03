@@ -260,6 +260,25 @@ void nixlHf3fsEngine::cleanupIOThread(nixlHf3fsBackendReqH *handle) const
     }
 }
 
+nixl_status_t
+nixlHf3fsEngine::checkXferDirection (const nixl_xfer_op_t &operation,
+                                     const nixl_meta_dlist_t &local,
+                                     const nixl_meta_dlist_t &remote) const {
+    const nixl_meta_dlist_t &files = (local.getType() == FILE_SEG) ? local : remote;
+    if (files.getType() != FILE_SEG) {
+        return NIXL_SUCCESS;
+    }
+    for (int i = 0; i < files.descCount(); ++i) {
+        auto *md = static_cast<const nixlHf3fsFileMetadata *>(files[i].metadataP);
+        if (md && !nixl::fileDirectionOk(md->file_fd, operation)) {
+            NIXL_ERROR << "HF3FS: write to read-only (ro) file registration '"
+                       << md->file_fd.path() << "' rejected";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+    }
+    return NIXL_SUCCESS;
+}
+
 nixl_status_t nixlHf3fsEngine::prepXfer (const nixl_xfer_op_t &operation,
                                          const nixl_meta_dlist_t &local,
                                          const nixl_meta_dlist_t &remote,

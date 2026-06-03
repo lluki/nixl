@@ -109,6 +109,11 @@ public:
     registerMem(const nixlBlobDesc &mem, const nixl_mem_t &nixl_mem, nixlBackendMD *&out) override;
 
     nixl_status_t
+    checkXferDirection(const nixl_xfer_op_t &operation,
+                       const nixl_meta_dlist_t &local,
+                       const nixl_meta_dlist_t &remote) const override;
+
+    nixl_status_t
     deregisterMem(nixlBackendMD *meta) override;
 
     nixl_status_t

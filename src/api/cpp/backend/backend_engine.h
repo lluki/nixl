@@ -223,6 +223,16 @@ class nixlBackendEngine {
 
         // *** Optional virtual methods that are good to be implemented in any backend *** //
 
+        // Checked by the agent during transfer-request creation. Default: any
+        // direction is allowed. Path-mode FILE_SEG backends override this to
+        // reject writes to a read-only (ro:) registration.
+        virtual nixl_status_t
+        checkXferDirection(const nixl_xfer_op_t &operation,
+                           const nixl_meta_dlist_t &local,
+                           const nixl_meta_dlist_t &remote) const {
+            return NIXL_SUCCESS;
+        }
+
         // Query information about a list of memory/storage
         virtual nixl_status_t
         queryMem(const nixl_reg_dlist_t &descs, std::vector<nixl_query_resp_t> &resp) const {

@@ -90,15 +90,18 @@ FileFd::FileFd(int fallback_fd, const std::string &metaInfo) {
     }
     fd_ = fd;
     owned_ = true;
+    writable_ = (spec->flags & O_ACCMODE) != O_RDONLY;
     path_ = std::move(spec->path);
 }
 
 FileFd::FileFd(FileFd &&other) noexcept
     : fd_(other.fd_),
       owned_(other.owned_),
+      writable_(other.writable_),
       path_(std::move(other.path_)) {
     other.fd_ = -1;
     other.owned_ = false;
+    other.writable_ = true;
 }
 
 FileFd &
@@ -109,9 +112,11 @@ FileFd::operator=(FileFd &&other) noexcept {
         }
         fd_ = other.fd_;
         owned_ = other.owned_;
+        writable_ = other.writable_;
         path_ = std::move(other.path_);
         other.fd_ = -1;
         other.owned_ = false;
+        other.writable_ = true;
     }
     return *this;
 }

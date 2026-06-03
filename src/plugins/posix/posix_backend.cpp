@@ -279,6 +279,25 @@ nixlPosixEngine::deregisterMem(nixlBackendMD *meta) {
 }
 
 nixl_status_t
+nixlPosixEngine::checkXferDirection(const nixl_xfer_op_t &operation,
+                                    const nixl_meta_dlist_t &local,
+                                    const nixl_meta_dlist_t &remote) const {
+    const nixl_meta_dlist_t &files = (local.getType() == FILE_SEG) ? local : remote;
+    if (files.getType() != FILE_SEG) {
+        return NIXL_SUCCESS;
+    }
+    for (int i = 0; i < files.descCount(); ++i) {
+        auto *md = static_cast<const nixlPosixFileMD *>(files[i].metadataP);
+        if (md && !nixl::fileDirectionOk(md->file_fd, operation)) {
+            NIXL_ERROR << "POSIX: write to read-only (ro) file registration '"
+                       << md->file_fd.path() << "' rejected";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
 nixlPosixEngine::prepXfer(const nixl_xfer_op_t &operation,
                           const nixl_meta_dlist_t &local,
                           const nixl_meta_dlist_t &remote,
