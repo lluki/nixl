@@ -87,6 +87,8 @@ fi
 python3 test/python/prep_xfer_perf.py list
 python3 test/python/prep_xfer_perf.py array
 
+python3 test/python/path_mode_gil_microbench.py --counts 64,256 --repeats 1
+
 echo "==== Running python examples ===="
 cd examples/python
 python3 partial_md_example.py --init-port "$(get_next_tcp_port)" --target-port "$(get_next_tcp_port)"
