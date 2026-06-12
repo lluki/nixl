@@ -62,7 +62,7 @@ if 'OBJ' in static_plugins
         'OBJ',
         obj_sources,
         dependencies: plugin_deps,
-        cpp_args: compile_defs + compile_flags,
+        cpp_args: ['-fPIC'],
         include_directories: [nixl_inc_dirs, utils_inc_dirs],
         install: false,
         name_prefix: 'libplugin_')  # Custom prefix for plugin libraries

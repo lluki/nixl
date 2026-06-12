@@ -11,10 +11,13 @@
 #include <aws/s3-crt/model/GetObjectRequest.h>
 #include <aws/s3-crt/model/HeadObjectRequest.h>
 #include <aws/s3-crt/S3CrtErrors.h>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 #include <absl/strings/str_format.h>
 #include <iostream>
+#include <string>
 #include "common/nixl_log.h"
 
 awsS3CrtClient::awsS3CrtClient(nixl_b_params_t *custom_params,
@@ -22,6 +25,23 @@ awsS3CrtClient::awsS3CrtClient(nixl_b_params_t *custom_params,
     : awsS3Client(custom_params, executor) {
     // Initialize AWS SDK (thread-safe, only happens once)
     nixl_s3_utils::initAWSSDK();
+
+    // NIXL addition: optionally raise the aws-c-io channel fragment size, which
+    // bounds the per-socket read() size (default KB_16 = 16 KiB). Must be set
+    // before the S3CrtClient creates its bootstrap/channels. Process-global.
+    if (const char *frag = std::getenv("NIXL_OBJ_CRT_FRAGMENT_SIZE")) {
+        const size_t v = std::strtoull(frag, nullptr, 10);
+        // g_aws_channel_max_fragment_size lives in libaws-c-io (not on libnixl's
+        // direct link line); resolve it at runtime. It is a process-global that
+        // bounds the per-socket read() size (default 16 KiB).
+        auto *frag_size = static_cast<size_t *>(dlsym(RTLD_DEFAULT, "g_aws_channel_max_fragment_size"));
+        if (v > 0 && frag_size) {
+            *frag_size = v;
+            NIXL_INFO << "CRT channel max fragment size overridden to " << v << " bytes";
+        } else if (!frag_size) {
+            NIXL_WARN << "Could not resolve g_aws_channel_max_fragment_size; fragment size unchanged";
+        }
+    }
 
     // Create S3 CRT client configuration
     Aws::S3Crt::ClientConfiguration config;
@@ -38,6 +58,28 @@ awsS3CrtClient::awsS3CrtClient(nixl_b_params_t *custom_params,
     if (crt_min_limit > 0) {
         config.partSize = crt_min_limit;
         config.multipartUploadThreshold = crt_min_limit;
+    }
+
+    // NIXL additions: CRT concurrency / chunking knobs.
+    //  - throughput_target_gbps: the primary CRT concurrency lever; aws-c-s3
+    //    opens enough parallel connections to reach this target (default 10.0).
+    //  - part_size: chunk size for parallel multipart up/download; defaults to
+    //    whatever crtMinLimit set above (else the SDK's 8 MiB). Decouples size
+    //    from the crtMinLimit routing threshold.
+    //  - max_connections: standard-client (libcurl) pool size; the CRT engine
+    //    runs its own connection manager off throughputTargetGbps and largely
+    //    ignores this, but we honor it for completeness.
+    if (const auto opt =
+            nixl::getBackendParamOptional<std::string>(custom_params, "throughput_target_gbps")) {
+        config.throughputTargetGbps = std::stod(*opt);
+        NIXL_INFO << "CRT throughputTargetGbps set to " << config.throughputTargetGbps;
+    }
+    config.partSize =
+        nixl::getBackendParamDefaulted<size_t>(custom_params, "part_size", config.partSize);
+    if (const auto opt = nixl::getBackendParamOptional<unsigned>(custom_params, "max_connections")) {
+        config.maxConnections = *opt;
+        NIXL_INFO << "CRT maxConnections set to " << config.maxConnections
+                  << " (note: used by the standard HTTP pool, not the CRT engine)";
     }
 
     auto credentials_opt = nixl_s3_utils::createAWSCredentials(custom_params);

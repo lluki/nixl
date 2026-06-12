@@ -19,10 +19,31 @@
 #define OBJ_PLUGIN_AWS_SDK_INIT_H
 
 #include <aws/core/Aws.h>
+#include <aws/core/utils/logging/ConsoleLogSystem.h>
+#include <aws/core/utils/logging/DefaultCRTLogSystem.h>
+#include <aws/core/utils/logging/LogLevel.h>
+#include <memory>
 #include <mutex>
 #include <cstdlib>
+#include <strings.h>
 
 namespace nixl_s3_utils {
+
+// Local NIXL addition: map the NIXL_OBJ_AWS_LOG env var to an AWS SDK log level.
+// Off (default) preserves upstream behaviour (no SDK logging). Debug/Trace make
+// the AWS SDK log every HTTP request (and Trace, the wire-level detail) to stderr.
+inline Aws::Utils::Logging::LogLevel
+nixlParseAwsLogLevel(const char *s) {
+    using L = Aws::Utils::Logging::LogLevel;
+    if (!s || !*s) return L::Off;
+    if (!strcasecmp(s, "Trace")) return L::Trace;
+    if (!strcasecmp(s, "Debug")) return L::Debug;
+    if (!strcasecmp(s, "Info")) return L::Info;
+    if (!strcasecmp(s, "Warn")) return L::Warn;
+    if (!strcasecmp(s, "Error")) return L::Error;
+    if (!strcasecmp(s, "Fatal")) return L::Fatal;
+    return L::Off;
+}
 
 /**
  * Initialize the AWS SDK in a thread-safe manner.
@@ -39,6 +60,22 @@ initAWSSDK() {
 
     std::call_once(aws_init_flag, []() {
         aws_options = new Aws::SDKOptions();
+
+        // NIXL addition: enable AWS SDK logging when NIXL_OBJ_AWS_LOG is set.
+        // Routes to stderr (ConsoleLogSystem) for both the standard S3 client
+        // and the CRT client (crt_logger), so every HTTP request is visible.
+        const Aws::Utils::Logging::LogLevel level =
+            nixlParseAwsLogLevel(std::getenv("NIXL_OBJ_AWS_LOG"));
+        if (level != Aws::Utils::Logging::LogLevel::Off) {
+            aws_options->loggingOptions.logLevel = level;
+            aws_options->loggingOptions.logger_create_fn = [level]() {
+                return std::make_shared<Aws::Utils::Logging::ConsoleLogSystem>(level);
+            };
+            aws_options->loggingOptions.crt_logger_create_fn = [level]() {
+                return std::make_shared<Aws::Utils::Logging::DefaultCRTLogSystem>(level);
+            };
+        }
+
         Aws::InitAPI(*aws_options);
 
         // Register cleanup at program exit

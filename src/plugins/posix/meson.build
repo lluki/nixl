@@ -64,7 +64,7 @@ if 'POSIX' in static_plugins
         posix_sources,
         dependencies: plugin_deps,
         link_args: plugin_link_args,
-        cpp_args: compile_defs + compile_flags,
+        cpp_args: compile_defs + ['-fPIC'],
         include_directories: [nixl_inc_dirs, utils_inc_dirs],
         install: false,
         name_prefix: 'libplugin_')  # Custom prefix for plugin libraries
