@@ -146,12 +146,15 @@ awsS3CrtClient::getObjectAsync(std::string_view key,
 
 void
 awsS3CrtClient::checkObjectExistsAsync(std::string_view key, check_object_callback_t callback) {
-    Aws::S3Crt::Model::HeadObjectRequest request;
-    request.WithBucket(bucketName_).WithKey(Aws::String(key));
+    // The CRT SDK retains a raw pointer to the request until its async callbacks
+    // finish, so keep it alive just like the PutObject and GetObject requests.
+    auto request =
+        Aws::MakeShared<Aws::S3Crt::Model::HeadObjectRequest>("HeadObjectRequest");
+    request->WithBucket(bucketName_).WithKey(Aws::String(key));
 
     s3CrtClient_->HeadObjectAsync(
-        request,
-        [callback](const Aws::S3Crt::S3CrtClient *,
+        *request,
+        [callback, request](const Aws::S3Crt::S3CrtClient *,
                    const Aws::S3Crt::Model::HeadObjectRequest &,
                    const Aws::S3Crt::Model::HeadObjectOutcome &outcome,
                    const std::shared_ptr<const Aws::Client::AsyncCallerContext> &) {
