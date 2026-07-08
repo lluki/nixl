@@ -26,6 +26,21 @@ Optionally POSIX plugin can also use liburing.
 `"<modes>:<path>"` string in `metaInfo` (path-mode, backend owns the
 open/close); see [`src/utils/file/README.md`](../../utils/file/README.md#path-mode-file-registration).
 
+## io_uring forced asynchronous execution
+
+When io_uring is selected, `uring_force_async=true` sets `IOSQE_ASYNC` on
+every read and write SQE. This immediately offloads requests to io-wq helper
+threads instead of first attempting them in the submitting task. The option
+defaults to `true` when io_uring is selected; set it to `false` to preserve
+the normal issue path. An explicit `true` is rejected unless
+`use_uring=true` selects the io_uring queue.
+
+```cpp
+nixl_b_params_t params;
+params["use_uring"] = "true";
+params["uring_force_async"] = "true";
+```
+
 ## Dependencies
 To enable Linux AIO support, you need to install the libaio package:
 

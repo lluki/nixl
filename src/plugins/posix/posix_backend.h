@@ -78,6 +78,7 @@ public:
 class nixlPosixEngine : public nixlBackendEngine {
 private:
     std::string_view io_queue_type_;
+    bool uring_force_async_;
     mutable std::unique_ptr<nixlPosixIOQueue> io_queue_;
     mutable nixlLock io_queue_lock_;
     nixl::PathModeDevIdRegistry path_mode_devids_;

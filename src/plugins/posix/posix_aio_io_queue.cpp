@@ -176,6 +176,9 @@ nixlPosixIOQueueAIO::poll(void) {
 }
 
 std::unique_ptr<nixlPosixIOQueue>
-nixlPosixIOQueueAIOCreate(uint32_t ios_pool_size, uint32_t kernel_queue_size) {
+nixlPosixIOQueueAIOCreate(uint32_t ios_pool_size,
+                          uint32_t kernel_queue_size,
+                          bool uring_force_async) {
+    (void)uring_force_async;
     return std::make_unique<nixlPosixIOQueueAIO>(ios_pool_size, kernel_queue_size);
 }

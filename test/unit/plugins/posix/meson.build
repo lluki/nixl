@@ -34,4 +34,17 @@ if has_posix_plugin
                                 cpp_args: posix_test_compile_defs,
                                 install: true)
     test('posix_plugin_test', nixl_posix_app)
+
+    if has_io_uring
+        nixl_posix_uring_force_async_test = executable(
+            'nixl_posix_uring_force_async_test',
+            'nixl_posix_uring_force_async_test.cpp',
+            dependencies: [nixl_dep, nixl_infra, file_utils_interface,
+                           absl_log_dep, io_uring_dep],
+            include_directories: [nixl_inc_dirs, utils_inc_dirs,
+                                  include_directories('../../../../src/plugins/posix')],
+            cpp_args: posix_test_compile_defs,
+            install: false)
+        test('posix_uring_force_async_test', nixl_posix_uring_force_async_test)
+    endif
 endif

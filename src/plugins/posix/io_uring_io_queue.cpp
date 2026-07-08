@@ -16,6 +16,7 @@
  */
 
 #include "io_queue.h"
+#include "io_uring_queue_utils.h"
 #include "common/nixl_log.h"
 #include <liburing.h>
 #include <absl/strings/str_format.h>
@@ -37,7 +38,9 @@ public:
 
 class nixlPosixIOQueueUring : public nixlPosixIOQueueImpl<nixlPosixIoUringIO> {
 public:
-    nixlPosixIOQueueUring(uint32_t ios_pool_size, uint32_t kernel_queue_size);
+    nixlPosixIOQueueUring(uint32_t ios_pool_size,
+                          uint32_t kernel_queue_size,
+                          bool uring_force_async);
 
     virtual nixl_status_t
     post(void) override;
@@ -61,10 +64,14 @@ protected:
 
 private:
     struct io_uring uring; // The io_uring instance for async I/O operations
+    bool uring_force_async_;
 };
 
-nixlPosixIOQueueUring::nixlPosixIOQueueUring(uint32_t ios_pool_size, uint32_t kernel_queue_size)
-    : nixlPosixIOQueueImpl<nixlPosixIoUringIO>(ios_pool_size, kernel_queue_size) {
+nixlPosixIOQueueUring::nixlPosixIOQueueUring(uint32_t ios_pool_size,
+                                             uint32_t kernel_queue_size,
+                                             bool uring_force_async)
+    : nixlPosixIOQueueImpl<nixlPosixIoUringIO>(ios_pool_size, kernel_queue_size),
+      uring_force_async_(uring_force_async) {
     io_uring_params params = {};
     int ret = io_uring_queue_init_params(kernel_queue_size_, &uring, &params);
     if (ret < 0) {
@@ -91,12 +98,8 @@ nixlPosixIOQueueUring::post(void) {
             return NIXL_ERR_BACKEND;
         }
 
-        if (io->read_) {
-            io_uring_prep_read(sqe, io->fd, io->buf_, io->len_, io->offset_);
-        } else {
-            io_uring_prep_write(sqe, io->fd, io->buf_, io->len_, io->offset_);
-        }
-
+        nixlPosixPrepareUringSqe(
+            sqe, io->fd, io->buf_, io->len_, io->offset_, io->read_, uring_force_async_);
         io_uring_sqe_set_data(sqe, io);
     }
 
@@ -184,6 +187,9 @@ nixlPosixIOQueueUring::~nixlPosixIOQueueUring() {
 }
 
 std::unique_ptr<nixlPosixIOQueue>
-nixlPosixIOQueueUringCreate(uint32_t ios_pool_size, uint32_t kernel_queue_size) {
-    return std::make_unique<nixlPosixIOQueueUring>(ios_pool_size, kernel_queue_size);
+nixlPosixIOQueueUringCreate(uint32_t ios_pool_size,
+                            uint32_t kernel_queue_size,
+                            bool uring_force_async) {
+    return std::make_unique<nixlPosixIOQueueUring>(
+        ios_pool_size, kernel_queue_size, uring_force_async);
 }

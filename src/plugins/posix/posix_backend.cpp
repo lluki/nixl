@@ -204,11 +204,30 @@ nixlPosixBackendReqH::postXfer() {
 nixlPosixEngine::nixlPosixEngine(const nixlBackendInitParams *init_params)
     : nixlBackendEngine(init_params),
       io_queue_type_(getIoQueueType(init_params->customParams)),
-      io_queue_(nixlPosixIOQueue::instantiate(
-          io_queue_type_,
-          nixl::getBackendParamDefaulted(init_params->customParams, "ios_pool_size", 0u),
-          nixl::getBackendParamDefaulted(init_params->customParams, "kernel_queue_size", 0u))),
+      uring_force_async_(
+          nixl::getBackendParamOptional<bool>(init_params->customParams, "uring_force_async")
+              .value_or(io_queue_type_ == "URING")),
+      io_queue_(
+          (!uring_force_async_ || io_queue_type_ == "URING") ?
+              nixlPosixIOQueue::instantiate(
+                  io_queue_type_,
+                  nixl::getBackendParamDefaulted(init_params->customParams, "ios_pool_size", 0u),
+                  nixl::getBackendParamDefaulted(init_params->customParams,
+                                                 "kernel_queue_size",
+                                                 0u),
+                  uring_force_async_) :
+              nullptr),
       io_queue_lock_(init_params->syncMode) {
+    const auto explicit_force_async =
+        nixl::getBackendParamOptional<bool>(init_params->customParams, "uring_force_async");
+    if (explicit_force_async.value_or(false) &&
+        (!nixl::getBackendParamDefaulted(init_params->customParams, "use_uring", false) ||
+         io_queue_type_ != "URING")) {
+        initErr = true;
+        NIXL_ERROR << "Failed to initialize POSIX backend - uring_force_async requires "
+                      "use_uring=true and io_uring to be selected";
+        return;
+    }
     if (io_queue_type_.empty()) {
         initErr = true;
         NIXL_ERROR << "Failed to initialize POSIX backend - no supported io queue type found";
@@ -220,8 +239,10 @@ nixlPosixEngine::nixlPosixEngine(const nixlBackendInitParams *init_params)
                    << io_queue_type_;
         return;
     }
-    NIXL_INFO << absl::StrFormat("POSIX backend initialized using io queue type: %s",
-                                 io_queue_type_);
+    NIXL_INFO << absl::StrFormat(
+        "POSIX backend initialized using io queue type: %s, uring_force_async: %s",
+        io_queue_type_,
+        uring_force_async_ ? "true" : "false");
 }
 
 nixl_status_t

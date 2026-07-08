@@ -31,7 +31,8 @@ class nixlPosixIOQueue {
 public:
     using nixlPosixIOQueueCreateFn =
         std::function<std::unique_ptr<nixlPosixIOQueue>(uint32_t ios_pool_size,
-                                                        uint32_t kernel_queue_size)>;
+                                                        uint32_t kernel_queue_size,
+                                                        bool uring_force_async)>;
 
     nixlPosixIOQueue(uint32_t ios_pool_size, uint32_t kernel_queue_size)
         : ios_pool_size_(normalizedIOSPoolSize(ios_pool_size)),
@@ -53,7 +54,10 @@ public:
     poll(void) = 0;
 
     static std::unique_ptr<nixlPosixIOQueue>
-    instantiate(std::string_view io_queue_type, uint32_t ios_pool_size, uint32_t kernel_queue_size);
+    instantiate(std::string_view io_queue_type,
+                uint32_t ios_pool_size,
+                uint32_t kernel_queue_size,
+                bool uring_force_async);
     static std::string_view
     getDefaultIoQueueType(void);
 

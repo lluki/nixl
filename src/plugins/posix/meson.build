@@ -43,7 +43,7 @@ endif
 
 if has_io_uring
     compile_defs += ['-DHAVE_LIBURING']
-    posix_sources += ['io_uring_io_queue.cpp']
+    posix_sources += ['io_uring_io_queue.cpp', 'io_uring_queue_utils.h']
     plugin_deps += [ io_uring_dep ]
     message('liburing found, adding io_uring support')
 else
