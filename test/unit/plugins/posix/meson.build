@@ -34,4 +34,33 @@ if has_posix_plugin
                                 cpp_args: posix_test_compile_defs,
                                 install: true)
     test('posix_plugin_test', nixl_posix_app)
+
+    if host_machine.system() == 'linux'
+        posix_worker_pool_test = executable(
+            'posix_worker_pool_test',
+            'posix_worker_pool_test.cpp',
+            '../../../../src/plugins/posix/posix_worker_pool.cpp',
+            dependencies: [thread_dep],
+            include_directories: [include_directories('../../../../src/plugins/posix')],
+            install: false)
+        test('posix_worker_pool_test', posix_worker_pool_test)
+    endif
+
+    posix_threaded_test = executable(
+        'posix_threaded_test',
+        'posix_threaded_test.cpp',
+        dependencies: [nixl_dep, nixl_infra, file_utils_interface, absl_log_dep],
+        include_directories: [nixl_inc_dirs, utils_inc_dirs,
+                              include_directories('..')],
+        cpp_args: posix_test_compile_defs,
+        install: false)
+    if has_linux_aio
+        test('posix_threaded_aio_test', posix_threaded_test)
+        test('posix_threaded_aio_unpin_test', posix_threaded_test,
+             args: ['--unpin'])
+    endif
+    if has_io_uring
+        test('posix_threaded_uring_test', posix_threaded_test,
+             args: ['--uring'])
+    endif
 endif

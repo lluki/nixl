@@ -26,6 +26,28 @@ Optionally POSIX plugin can also use liburing.
 `"<modes>:<path>"` string in `metaInfo` (path-mode, backend owns the
 open/close); see [`src/utils/file/README.md`](../../utils/file/README.md#path-mode-file-registration).
 
+## Worker threads
+
+The backend accepts two optional parameters:
+
+- `thread_num` (default `1`): With the default, path-mode opens and I/O queue
+  operations execute directly on the caller. Values greater than one create that
+  many workers, each with an independent AIO/io_uring queue. Path-mode opens and
+  transfer requests are assigned to workers in round-robin order.
+- `thread_unpin` (default `false`, Linux only): Expand each worker's CPU
+  affinity to all configured CPUs instead of inheriting the caller's affinity.
+  Kernel cpuset/cgroup restrictions still apply. This is useful when the caller
+  is CPU- or NUMA-pinned but file I/O should be scheduled freely.
+
+For example:
+
+```cpp
+nixl_b_params_t params;
+params["thread_num"] = "4";
+params["thread_unpin"] = "true";
+params["use_uring"] = "true";
+```
+
 ## Dependencies
 To enable Linux AIO support, you need to install the libaio package:
 

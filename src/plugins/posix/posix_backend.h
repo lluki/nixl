@@ -18,7 +18,9 @@
 #ifndef NIXL_SRC_PLUGINS_POSIX_POSIX_BACKEND_H
 #define NIXL_SRC_PLUGINS_POSIX_POSIX_BACKEND_H
 
+#include <cstddef>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -27,7 +29,7 @@
 #include "backend/backend_engine.h"
 #include "file/file_path_mode.h"
 #include "io_queue.h"
-#include "sync.h"
+#include "posix_worker_pool.h"
 
 // POSIX reuses the shared owned-fd base (path-mode devId stored for dereg).
 using nixlPosixFileMD = nixlFilePathMD;
@@ -39,7 +41,9 @@ private:
     const nixl_meta_dlist_t &remote; // Remote memory descriptor list
     const int queue_depth_; // Queue depth for async I/O
     int num_confirmed_ios_; // Number of confirmed IOs
-    std::unique_ptr<nixlPosixIOQueue> &io_queue_; // Async I/O queue instance
+    nixlPosixIOQueue &io_queue_; // Async I/O queue assigned to this request
+    const size_t worker_index_;
+    nixl_status_t post_status_ = NIXL_SUCCESS;
 
     void
     ioDone(uint32_t data_size, int error);
@@ -50,15 +54,23 @@ public:
     nixlPosixBackendReqH(const nixl_xfer_op_t &operation,
                          const nixl_meta_dlist_t &local,
                          const nixl_meta_dlist_t &remote,
-                         std::unique_ptr<nixlPosixIOQueue> &io_queue);
-    ~nixlPosixBackendReqH() {};
+                         nixlPosixIOQueue &io_queue,
+                         size_t worker_index);
+    ~nixlPosixBackendReqH(){};
 
     nixl_status_t
     postXfer();
+    void
+    postXferOnWorker() noexcept;
     nixl_status_t
     prepXfer();
     nixl_status_t
     checkXfer();
+
+    size_t
+    workerIndex() const noexcept {
+        return worker_index_;
+    }
 
     // Exception classes
     class exception : public std::exception {
@@ -78,9 +90,21 @@ public:
 class nixlPosixEngine : public nixlBackendEngine {
 private:
     std::string_view io_queue_type_;
+    uint32_t ios_pool_size_;
+    uint32_t kernel_queue_size_;
+    size_t thread_num_;
+    bool thread_unpin_;
     mutable std::unique_ptr<nixlPosixIOQueue> io_queue_;
-    mutable nixlLock io_queue_lock_;
+    mutable std::vector<std::unique_ptr<nixlPosixIOQueue>> worker_io_queues_;
+    std::unique_ptr<nixlPosixWorkerPool> worker_pool_;
     nixl::PathModeDevIdRegistry path_mode_devids_;
+
+    size_t
+    selectWorker() const;
+    nixlPosixIOQueue &
+    queueForWorker(size_t worker_index) const;
+    void
+    invokeWorker(size_t worker_index, std::function<void()> task) const;
 
 public:
     nixlPosixEngine(const nixlBackendInitParams *init_params);

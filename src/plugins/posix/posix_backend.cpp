@@ -124,13 +124,15 @@ logOnPercentStep(unsigned int completed, unsigned int total) {
 nixlPosixBackendReqH::nixlPosixBackendReqH(const nixl_xfer_op_t &op,
                                            const nixl_meta_dlist_t &loc,
                                            const nixl_meta_dlist_t &rem,
-                                           std::unique_ptr<nixlPosixIOQueue> &io_queue)
+                                           nixlPosixIOQueue &io_queue,
+                                           size_t worker_index)
     : operation(op),
       local(loc),
       remote(rem),
       queue_depth_(loc.descCount()),
       num_confirmed_ios_(queue_depth_),
-      io_queue_(io_queue) {
+      io_queue_(io_queue),
+      worker_index_(worker_index) {
     NIXL_ASSERT(local.descCount());
     NIXL_ASSERT(remote.descCount());
 }
@@ -154,11 +156,14 @@ nixlPosixBackendReqH::prepXfer() {
 
 nixl_status_t
 nixlPosixBackendReqH::checkXfer() {
+    if (post_status_ < 0) {
+        return post_status_;
+    }
     if (num_confirmed_ios_ == queue_depth_) {
         return NIXL_SUCCESS;
     }
 
-    nixl_status_t status = io_queue_->poll();
+    nixl_status_t status = io_queue_.poll();
     if (status < 0) {
         return status;
     }
@@ -168,24 +173,19 @@ nixlPosixBackendReqH::checkXfer() {
 
 nixl_status_t
 nixlPosixBackendReqH::postXfer() {
-    if (__builtin_expect(!io_queue_, 0)) {
-        NIXL_ERROR << "POSIX I/O queue is not initialized";
-        return NIXL_ERR_BACKEND;
-    }
-
     num_confirmed_ios_ = 0;
 
     for (auto [local_it, remote_it] = std::make_pair(local.begin(), remote.begin());
          local_it != local.end() && remote_it != remote.end();
          ++local_it, ++remote_it) {
         int fd = static_cast<nixlPosixFileMD *>(remote_it->metadataP)->file_fd.fd();
-        nixl_status_t status = io_queue_->enqueue(fd,
-                                                  reinterpret_cast<void *>(local_it->addr),
-                                                  remote_it->len,
-                                                  remote_it->addr,
-                                                  operation == NIXL_READ,
-                                                  ioDoneClb,
-                                                  this);
+        nixl_status_t status = io_queue_.enqueue(fd,
+                                                 reinterpret_cast<void *>(local_it->addr),
+                                                 remote_it->len,
+                                                 remote_it->addr,
+                                                 operation == NIXL_READ,
+                                                 ioDoneClb,
+                                                 this);
 
         if (status != NIXL_SUCCESS) {
             // Currently we do not support partial submissions, so it's all or nothing
@@ -194,7 +194,22 @@ nixlPosixBackendReqH::postXfer() {
         }
     }
 
-    return io_queue_->post();
+    return io_queue_.post();
+}
+
+void
+nixlPosixBackendReqH::postXferOnWorker() noexcept {
+    try {
+        post_status_ = postXfer();
+    }
+    catch (const std::exception &e) {
+        NIXL_ERROR << "Unexpected error posting POSIX transfer on worker: " << e.what();
+        post_status_ = NIXL_ERR_BACKEND;
+    }
+    catch (...) {
+        NIXL_ERROR << "Unknown error posting POSIX transfer on worker";
+        post_status_ = NIXL_ERR_BACKEND;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -204,24 +219,79 @@ nixlPosixBackendReqH::postXfer() {
 nixlPosixEngine::nixlPosixEngine(const nixlBackendInitParams *init_params)
     : nixlBackendEngine(init_params),
       io_queue_type_(getIoQueueType(init_params->customParams)),
-      io_queue_(nixlPosixIOQueue::instantiate(
-          io_queue_type_,
-          nixl::getBackendParamDefaulted(init_params->customParams, "ios_pool_size", 0u),
-          nixl::getBackendParamDefaulted(init_params->customParams, "kernel_queue_size", 0u))),
-      io_queue_lock_(init_params->syncMode) {
+      ios_pool_size_(
+          nixl::getBackendParamDefaulted(init_params->customParams, "ios_pool_size", 0u)),
+      kernel_queue_size_(
+          nixl::getBackendParamDefaulted(init_params->customParams, "kernel_queue_size", 0u)),
+      thread_num_(
+          nixl::getBackendParamDefaulted(init_params->customParams, "thread_num", size_t{1})),
+      thread_unpin_(
+          nixl::getBackendParamDefaulted(init_params->customParams, "thread_unpin", false)),
+      io_queue_(
+          thread_num_ == 1 ?
+              nixlPosixIOQueue::instantiate(io_queue_type_, ios_pool_size_, kernel_queue_size_) :
+              nullptr) {
+    if (thread_num_ == 0) {
+        initErr = true;
+        NIXL_ERROR << "Failed to initialize POSIX backend - thread_num must be at least 1";
+        return;
+    }
     if (io_queue_type_.empty()) {
         initErr = true;
         NIXL_ERROR << "Failed to initialize POSIX backend - no supported io queue type found";
         return;
     }
-    if (!io_queue_) {
+
+    try {
+        if (thread_num_ == 1) {
+            if (!io_queue_) {
+                throw std::runtime_error(
+                    absl::StrFormat("unavailable io queue type requested: %s", io_queue_type_));
+            }
+        } else {
+            worker_io_queues_.reserve(thread_num_);
+            for (size_t i = 0; i < thread_num_; ++i) {
+                auto io_queue = nixlPosixIOQueue::instantiate(
+                    io_queue_type_, ios_pool_size_, kernel_queue_size_);
+                if (!io_queue) {
+                    throw std::runtime_error(
+                        absl::StrFormat("unavailable io queue type requested: %s", io_queue_type_));
+                }
+                worker_io_queues_.push_back(std::move(io_queue));
+            }
+            worker_pool_ = std::make_unique<nixlPosixWorkerPool>(thread_num_, thread_unpin_);
+        }
+    }
+    catch (const std::exception &e) {
         initErr = true;
-        NIXL_ERROR << "Failed to initialize POSIX backend - unavailable io queue type requested: "
-                   << io_queue_type_;
+        NIXL_ERROR << "Failed to initialize POSIX backend: " << e.what();
         return;
     }
-    NIXL_INFO << absl::StrFormat("POSIX backend initialized using io queue type: %s",
-                                 io_queue_type_);
+
+    NIXL_INFO << absl::StrFormat(
+        "POSIX backend initialized using io queue type: %s, thread_num: %zu, thread_unpin: %s",
+        io_queue_type_,
+        thread_num_,
+        thread_unpin_ ? "true" : "false");
+}
+
+size_t
+nixlPosixEngine::selectWorker() const {
+    return worker_pool_ ? worker_pool_->nextWorker() : 0;
+}
+
+nixlPosixIOQueue &
+nixlPosixEngine::queueForWorker(size_t worker_index) const {
+    return worker_pool_ ? *worker_io_queues_.at(worker_index) : *io_queue_;
+}
+
+void
+nixlPosixEngine::invokeWorker(size_t worker_index, std::function<void()> task) const {
+    if (worker_pool_) {
+        worker_pool_->invoke(worker_index, std::move(task));
+    } else {
+        task();
+    }
 }
 
 nixl_status_t
@@ -239,10 +309,23 @@ nixlPosixEngine::registerMem(const nixlBlobDesc &mem,
                 return NIXL_ERR_INVALID_PARAM;
             }
             try {
-                out = new nixlPosixFileMD(mem.devId, mem.metaInfo);
+                std::unique_ptr<nixlPosixFileMD> file_md;
+                if (worker_pool_ && nixl::parsePathMeta(mem.metaInfo)) {
+                    const size_t worker_index = selectWorker();
+                    invokeWorker(worker_index, [&]() {
+                        file_md = std::make_unique<nixlPosixFileMD>(mem.devId, mem.metaInfo);
+                    });
+                } else {
+                    file_md = std::make_unique<nixlPosixFileMD>(mem.devId, mem.metaInfo);
+                }
+                out = file_md.release();
             }
             catch (const std::system_error &e) {
                 NIXL_ERROR << "POSIX path-mode open failed: " << e.what();
+                return NIXL_ERR_BACKEND;
+            }
+            catch (const std::exception &e) {
+                NIXL_ERROR << "POSIX path-mode worker failed: " << e.what();
                 return NIXL_ERR_BACKEND;
             }
             resv.commit();
@@ -279,10 +362,11 @@ nixlPosixEngine::prepXfer(const nixl_xfer_op_t &operation,
     }
 
     try {
-        auto posix_handle =
-            std::make_unique<nixlPosixBackendReqH>(operation, local, remote, io_queue_);
-        NIXL_LOCK_GUARD(io_queue_lock_);
-        nixl_status_t status = posix_handle->prepXfer();
+        const size_t worker_index = selectWorker();
+        auto posix_handle = std::make_unique<nixlPosixBackendReqH>(
+            operation, local, remote, queueForWorker(worker_index), worker_index);
+        nixl_status_t status = NIXL_SUCCESS;
+        invokeWorker(worker_index, [&]() { status = posix_handle->prepXfer(); });
         if (status != NIXL_SUCCESS) {
             return status;
         }
@@ -309,7 +393,15 @@ nixlPosixEngine::postXfer(const nixl_xfer_op_t &operation,
                           const nixl_opt_b_args_t *opt_args) const {
     try {
         auto &posix_handle = castPosixHandle(handle);
-        NIXL_LOCK_GUARD(io_queue_lock_);
+        if (worker_pool_) {
+            if (!worker_pool_->submit(posix_handle.workerIndex(),
+                                      [&posix_handle]() { posix_handle.postXferOnWorker(); })) {
+                NIXL_ERROR << "POSIX worker pool rejected transfer submission";
+                return NIXL_ERR_BACKEND;
+            }
+            return NIXL_IN_PROG;
+        }
+
         nixl_status_t status = posix_handle.postXfer();
         if (status != NIXL_IN_PROG) {
             NIXL_ERROR << "Error in submitting queue";
@@ -320,21 +412,28 @@ nixlPosixEngine::postXfer(const nixl_xfer_op_t &operation,
         NIXL_ERROR << e.what();
         return e.code();
     }
-    return NIXL_ERR_BACKEND;
+    catch (const std::exception &e) {
+        NIXL_ERROR << "Unexpected error submitting POSIX transfer: " << e.what();
+        return NIXL_ERR_BACKEND;
+    }
 }
 
 nixl_status_t
 nixlPosixEngine::checkXfer(nixlBackendReqH *handle) const {
     try {
         auto &posix_handle = castPosixHandle(handle);
-        NIXL_LOCK_GUARD(io_queue_lock_);
-        return posix_handle.checkXfer();
+        nixl_status_t status = NIXL_SUCCESS;
+        invokeWorker(posix_handle.workerIndex(), [&]() { status = posix_handle.checkXfer(); });
+        return status;
     }
     catch (const nixlPosixBackendReqH::exception &e) {
         NIXL_ERROR << e.what();
         return e.code();
     }
-    return NIXL_ERR_BACKEND;
+    catch (const std::exception &e) {
+        NIXL_ERROR << "Unexpected error checking POSIX transfer: " << e.what();
+        return NIXL_ERR_BACKEND;
+    }
 }
 
 nixl_status_t
@@ -350,8 +449,9 @@ nixlPosixEngine::queryMem(const nixl_reg_dlist_t &descs,
     // Extract metadata from descriptors which are file names
     // Different plugins might customize parsing of metaInfo to get the file names
     std::vector<nixl_blob_t> metadata(descs.descCount());
-    for (int i = 0; i < descs.descCount(); ++i)
+    for (int i = 0; i < descs.descCount(); ++i) {
         metadata[i] = descs[i].metaInfo;
+    }
 
     return nixl::queryFileInfoList(metadata, resp);
 }

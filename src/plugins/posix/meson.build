@@ -18,13 +18,15 @@ if not has_posix_plugin
     subdir_done()
 endif
 
-plugin_deps = [nixl_infra, nixl_common_dep, file_utils_interface]
+plugin_deps = [nixl_infra, nixl_common_dep, file_utils_interface, thread_dep]
 
 # Define base source files
 posix_sources = [
     'posix_backend.cpp',
     'posix_backend.h',
     'posix_plugin.cpp',
+    'posix_worker_pool.cpp',
+    'posix_worker_pool.h',
     'io_queue.h',
     'io_queue.cpp'
 ]
