@@ -39,12 +39,16 @@ private:
     const nixl_meta_dlist_t &remote; // Remote memory descriptor list
     const int queue_depth_; // Queue depth for async I/O
     int num_confirmed_ios_; // Number of confirmed IOs
+    bool any_failed_; // Set if any io of the current transfer failed
+    bool cancel_requested_; // Set once cancel() has been issued for this transfer
     std::unique_ptr<nixlPosixIOQueue> &io_queue_; // Async I/O queue instance
 
     void
     ioDone(uint32_t data_size, int error);
     static void
     ioDoneClb(void *ctx, uint32_t data_size, int error);
+    nixl_status_t
+    processQueueStatus(nixl_status_t status);
 
 public:
     nixlPosixBackendReqH(const nixl_xfer_op_t &operation,

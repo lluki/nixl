@@ -34,6 +34,441 @@
 #include <stdexcept>
 #include <cstdio>
 #include <getopt.h>
+#include <csignal>
+#include <chrono>
+#include <thread>
+#include <sys/resource.h>
+
+// io_uring submission fault-injection checks.
+#ifdef HAVE_LIBURING
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <liburing.h>
+
+#include "io_queue.h"
+
+extern "C" int
+__real_io_uring_submit(struct io_uring *ring);
+
+extern "C" int
+__wrap_io_uring_submit(struct io_uring *ring);
+
+namespace {
+
+constexpr int kRequestCount = 32;
+constexpr int kRequestsPerTransfer = kRequestCount / 2;
+constexpr int kRingEntries = 16;
+constexpr size_t kBlockSize = 4096;
+constexpr int kMaxPollIterations = 2000;
+constexpr auto kPollPause = std::chrono::microseconds(50);
+
+using Buffers = std::array<std::array<char, kBlockSize>, kRequestCount + 1>;
+
+enum class SubmitMode {
+    PartialOnly,
+    FailSecond,
+    BusyWhileCqReady,
+    PassThrough,
+};
+
+SubmitMode submit_mode = SubmitMode::PassThrough;
+int submit_calls = 0;
+int busy_submit_errors = 0;
+unsigned first_ready = 0;
+unsigned first_submitted = 0;
+struct io_uring *wrapped_ring = nullptr;
+
+struct CompletionState {
+    int count = 0;
+    int errors = 0;
+};
+
+void
+completionCallback(void *ctx, uint32_t, int error) {
+    auto *state = static_cast<CompletionState *>(ctx);
+    state->count++;
+    state->errors += error != 0;
+}
+
+nixl_status_t
+requestStatus(const CompletionState &state, int expected) {
+    if (state.count != expected) {
+        return NIXL_IN_PROG;
+    }
+    return state.errors == 0 ? NIXL_SUCCESS : NIXL_ERR_BACKEND;
+}
+
+void
+resetSubmitMock(SubmitMode mode) {
+    submit_mode = mode;
+    submit_calls = 0;
+    busy_submit_errors = 0;
+    first_ready = 0;
+    first_submitted = 0;
+    wrapped_ring = nullptr;
+}
+
+int
+createTempFile(const char *pattern) {
+    char path[128];
+    std::strncpy(path, pattern, sizeof(path));
+    path[sizeof(path) - 1] = '\0';
+    const int fd = mkstemp(path);
+    if (fd >= 0) {
+        unlink(path);
+    }
+    return fd;
+}
+
+nixl_status_t
+enqueueRange(nixlPosixIOQueue &queue,
+             int fd,
+             Buffers &buffers,
+             int start,
+             int count,
+             CompletionState &state) {
+    for (int i = start; i < start + count; i++) {
+        const nixl_status_t status = queue.enqueue(fd,
+                                                  buffers[i].data(),
+                                                  buffers[i].size(),
+                                                  i * kBlockSize,
+                                                  false,
+                                                  completionCallback,
+                                                  &state);
+        if (status != NIXL_SUCCESS) {
+            return status;
+        }
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+drainQueue(nixlPosixIOQueue &queue) {
+    nixl_status_t status = NIXL_IN_PROG;
+    for (int i = 0; i < kMaxPollIterations && status == NIXL_IN_PROG; i++) {
+        status = queue.poll();
+        std::this_thread::sleep_for(kPollPause);
+    }
+    return status;
+}
+
+bool
+waitForCompletion(void) {
+    for (int i = 0; i < kMaxPollIterations; i++) {
+        if (wrapped_ring && io_uring_cq_ready(wrapped_ring) != 0) {
+            return true;
+        }
+        std::this_thread::sleep_for(kPollPause);
+    }
+    return false;
+}
+
+int
+testPartialSubmitAndSqExhaustion(Buffers &buffers) {
+    const int fd = createTempFile("/tmp/nixl_uring_partial_submit_XXXXXX");
+    if (fd < 0) {
+        std::cerr << "mkstemp failed" << std::endl;
+        return 1;
+    }
+
+    resetSubmitMock(SubmitMode::PartialOnly);
+    auto queue = nixlPosixIOQueue::instantiate("URING", 64, kRingEntries);
+    CompletionState first;
+    nixl_status_t status = enqueueRange(*queue, fd, buffers, 0, kRequestCount, first);
+    if (status == NIXL_SUCCESS) {
+        status = queue->post();
+    }
+
+    // The 17th get_sqe() must return nullptr. The wrapped submit observes the
+    // 16 prepared entries and forces half of them to remain pending.
+    if (status != NIXL_IN_PROG || first_ready != kRingEntries ||
+        first_submitted != kRingEntries / 2) {
+        std::cerr << "failed to create SQ exhaustion and partial submission: status=" << status
+                  << " ready=" << first_ready << " submitted=" << first_submitted << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    // A null external context must not select the private queue-wide cancellation path.
+    // Check this after submission so any accidental cancellation would affect ring-owned ios.
+    const nixl_status_t cancel_status = queue->cancel(nullptr);
+    if (cancel_status != NIXL_ERR_INVALID_PARAM) {
+        std::cerr << "cancel(nullptr) was not rejected: status=" << cancel_status << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    status = drainQueue(*queue);
+    if (status != NIXL_SUCCESS || first.count != kRequestCount || first.errors != 0 ||
+        submit_calls != 3) {
+        std::cerr << "partial submission did not drain: status=" << status
+                  << " completions=" << first.count << " errors=" << first.errors
+                  << " submit_calls=" << submit_calls << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    queue.reset();
+    close(fd);
+    return 0;
+}
+
+int
+testSubmissionFailureCancelsAll(Buffers &buffers) {
+    const int fd = createTempFile("/tmp/nixl_uring_submit_failure_XXXXXX");
+    if (fd < 0) {
+        std::cerr << "mkstemp failed" << std::endl;
+        return 1;
+    }
+
+    resetSubmitMock(SubmitMode::FailSecond);
+    auto queue = nixlPosixIOQueue::instantiate("URING", 64, kRingEntries);
+    CompletionState first;
+    CompletionState second;
+
+    nixl_status_t status =
+        enqueueRange(*queue, fd, buffers, 0, kRequestsPerTransfer, first);
+    if (status == NIXL_SUCCESS) {
+        status = enqueueRange(
+            *queue, fd, buffers, kRequestsPerTransfer, kRequestsPerTransfer, second);
+    }
+    if (status == NIXL_SUCCESS) {
+        status = queue->post();
+    }
+    if (status != NIXL_IN_PROG || first_ready != kRingEntries ||
+        first_submitted != kRingEntries / 2) {
+        std::cerr << "failed to prepare mixed failure batch: status=" << status
+                  << " ready=" << first_ready << " submitted=" << first_submitted << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    // The retry contains the first transfer's pending SQEs and newly prepared
+    // SQEs from the second transfer. Inject a fatal error for that mixed batch.
+    status = queue->poll();
+    if (status >= 0) {
+        std::cerr << "second io_uring_submit did not report the injected error" << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+    if (requestStatus(first, kRequestsPerTransfer) != NIXL_IN_PROG ||
+        requestStatus(second, kRequestsPerTransfer) != NIXL_IN_PROG) {
+        std::cerr << "a caller became terminal before queue-wide cleanup completed" << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    CompletionState rejected;
+    status = queue->enqueue(fd,
+                            buffers.back().data(),
+                            buffers.back().size(),
+                            kRequestCount * kBlockSize,
+                            false,
+                            completionCallback,
+                            &rejected);
+    if (status >= 0) {
+        std::cerr << "queue accepted new work while submission-failure cleanup was pending"
+                  << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    status = drainQueue(*queue);
+    if (status != NIXL_SUCCESS ||
+        requestStatus(first, kRequestsPerTransfer) != NIXL_ERR_BACKEND ||
+        requestStatus(second, kRequestsPerTransfer) != NIXL_ERR_BACKEND ||
+        rejected.count != 0) {
+        std::cerr << "queue-wide failure did not drain cleanly: status=" << status
+                  << " first=" << first.count << "/" << first.errors
+                  << " second=" << second.count << "/" << second.errors
+                  << " rejected=" << rejected.count << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    resetSubmitMock(SubmitMode::PassThrough);
+    if (ftruncate(fd, 0) != 0) {
+        std::cerr << "ftruncate failed" << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    CompletionState follow_up;
+    status = queue->enqueue(fd,
+                            buffers.back().data(),
+                            buffers.back().size(),
+                            0,
+                            false,
+                            completionCallback,
+                            &follow_up);
+    if (status == NIXL_SUCCESS) {
+        status = queue->post();
+    }
+    if (status == NIXL_IN_PROG) {
+        status = drainQueue(*queue);
+    }
+    const off_t actual_size = lseek(fd, 0, SEEK_END);
+    if (status != NIXL_SUCCESS || follow_up.count != 1 || follow_up.errors != 0 ||
+        actual_size != static_cast<off_t>(kBlockSize)) {
+        std::cerr << "follow-up transfer failed: status=" << status
+                  << " completions=" << follow_up.count << " errors=" << follow_up.errors
+                  << " size=" << actual_size << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    queue.reset();
+    close(fd);
+    return 0;
+}
+
+int
+testBusySubmissionReapsCompletions(Buffers &buffers) {
+    const int fd = createTempFile("/tmp/nixl_uring_submit_busy_XXXXXX");
+    if (fd < 0) {
+        std::cerr << "mkstemp failed" << std::endl;
+        return 1;
+    }
+
+    resetSubmitMock(SubmitMode::BusyWhileCqReady);
+    auto queue = nixlPosixIOQueue::instantiate("URING", 64, kRingEntries);
+    CompletionState state;
+    nixl_status_t status = enqueueRange(*queue, fd, buffers, 0, kRequestCount, state);
+    if (status == NIXL_SUCCESS) {
+        status = queue->post();
+    }
+    if (status != NIXL_IN_PROG || !waitForCompletion()) {
+        std::cerr << "failed to prepare completions for EBUSY injection" << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    status = queue->poll();
+    if (status >= 0 || busy_submit_errors == 0) {
+        std::cerr << "failed to inject EBUSY while CQEs were ready" << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    // A submission error must not prevent poll() from reaping the CQ. Continue
+    // polling through repeated EBUSY results until the failure drain completes.
+    for (int i = 0; i < kMaxPollIterations && queue->isSubmissionFailureDraining(); i++) {
+        queue->poll();
+        std::this_thread::sleep_for(kPollPause);
+    }
+
+    if (queue->isSubmissionFailureDraining() || state.count != kRequestCount ||
+        state.errors != kRequestCount) {
+        std::cerr << "EBUSY failure drain stalled: completions=" << state.count
+                  << " errors=" << state.errors << " busy_errors=" << busy_submit_errors
+                  << std::endl;
+        queue.reset();
+        close(fd);
+        return 1;
+    }
+
+    resetSubmitMock(SubmitMode::PassThrough);
+    queue.reset();
+    close(fd);
+    return 0;
+}
+
+} // namespace
+
+extern "C" int
+__wrap_io_uring_submit(struct io_uring *ring) {
+    wrapped_ring = ring;
+    if (submit_mode == SubmitMode::BusyWhileCqReady) {
+        if (io_uring_cq_ready(ring) != 0) {
+            busy_submit_errors++;
+            return -EBUSY;
+        }
+        return __real_io_uring_submit(ring);
+    }
+
+    const unsigned ready = io_uring_sq_ready(ring);
+    if (ready == 0) {
+        // Empty submits may still flush completion-side state. Pass them through,
+        // but do not count them as submission attempts for fault injection.
+        return __real_io_uring_submit(ring);
+    }
+
+    submit_calls++;
+    if (submit_mode == SubmitMode::PassThrough) {
+        return __real_io_uring_submit(ring);
+    }
+
+    if (submit_calls == 2 && submit_mode == SubmitMode::FailSecond) {
+        return -EIO;
+    }
+
+    if (submit_calls != 1 || ready < 2) {
+        return __real_io_uring_submit(ring);
+    }
+
+    const unsigned original_tail = ring->sq.sqe_tail;
+
+    const unsigned partial = ready / 2;
+    first_ready = ready;
+    ring->sq.sqe_tail = ring->sq.sqe_head + partial;
+    const int ret = __real_io_uring_submit(ring);
+    ring->sq.sqe_tail = original_tail;
+    first_submitted = ret > 0 ? static_cast<unsigned>(ret) : 0;
+    return ret;
+}
+
+int
+runUringSubmissionTests() {
+    struct io_uring probe_ring = {};
+    struct io_uring_params probe_params = {};
+    const int probe_status =
+        io_uring_queue_init_params(kRingEntries, &probe_ring, &probe_params);
+    if (probe_status < 0) {
+        if (probe_status == -ENOSYS || probe_status == -EPERM || probe_status == -EACCES) {
+            std::cout << "io_uring submission tests skipped: runtime unavailable ("
+                      << std::strerror(-probe_status) << ")" << std::endl;
+            return 0;
+        }
+        std::cerr << "io_uring runtime probe failed: " << std::strerror(-probe_status)
+                  << std::endl;
+        return 1;
+    }
+    io_uring_queue_exit(&probe_ring);
+
+    Buffers buffers{};
+    for (size_t i = 0; i < buffers.size(); i++) {
+        std::memset(buffers[i].data(), static_cast<int>(i + 1), buffers[i].size());
+    }
+
+    if (testPartialSubmitAndSqExhaustion(buffers) != 0) {
+        return 1;
+    }
+    if (testSubmissionFailureCancelsAll(buffers) != 0) {
+        return 1;
+    }
+    if (testBusySubmissionReapsCompletions(buffers) != 0) {
+        return 1;
+    }
+
+    std::cout << "partial submission, SQ exhaustion, EBUSY reaping, and queue-wide recovery "
+                 "succeeded"
+              << std::endl;
+    return 0;
+}
+#endif
 
 namespace {
     const size_t page_size = sysconf(_SC_PAGESIZE);
@@ -991,6 +1426,360 @@ runFdModeReuseCheck() {
     return 0;
 }
 
+// Force a short write (RLIMIT_FSIZE) on a queue; expect an error + recovery; -1 if absent.
+int
+short_write_case(const std::string &test_files_dir_path_abs_path,
+                 const std::string &queue,
+                 const std::string &param_key,
+                 int n_desc) {
+    print_segment_title(
+        phase_title(absl::StrFormat("Short-write / ENOSPC: %s x%d", queue, n_desc)));
+
+    const size_t cap = page_size;
+    const size_t transfer_size = 4 * page_size;
+
+    nixl_b_params_t params;
+    params[param_key] = "true";
+
+    nixlAgentConfig cfg(false);
+    nixlAgent agent("POSIXEnospcTester", cfg);
+    nixlBackendH *posix = nullptr;
+    if (agent.createBackend("POSIX", params, posix) != NIXL_SUCCESS) {
+        std::cout << queue << ": backend unavailable, skipping" << std::endl;
+        return -1;
+    }
+
+    tempFile fd(test_files_dir_path_abs_path + "/enospc_" + queue + "_" + test_file_name,
+                O_RDWR | O_CREAT | O_TRUNC);
+
+    nixl_reg_dlist_t dram_for_posix(DRAM_SEG);
+    nixl_reg_dlist_t file_for_posix(FILE_SEG);
+    nixl_xfer_dlist_t dram_xfer(DRAM_SEG);
+    nixl_xfer_dlist_t file_xfer(FILE_SEG);
+
+    std::vector<std::unique_ptr<void, PosixMemalignDeleter>> bufs;
+    for (int i = 0; i < n_desc; i++) {
+        void *ptr;
+        if (posix_memalign(&ptr, page_size, transfer_size) != 0) {
+            std::cerr << "DRAM allocation failed" << std::endl;
+            return 1;
+        }
+        bufs.emplace_back(ptr);
+        fill_test_pattern(ptr, read_write_test_phrase, transfer_size);
+
+        nixlBlobDesc dram_desc;
+        dram_desc.addr = (uintptr_t)ptr;
+        dram_desc.len = transfer_size;
+        dram_desc.devId = 0;
+        dram_for_posix.addDesc(dram_desc);
+        dram_xfer.addDesc(dram_desc);
+
+        nixlBlobDesc file_desc;
+        file_desc.addr = 0;
+        file_desc.len = transfer_size;
+        file_desc.devId = fd;
+        file_for_posix.addDesc(file_desc);
+        file_xfer.addDesc(file_desc);
+    }
+
+    if (agent.registerMem(dram_for_posix) != NIXL_SUCCESS ||
+        agent.registerMem(file_for_posix) != NIXL_SUCCESS) {
+        std::cerr << "Failed to register memory" << std::endl;
+        return 1;
+    }
+
+    nixlXferReqH *treq = nullptr;
+    if (agent.createXferReq(NIXL_WRITE, dram_xfer, file_xfer, "POSIXEnospcTester", treq) !=
+        NIXL_SUCCESS) {
+        std::cerr << "Failed to create transfer request" << std::endl;
+        return 1;
+    }
+
+    // cap file size to force a short write; ignore SIGXFSZ defensively
+    signal(SIGXFSZ, SIG_IGN);
+    struct rlimit saved{};
+    getrlimit(RLIMIT_FSIZE, &saved);
+    struct rlimit rl{cap, saved.rlim_max};
+    if (setrlimit(RLIMIT_FSIZE, &rl) != 0) {
+        std::cerr << "setrlimit(RLIMIT_FSIZE) failed" << std::endl;
+        agent.releaseXferReq(treq);
+        return 1;
+    }
+
+    nixl_status_t status = agent.postXferReq(treq);
+    while (status == NIXL_IN_PROG) {
+        status = agent.getXferStatus(treq);
+    }
+    setrlimit(RLIMIT_FSIZE, &saved);
+
+    std::cout << queue << ": " << n_desc << " desc, status " << nixlEnumStrings::statusStr(status)
+              << std::endl;
+
+    agent.releaseXferReq(treq);
+
+    int rc = 0;
+    if (status >= 0) {
+        std::cerr << queue << ": short write reported as success -- ENOSPC not propagated"
+                  << std::endl;
+        rc = 1;
+    } else {
+        std::cout << queue << ": short write correctly surfaced as error" << std::endl;
+        // a normal write reusing the same queue must still succeed after the failure
+        nixlXferReqH *treq2 = nullptr;
+        if (agent.createXferReq(NIXL_WRITE, dram_xfer, file_xfer, "POSIXEnospcTester", treq2) !=
+                NIXL_SUCCESS ||
+            treq2 == nullptr) {
+            std::cerr << queue << ": failed to create follow-up transfer request" << std::endl;
+            rc = 1;
+        } else {
+            nixl_status_t status2 = agent.postXferReq(treq2);
+            while (status2 == NIXL_IN_PROG) {
+                status2 = agent.getXferStatus(treq2);
+            }
+            agent.releaseXferReq(treq2);
+            if (status2 != NIXL_SUCCESS || lseek(fd, 0, SEEK_END) != (off_t)transfer_size) {
+                std::cerr << queue << ": transfer after a failed one did not cleanly succeed"
+                          << std::endl;
+                rc = 1;
+            }
+        }
+    }
+
+    {
+        nixl_reg_dlist_t one(FILE_SEG);
+        nixlBlobDesc fd_desc;
+        fd_desc.addr = 0;
+        fd_desc.len = transfer_size;
+        fd_desc.devId = fd;
+        one.addDesc(fd_desc);
+        for (int i = 0; i < n_desc; i++) {
+            agent.deregisterMem(one);
+        }
+    }
+    agent.deregisterMem(dram_for_posix);
+    return rc;
+}
+
+// Two transfers share one backend's io queue. A (ios exceed the file-size cap) must
+// fail; B (a large, valid write) must still succeed. A scoped cancel of A's ios must
+// not disturb B's un-submitted ios.
+int
+concurrent_cancel_scoping_case(const std::string &dir,
+                               const std::string &queue,
+                               const std::string &param_key) {
+    print_segment_title(phase_title(absl::StrFormat("Cancel scoping: %s", queue)));
+
+    // paired with the 20us poll_pause below: ~3s backstop before declaring a stall
+    constexpr int max_poll_iters = 150000;
+    const size_t cap = 2 * page_size;
+    const size_t a_size = 4 * page_size; // > cap -> short write, A fails
+    const size_t b_size = page_size; // <= cap -> B succeeds
+    const int a_desc = 4;
+    const int b_desc = 512; // large: leaves un-submitted ios when A's cancel fires
+
+    nixl_b_params_t params;
+    params[param_key] = "true";
+
+    nixlAgentConfig cfg(false);
+    nixlAgent agent("POSIXScopingTester", cfg);
+    nixlBackendH *posix = nullptr;
+    if (agent.createBackend("POSIX", params, posix) != NIXL_SUCCESS) {
+        std::cout << queue << ": backend unavailable, skipping" << std::endl;
+        return -1;
+    }
+
+    tempFile fd_a(dir + "/scope_a_" + queue + "_" + test_file_name, O_RDWR | O_CREAT | O_TRUNC);
+    tempFile fd_b(dir + "/scope_b_" + queue + "_" + test_file_name, O_RDWR | O_CREAT | O_TRUNC);
+
+    nixl_reg_dlist_t dram_reg(DRAM_SEG);
+    nixl_reg_dlist_t file_reg(FILE_SEG);
+    nixl_xfer_dlist_t dram_a(DRAM_SEG), file_a(FILE_SEG);
+    nixl_xfer_dlist_t dram_b(DRAM_SEG), file_b(FILE_SEG);
+
+    std::vector<std::unique_ptr<void, PosixMemalignDeleter>> bufs;
+    auto add =
+        [&](int n, size_t sz, int fd, nixl_xfer_dlist_t &dram_x, nixl_xfer_dlist_t &file_x) -> int {
+        for (int i = 0; i < n; i++) {
+            void *ptr;
+            if (posix_memalign(&ptr, page_size, sz) != 0) {
+                std::cerr << "DRAM allocation failed" << std::endl;
+                return 1;
+            }
+            bufs.emplace_back(ptr);
+            fill_test_pattern(ptr, read_write_test_phrase, sz);
+
+            nixlBlobDesc dram_desc;
+            dram_desc.addr = (uintptr_t)ptr;
+            dram_desc.len = sz;
+            dram_desc.devId = 0;
+            dram_reg.addDesc(dram_desc);
+            dram_x.addDesc(dram_desc);
+
+            nixlBlobDesc file_desc;
+            file_desc.addr = 0;
+            file_desc.len = sz;
+            file_desc.devId = fd;
+            file_reg.addDesc(file_desc);
+            file_x.addDesc(file_desc);
+        }
+        return 0;
+    };
+
+    if (add(a_desc, a_size, fd_a, dram_a, file_a) != 0) {
+        return 1;
+    }
+    if (add(b_desc, b_size, fd_b, dram_b, file_b) != 0) {
+        return 1;
+    }
+
+    if (agent.registerMem(dram_reg) != NIXL_SUCCESS ||
+        agent.registerMem(file_reg) != NIXL_SUCCESS) {
+        std::cerr << "Failed to register memory" << std::endl;
+        return 1;
+    }
+
+    nixlXferReqH *req_a = nullptr;
+    nixlXferReqH *req_b = nullptr;
+    if (agent.createXferReq(NIXL_WRITE, dram_a, file_a, "POSIXScopingTester", req_a) !=
+            NIXL_SUCCESS ||
+        agent.createXferReq(NIXL_WRITE, dram_b, file_b, "POSIXScopingTester", req_b) !=
+            NIXL_SUCCESS) {
+        std::cerr << "Failed to create transfer requests" << std::endl;
+        return 1;
+    }
+
+    signal(SIGXFSZ, SIG_IGN);
+    struct rlimit saved{};
+    getrlimit(RLIMIT_FSIZE, &saved);
+    struct rlimit rl{cap, saved.rlim_max};
+    if (setrlimit(RLIMIT_FSIZE, &rl) != 0) {
+        std::cerr << "setrlimit(RLIMIT_FSIZE) failed" << std::endl;
+        agent.releaseXferReq(req_a);
+        agent.releaseXferReq(req_b);
+        return 1;
+    }
+
+    nixl_status_t st_a = agent.postXferReq(req_a);
+    nixl_status_t st_b = agent.postXferReq(req_b);
+
+    // drive A (the failing transfer) to terminal first -- this fires cancel(A)
+    // while B still has outstanding ios on the shared queue
+    // yield each iteration: a busy-spin here starves the kernel io completion
+    // workers, so B's buffered writes never drain before max_poll_iters
+    constexpr auto poll_pause = std::chrono::microseconds(20);
+    int iters = 0;
+    while (st_a == NIXL_IN_PROG && iters++ < max_poll_iters) {
+        st_a = agent.getXferStatus(req_a);
+        std::this_thread::sleep_for(poll_pause);
+    }
+    iters = 0;
+    while (st_b == NIXL_IN_PROG && iters++ < max_poll_iters) {
+        st_b = agent.getXferStatus(req_b);
+        std::this_thread::sleep_for(poll_pause);
+    }
+
+    setrlimit(RLIMIT_FSIZE, &saved);
+
+    std::cout << queue << ": A=" << nixlEnumStrings::statusStr(st_a)
+              << " B=" << nixlEnumStrings::statusStr(st_b) << std::endl;
+
+    int rc = 0;
+    if (st_a >= 0) {
+        std::cerr << queue << ": failing transfer A was not reported as error" << std::endl;
+        rc = 1;
+    }
+    if (st_b != NIXL_SUCCESS) {
+        std::cerr << queue << ": concurrent transfer B disturbed by A's cancel (status "
+                  << nixlEnumStrings::statusStr(st_b) << ")" << std::endl;
+        rc = 1;
+    } else if (lseek(fd_b, 0, SEEK_END) != (off_t)b_size) {
+        std::cerr << queue << ": transfer B did not fully write its data" << std::endl;
+        rc = 1;
+    }
+
+    agent.releaseXferReq(req_a);
+    agent.releaseXferReq(req_b);
+    {
+        nixl_reg_dlist_t fa(FILE_SEG), fb(FILE_SEG);
+        nixlBlobDesc da;
+        da.addr = 0;
+        da.len = a_size;
+        da.devId = fd_a;
+        fa.addDesc(da);
+        nixlBlobDesc db;
+        db.addr = 0;
+        db.len = b_size;
+        db.devId = fd_b;
+        fb.addDesc(db);
+        for (int i = 0; i < a_desc; i++) {
+            agent.deregisterMem(fa);
+        }
+        for (int i = 0; i < b_desc; i++) {
+            agent.deregisterMem(fb);
+        }
+    }
+    agent.deregisterMem(dram_reg);
+    return rc;
+}
+
+int
+test_concurrent_cancel_scoping(std::string dir) {
+    const std::pair<const char *, const char *> queues[] = {
+        {"AIO", "use_aio"},
+        {"io_uring", "use_uring"},
+        {"POSIXAIO", "use_posix_aio"},
+    };
+
+    int failures = 0;
+    int ran = 0;
+    for (const auto &[queue, param_key] : queues) {
+        int rc = concurrent_cancel_scoping_case(dir, queue, param_key);
+        if (rc >= 0) {
+            ran++;
+        }
+        if (rc == 1) {
+            failures++;
+        }
+    }
+
+    if (ran == 0) {
+        std::cerr << "No POSIX io queue backend available to test" << std::endl;
+        return 1;
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+int
+test_short_write_enospc(std::string test_files_dir_path_abs_path) {
+    const std::pair<const char *, const char *> queues[] = {
+        {"AIO", "use_aio"},
+        {"io_uring", "use_uring"},
+        {"POSIXAIO", "use_posix_aio"},
+    };
+
+    int failures = 0;
+    int ran = 0;
+    // 1 = single-io path; 8 = multi-io batch; 200 = >64 batch with an un-submitted
+    // remainder that the cancel path must clear and recover
+    for (int n_desc : {1, 8, 200}) {
+        for (const auto &[queue, param_key] : queues) {
+            int rc = short_write_case(test_files_dir_path_abs_path, queue, param_key, n_desc);
+            if (rc >= 0) {
+                ran++;
+            }
+            if (rc == 1) {
+                failures++;
+            }
+        }
+    }
+
+    if (ran == 0) {
+        std::cerr << "No POSIX io queue backend available to test" << std::endl;
+        return 1;
+    }
+    return failures == 0 ? 0 : 1;
+}
+
 int
 main (int argc, char *argv[]) {
     if (page_size <= 0) {
@@ -1061,6 +1850,12 @@ main (int argc, char *argv[]) {
         return 1;
     }
 
+#ifdef HAVE_LIBURING
+    if (int rc = runUringSubmissionTests(); rc != 0) {
+        return rc;
+    }
+#endif
+
     if (run_path_mode_smoke) {
         checkPathModeParser();
         if (int rc = runPathModeCreateCheck(); rc != 0) {
@@ -1099,6 +1894,22 @@ main (int argc, char *argv[]) {
     ret = test_posix_repost (test_files_dir_path_abs_path, use_uring);
     if (ret != 0) {
         std::cerr << "Repost Test failed" << std::endl;
+        return 1;
+    }
+
+    phase_num = 1;
+
+    ret = test_short_write_enospc(test_files_dir_path_abs_path);
+    if (ret != 0) {
+        std::cerr << "Short-write/ENOSPC Test failed" << std::endl;
+        return 1;
+    }
+
+    phase_num = 1;
+
+    ret = test_concurrent_cancel_scoping(test_files_dir_path_abs_path);
+    if (ret != 0) {
+        std::cerr << "Concurrent cancel scoping Test failed" << std::endl;
         return 1;
     }
 
