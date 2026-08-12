@@ -55,14 +55,133 @@ page-actions:
 
 
 navigation:
-  - section: NIXL
+  - section: Getting Started
     contents:
       - page: Overview
-        slug: nixl
-        path: ./docs/pages/empty.md
-      - page: Second Page
-        slug: second-page
-        path: ./docs/pages/second-page.md
+        path: ./docs/pages/getting-started/overview.md
+      - page: Architecture
+        path: ./docs/pages/getting-started/architecture.md
+      - page: Quick Start
+        path: ./docs/pages/getting-started/quick-start.md
+
+  - section: User Guide
+    contents:
+      - section: NIXL Backends
+        collapsed: open-by-default
+        path: ./docs/pages/user-guide/backends/index.md
+        contents:
+          - page: UCX
+            path: ./docs/pages/user-guide/backends/ucx.md
+          - page: Libfabric
+            path: ./docs/pages/user-guide/backends/libfabric.md
+          - page: Mooncake
+            path: ./docs/pages/user-guide/backends/mooncake.md
+          - page: UCCL-P2P
+            slug: uccl
+            path: ./docs/pages/user-guide/backends/uccl.md
+          - page: DOCA GPUNetIO
+            slug: gpunetio
+            path: ./docs/pages/user-guide/backends/gpunetio.md
+          - page: GPUDirect Storage
+            slug: gds
+            path: ./docs/pages/user-guide/backends/gds.md
+          - page: GPUDirect Storage MT
+            slug: gds-mt
+            path: ./docs/pages/user-guide/backends/gds-mt.md
+          - page: POSIX
+            path: ./docs/pages/user-guide/backends/posix.md
+          - page: HF3FS
+            slug: hf3fs
+            path: ./docs/pages/user-guide/backends/hf3fs.md
+          - page: OBJ
+            path: ./docs/pages/user-guide/backends/obj.md
+          - page: Azure Blob
+            path: ./docs/pages/user-guide/backends/azure-blob.md
+          - page: GUSLI
+            path: ./docs/pages/user-guide/backends/gusli.md
+      - page: "Metadata Exchange with etcd"
+        path: ./docs/pages/user-guide/etcd-metadata-exchange.md
+      - page: Telemetry Guide
+        path: ./docs/pages/user-guide/telemetry.md
+      - section: Benchmarking NIXL
+        contents:
+          - section: NIXLBench
+            collapsed: open-by-default
+            path: ./docs/pages/user-guide/benchmarking/nixlbench/index.md
+            contents:
+              - page: Building NIXLBench
+                path: ./docs/pages/user-guide/benchmarking/nixlbench/build.md
+              - page: Using NIXLBench
+                path: ./docs/pages/user-guide/benchmarking/nixlbench/usage.md
+          - section: KVBench
+            collapsed: open-by-default
+            path: ./docs/pages/user-guide/benchmarking/kvbench/index.md
+            contents:
+              - page: Building KVBench
+                path: ./docs/pages/user-guide/benchmarking/kvbench/build.md
+              - page: Using KVBench
+                path: ./docs/pages/user-guide/benchmarking/kvbench/commands.md
+
+  - section: Developer Guide
+    contents:
+      - section: Building NIXL from Source
+        collapsed: open-by-default
+        path: ./docs/pages/user-guide/building-nixl/index.md
+        contents:
+          - page: Docker
+            path: ./docs/pages/user-guide/building-nixl/docker.md
+          - page: "NIXL C++ (Meson)"
+            path: ./docs/pages/user-guide/building-nixl/nixl-cpp.md
+          - page: Python Bindings
+            path: ./docs/pages/user-guide/building-nixl/python-bindings.md
+          - page: Rust Bindings
+            path: ./docs/pages/user-guide/building-nixl/rust-bindings.md
+      - page: Building a Backend Plugin
+        path: ./docs/pages/development/building-a-backend-plugin.md
+      - page: Contribution Guide
+        path: ./docs/pages/development/contribution-guide.md
+
+  - section: Examples
+    contents:
+      - page: Basic Two-Peer Transfer
+        path: ./docs/pages/examples/basic-transfer.md
+      - page: GDS Direct Storage
+        path: ./docs/pages/examples/gds-direct-storage.md
+      - page: Remote Storage Transfer
+        path: ./docs/pages/examples/remote-storage.md
+      - page: "NIXL-EP: Expert-Parallel Communication"
+        path: ./docs/pages/examples/nixl-ep.md
+      - page: etcd Metadata Exchange
+        path: ./docs/pages/examples/etcd-metadata-exchange.md
+      - page: Telemetry Reader
+        path: ./docs/pages/examples/telemetry-reader.md
+
+  - section: Examples2
+    path: ./docs/pages/examples2/index.md
+    contents:
+      - page: Basic Two-Peer Transfer
+        path: ./docs/pages/examples2/basic-two-peers.md
+      - page: Expanded Two-Peer Transfer
+        path: ./docs/pages/examples2/expanded-two-peers.md
+      - page: GDS Direct Storage
+        path: ./docs/pages/examples2/gds-direct-storage.md
+      - page: Partial Metadata Exchange
+        path: ./docs/pages/examples2/partial-metadata.md
+      - page: Query Storage Metadata
+        path: ./docs/pages/examples2/query-memory.md
+      - page: Remote Storage Transfer
+        path: ./docs/pages/examples2/remote-storage.md
+      - page: Telemetry Reader
+        path: ./docs/pages/examples2/telemetry-reader.md
+      - page: NIXL-EP Buffer API
+        path: ./docs/pages/examples2/nixl-ep-buffer.md
+
+  - section: Resources
+    contents:
+      - page: Environment Variables
+        path: ./docs/pages/resources/environment-variables.md
+      - page: Troubleshooting
+        path: ./docs/pages/resources/troubleshooting.md
 
 logo:
   dark: ./docs/assets/NVIDIA_dark.svg

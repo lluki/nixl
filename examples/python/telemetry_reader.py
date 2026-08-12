@@ -15,6 +15,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Read NIXL telemetry events from a shared-memory cyclic buffer.
+
+The reader maps an existing telemetry file, validates its format version,
+decodes event types and values, and reports events until interrupted. The
+ctypes structures in this file mirror the current C++ telemetry buffer
+layout, so this source is the canonical Python representation of that format.
+
+Run it against a telemetry file created by a NIXL agent:
+
+    python3 examples/python/telemetry_reader.py \\
+        --telemetry_path /tmp/nixl_telemetry/agent_name
+"""
+
 import argparse
 import ctypes
 import logging

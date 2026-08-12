@@ -15,6 +15,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Exchange and invalidate partial NIXL metadata.
+
+This example registers two groups of target memory descriptors, publishes
+them independently, and demonstrates retrying a transfer after the matching
+partial metadata arrives. Metadata can be exchanged directly over sockets or
+through etcd.
+
+Run with socket metadata exchange:
+
+    python3 examples/python/partial_md_example.py
+
+Run with etcd after setting NIXL_ETCD_ENDPOINTS:
+
+    python3 examples/python/partial_md_example.py --etcd
+"""
+
 import argparse
 import os
 
@@ -36,9 +52,7 @@ def exchange_target_metadata(
     label,
     target_reg_descs,
 ):
-    """
-    Exchange metadata from target to initiator
-    """
+    """Publish one target descriptor group to the initiator."""
     if etcd_endpoints:
         # With ETCD, target sends MD to server and initiator fetches it
         target_agent.send_partial_agent_metadata(
@@ -58,9 +72,7 @@ def invalidate_target_metadata(
     init_port,
     etcd_endpoints,
 ):
-    """
-    Invalidate metadata from target to initiator
-    """
+    """Invalidate the target metadata previously sent to the initiator."""
     if etcd_endpoints:
         target_agent.invalidate_local_metadata()
     else:

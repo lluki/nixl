@@ -3,10 +3,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Run a single READ transfer between two NIXL agents.
+
+## What this example demonstrates
+
+- Creating target and initiator agents with progress and notification support.
+- Registering a CPU or CUDA tensor with NIXL.
+- Exchanging agent metadata and serialized transfer descriptors.
+- Reading the target tensor into the initiator tensor asynchronously.
+- Waiting for completion, verifying the data, and releasing resources.
+
+## Run
+
+Start the target first:
+
+    python3 examples/python/basic_two_peers.py --mode target --ip 127.0.0.1
+
+Then start the initiator:
+
+    python3 examples/python/basic_two_peers.py --mode initiator --ip 127.0.0.1
+
+Pass --use_cuda True to allocate tensors on CUDA instead of the CPU.
+"""
+
 import argparse
 
 import torch
-
 from nixl import nixl_agent, nixl_agent_config
 from nixl.logging import get_logger
 

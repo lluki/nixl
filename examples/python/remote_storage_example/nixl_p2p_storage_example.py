@@ -13,16 +13,34 @@
 # See the for the specific language governing permissions and
 # limitations under the License.
 
-"""
-NIXL Peer-to-Peer Storage Example
-Demonstrates peer-to-peer storage transfers using NIXL with initiator and target modes.
+"""Transfer data between memory and local or remote storage.
+
+This client/server example combines UCX networking with the GDS_MT or POSIX
+storage backend. A client can perform local storage transfers or send READ and
+WRITE requests to a storage server. The server pipelines storage and network
+operations with a two-worker thread pool.
+
+Each line in the client agents file has this format:
+
+    AGENT_NAME IP_ADDRESS PORT
+
+Run a server:
+
+    python3 nixl_p2p_storage_example.py --role server \\
+        --fileprefix /path/to/files --name storage-server
+
+Run a client:
+
+    python3 nixl_p2p_storage_example.py --role client \\
+        --agents_file agents.txt --fileprefix /path/to/files --name client
+
+Client and server buffer and batch sizes must match.
 """
 
 import concurrent.futures
 import time
 
 import nixl_storage_utils as nsu
-
 from nixl.logging import get_logger
 
 logger = get_logger(__name__)
@@ -31,6 +49,7 @@ logger = get_logger(__name__)
 def execute_transfer(
     my_agent, local_descs, remote_descs, remote_name, operation, use_backends=[]
 ):
+    """Execute one transfer, wait for completion, and release its handle."""
     handle = my_agent.initialize_xfer(
         operation, local_descs, remote_descs, remote_name, backends=use_backends
     )
@@ -42,7 +61,7 @@ def execute_transfer(
 def remote_storage_transfer(
     my_agent, my_mem_descs, operation, remote_agent_name, iterations
 ):
-    """Initiate remote memory transfer."""
+    """Send a remote storage request and wait for its completion notification."""
     if operation != "READ" and operation != "WRITE":
         logger.error("Invalid operation, exiting")
         exit(-1)
@@ -72,6 +91,7 @@ def remote_storage_transfer(
 
 
 def connect_to_agents(my_agent, agents_file):
+    """Exchange metadata with every storage server listed in an agents file."""
     target_agents = []
     with open(agents_file, "r") as f:
         for line in f:
@@ -99,6 +119,7 @@ def connect_to_agents(my_agent, agents_file):
 def pipeline_reads(
     my_agent, req_agent, my_mem_descs, my_file_descs, sent_descs, iterations
 ):
+    """Pipeline storage reads with network writes to the requesting client."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         n = 0
         s = 0
@@ -166,6 +187,7 @@ def pipeline_reads(
 def pipeline_writes(
     my_agent, req_agent, my_mem_descs, my_file_descs, sent_descs, iterations
 ):
+    """Pipeline network reads from the client with local storage writes."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         n = 0
         s = 1
@@ -227,7 +249,7 @@ def pipeline_writes(
 
 
 def handle_remote_transfer_request(my_agent, my_mem_descs, my_file_descs):
-    """Handle remote memory and storage transfers as target."""
+    """Decode one client request, execute its pipeline, and notify completion."""
     # Wait for initiator to send list of memory descriptors
     notifs = my_agent.get_new_notifs()
 
@@ -268,6 +290,7 @@ def handle_remote_transfer_request(my_agent, my_mem_descs, my_file_descs):
 def run_client(
     my_agent, nixl_mem_reg_descs, nixl_file_reg_descs, agents_file, iterations
 ):
+    """Run local storage tests, then READ and WRITE against every server."""
     logger.info("Client initialized, ready for local transfer test...")
 
     # For sample purposes, write to and then read from local storage
@@ -324,6 +347,7 @@ def run_client(
 
 
 def run_storage_server(my_agent, nixl_mem_reg_descs, nixl_file_reg_descs):
+    """Serve remote storage requests until the process is interrupted."""
     logger.info("Server initialized, ready for remote transfer test...")
     while True:
         handle_remote_transfer_request(

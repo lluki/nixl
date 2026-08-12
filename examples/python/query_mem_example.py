@@ -15,6 +15,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Query storage metadata through a NIXL backend.
+
+The example creates temporary files, represents their paths as FILE
+descriptors, and queries a POSIX backend for properties such as size, mode,
+and modification time. It includes a nonexistent path to demonstrate the
+response for inaccessible storage and falls back to MOCK_DRAM when needed.
+
+Run it with:
+
+    python3 examples/python/query_mem_example.py
+"""
+
 import os
 import sys
 import tempfile

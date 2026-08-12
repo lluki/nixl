@@ -3,6 +3,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Exercise advanced two-peer transfer and notification patterns.
+
+The target and initiator exchange tensor layout information and run parallel
+READ and WRITE operations. The example demonstrates prepared transfers,
+descriptor construction from offsets, transfer reposting, exact and prefix
+notification matching, verification, and cleanup.
+
+## Run
+
+Start the target:
+
+    python3 examples/python/expanded_two_peers.py --mode target \\
+        --ip 127.0.0.1 --backend UCX
+
+Then start the initiator:
+
+    python3 examples/python/expanded_two_peers.py --mode initiator \\
+        --ip 127.0.0.1 --backend UCX
+
+Use --use_cuda True when the selected backend and system support CUDA memory.
+"""
+
 import argparse
 import pickle
 import random
@@ -10,7 +32,6 @@ import sys
 
 import numpy as np
 import torch
-
 from nixl._api import nixl_agent, nixl_agent_config
 from nixl.logging import get_logger
 

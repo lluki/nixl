@@ -18,6 +18,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Provide NIXL expert-parallel communication buffers.
+
+The Buffer API implements dispatch and combine operations for Mixture of
+Experts models over NVLink and RDMA. It supports low-latency and
+high-throughput modes, dynamic rank connection and disconnection, rank
+masking, buffer sizing, and explicit resource management.
+
+The generated Examples2 documentation uses the Buffer class and method
+docstrings below as its canonical API description.
+"""
+
 import os
 from contextlib import contextmanager
 from datetime import timedelta

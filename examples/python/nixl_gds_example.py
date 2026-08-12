@@ -15,6 +15,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Perform a GPUDirect Storage round trip with the NIXL GDS backend.
+
+The example allocates two DRAM buffers, fills the source with a known pattern,
+registers a file as FILE memory, writes the source buffer to the file, reads
+the file into the destination buffer, and verifies the result.
+
+The GDS plugin and cuFile support must be available. Pass the full path of the
+file to create or reuse:
+
+    python3 examples/python/nixl_gds_example.py /path/to/gds_test_file
+"""
+
 import os
 import sys
 
