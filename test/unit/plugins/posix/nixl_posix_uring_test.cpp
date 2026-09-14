@@ -22,12 +22,12 @@
 #endif
 
 namespace {
-constexpr int request_count = 32, ring_entries = 16, max_poll_iterations = 2000;
+constexpr int request_count = 64, ring_entries = 16, max_poll_iterations = 2000;
 constexpr size_t block_size = 4096;
 constexpr auto poll_pause = std::chrono::microseconds(50);
 using buffers_t = std::array<std::array<char, block_size>, request_count>;
 
-enum class submit_mode_t { PARTIAL_ONLY, TRANSIENT_ERRORS, PASS_THROUGH };
+enum class submit_mode_t { PARTIAL_ONLY, EAGAIN_ONCE, EINTR_ONCE, PASS_THROUGH };
 submit_mode_t submit_mode = submit_mode_t::PASS_THROUGH;
 int submit_calls = 0, transient_submit_errors = 0, cancel_completions = 0;
 unsigned first_ready = 0, first_submitted = 0;
@@ -138,9 +138,10 @@ io_uring_submit(struct io_uring *ring) LIBURING_NOEXCEPT {
     if (!real_submit) {
         return -EINVAL;
     }
-    if (submit_mode == submit_mode_t::TRANSIENT_ERRORS && transient_submit_errors == 0) {
+    if ((submit_mode == submit_mode_t::EAGAIN_ONCE || submit_mode == submit_mode_t::EINTR_ONCE) &&
+        transient_submit_errors == 0) {
         transient_submit_errors++;
-        return -EAGAIN;
+        return submit_mode == submit_mode_t::EAGAIN_ONCE ? -EAGAIN : -EINTR;
     }
 
     const unsigned ready = io_uring_sq_ready(ring);
@@ -179,13 +180,27 @@ main() {
         URING_CHECK(test.drain() == NIXL_SUCCESS);
         URING_CHECK(state.count == request_count && !state.errors && submit_calls > 1);
     }
-    {
-        uringTest test(submit_mode_t::TRANSIENT_ERRORS);
+    for (const submit_mode_t mode : {submit_mode_t::EAGAIN_ONCE, submit_mode_t::EINTR_ONCE}) {
+        uringTest test(mode);
         completionState state;
         URING_CHECK(test.enqueue(state, 0, request_count));
         URING_CHECK(test.queue->post() == NIXL_IN_PROG);
         URING_CHECK(test.drain() == NIXL_SUCCESS && transient_submit_errors == 1);
         URING_CHECK(state.count == request_count && !state.errors);
+    }
+    {
+        uringTest test(submit_mode_t::PASS_THROUGH);
+        completionState cancelled;
+        URING_CHECK(test.enqueue(cancelled, 0, 1));
+        URING_CHECK(test.queue->cancel(&cancelled, cancelCompletionCallback) == 0);
+        URING_CHECK(cancelled.count == 1 && cancelled.errors == 1 && cancel_completions == 0);
+
+        completionState reusable;
+        URING_CHECK(test.enqueue(reusable, 0, request_count));
+        URING_CHECK(test.queue->post() == NIXL_IN_PROG);
+        URING_CHECK(test.drain() == NIXL_SUCCESS);
+        URING_CHECK(reusable.count == request_count && reusable.errors == 0 &&
+                    cancel_completions == 0);
     }
     {
         uringTest test(submit_mode_t::PASS_THROUGH);
