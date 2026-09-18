@@ -50,6 +50,12 @@ public:
             void *ctx) override;
     virtual nixl_status_t
     poll(void) override;
+
+    bool
+    canEnqueue(size_t count) const override {
+        return !terminal_error_ && nixlPosixIOQueueImpl<nixlPosixLinuxAioIO>::canEnqueue(count);
+    }
+
     virtual unsigned
     cancel(void *ctx, nixlPosixIOQueueCancelDoneCb clb) override;
     virtual ~nixlPosixIOQueueLinuxAIO() override;
@@ -306,7 +312,8 @@ nixlPosixIOQueueLinuxAIO::cancel(void *ctx, nixlPosixIOQueueCancelDoneCb) {
             continue;
         }
 
-        struct io_event event{};
+        struct io_event event {};
+
         if (io_cancel(io_ctx_, &io.io_, &event) == 0) {
             // io_cancel returns the canceled operation's completion synchronously.
             completeIO(&io, event.res);

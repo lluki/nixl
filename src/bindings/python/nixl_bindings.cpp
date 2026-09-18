@@ -208,6 +208,9 @@ PYBIND11_MODULE(_bindings, m) {
 
     m.attr("NIXL_INIT_AGENT") = NIXL_INIT_AGENT;
 
+    // The core preserves active request state when backend release asks for a retry.
+    m.attr("HAVE_SAFE_POSIX_ERROR_RELEASE_CORE") = true;
+
     m.attr("DEFAULT_COMM_PORT") = default_comm_port;
 
     // Whether NIXL was built against a UCX with the GPU device API, which the

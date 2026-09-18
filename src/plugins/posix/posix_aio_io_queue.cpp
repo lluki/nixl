@@ -18,6 +18,7 @@
 #include "io_queue.h"
 #include "common/nixl_log.h"
 #include <aio.h>
+#include <cerrno>
 
 #define MAX_IO_SUBMIT_BATCH_SIZE 64
 #define MAX_IO_CHECK_COMPLETED_BATCH_SIZE 64
@@ -113,9 +114,17 @@ nixlPosixIOQueueAIO::post(void) {
         }
 
         if (ret < 0) {
-            NIXL_ERROR << "aio_submit failed: " << nixl_strerror(-ret);
-            ios_to_submit_.push_front(io);
-            return NIXL_ERR_BACKEND;
+            int error = errno;
+            if (error == EAGAIN) {
+                ios_to_submit_.push_front(io);
+                return NIXL_IN_PROG;
+            }
+            NIXL_ERROR << "aio_submit failed: " << nixl_strerror(error);
+            if (io->clb_) {
+                io->clb_(io->ctx_, 0, 1);
+            }
+            free_ios_.push_back(io);
+            continue;
         }
 
         ios_in_flight_.push_back(io);
@@ -131,35 +140,27 @@ nixlPosixIOQueueAIO::doCheckCompleted(void) {
     }
 
     int num_ios = std::min(MAX_IO_CHECK_COMPLETED_BATCH_SIZE, (int)ios_in_flight_.size());
-    for (auto it = ios_in_flight_.begin(); it != ios_in_flight_.end();) {
+    for (auto it = ios_in_flight_.begin(); it != ios_in_flight_.end() && num_ios > 0;) {
         nixlPosixAioIO *io = *it;
         int status = aio_error(&io->aio_);
-        if (status == 0) {
-            ssize_t ret = aio_return(&io->aio_);
-            if (ret < 0 || ret != static_cast<ssize_t>(io->aio_.aio_nbytes)) {
-                NIXL_ERROR << "aio_return failed: " << nixl_strerror(-ret);
-                ios_in_flight_.push_front(io);
-                return NIXL_ERR_BACKEND;
-            }
-            if (io->clb_) {
-                io->clb_(io->ctx_, ret, 0);
-            }
-            it = ios_in_flight_.erase(it);
-            free_ios_.push_back(io);
-        } else if (status == EINPROGRESS) {
-            return NIXL_IN_PROG;
-        } else {
-            NIXL_ERROR << "aio_error failed: " << nixl_strerror(-status);
-            ios_in_flight_.push_front(io);
-            return NIXL_ERR_BACKEND;
+        if (status == EINPROGRESS) {
+            ++it;
+            --num_ios;
+            continue;
         }
 
-        it++;
-
-        num_ios--;
-        if (num_ios == 0) {
-            break;
+        ssize_t ret = aio_return(&io->aio_);
+        bool error = status != 0 || ret < 0 || ret != static_cast<ssize_t>(io->aio_.aio_nbytes);
+        if (error) {
+            NIXL_ERROR << "POSIX AIO operation incomplete: status=" << status << ", result=" << ret
+                       << ", expected=" << io->aio_.aio_nbytes;
         }
+        if (io->clb_) {
+            io->clb_(io->ctx_, error ? 0 : static_cast<uint32_t>(ret), error);
+        }
+        it = ios_in_flight_.erase(it);
+        free_ios_.push_back(io);
+        --num_ios;
     }
 
     return ios_in_flight_.empty() ? NIXL_SUCCESS : NIXL_IN_PROG;

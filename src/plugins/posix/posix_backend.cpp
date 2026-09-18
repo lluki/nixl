@@ -189,10 +189,6 @@ nixlPosixBackendReqH::queueResult(nixl_status_t queue_result) {
     }
 
     requestCancellation();
-    if (queue_result < 0 && cancels_expected_ == 0) {
-        return queue_result;
-    }
-
     if (!isComplete()) {
         return NIXL_IN_PROG;
     }
@@ -202,9 +198,6 @@ nixlPosixBackendReqH::queueResult(nixl_status_t queue_result) {
 nixl_status_t
 nixlPosixBackendReqH::checkXfer() {
     nixl_status_t queue_result = isComplete() ? NIXL_SUCCESS : io_queue_->poll();
-    if (queue_result < 0 && !isComplete()) {
-        return queue_result;
-    }
     return queueResult(isComplete() ? NIXL_SUCCESS : queue_result);
 }
 
@@ -213,6 +206,10 @@ nixlPosixBackendReqH::postXfer() {
     if (__builtin_expect(!io_queue_, 0)) {
         NIXL_ERROR << "POSIX I/O queue is not initialized";
         return NIXL_ERR_BACKEND;
+    }
+    if (!io_queue_->canEnqueue(queue_depth_)) {
+        NIXL_ERROR << "Insufficient POSIX I/O queue capacity for atomic request enqueue";
+        return NIXL_ERR_NOT_ALLOWED;
     }
     num_confirmed_ios_ = 0;
     transfer_failed_ = false;
@@ -271,6 +268,12 @@ nixlPosixEngine::nixlPosixEngine(const nixlBackendInitParams *init_params)
           nixl::getBackendParamDefaulted(init_params->customParams, "ios_pool_size", 0u),
           nixl::getBackendParamDefaulted(init_params->customParams, "kernel_queue_size", 0u))),
       io_queue_lock_(init_params->syncMode) {
+    if (init_params->customParams &&
+        init_params->customParams->find("safe_error_release") != init_params->customParams->end()) {
+        initErr = true;
+        NIXL_ERROR << "POSIX backend parameter safe_error_release is reserved";
+        return;
+    }
     if (io_queue_type_.empty()) {
         initErr = true;
         NIXL_ERROR << "Failed to initialize POSIX backend - no supported io queue type found";
@@ -281,6 +284,9 @@ nixlPosixEngine::nixlPosixEngine(const nixlBackendInitParams *init_params)
         NIXL_ERROR << "Failed to initialize POSIX backend - unavailable io queue type requested: "
                    << io_queue_type_;
         return;
+    }
+    if (io_queue_type_ == "AIO" || io_queue_type_ == "POSIXAIO") {
+        (void)setInitParam("safe_error_release", "true");
     }
     NIXL_INFO << absl::StrFormat("POSIX backend initialized using io queue type: %s",
                                  io_queue_type_);
@@ -402,6 +408,12 @@ nixlPosixEngine::checkXfer(nixlBackendReqH *handle) const {
 nixl_status_t
 nixlPosixEngine::releaseReqH(nixlBackendReqH *handle) const {
     NIXL_ASSERT(handle != nullptr);
+    auto &posix_handle = castPosixHandle(handle);
+    NIXL_LOCK_GUARD(io_queue_lock_);
+    posix_handle.checkXfer();
+    if (!posix_handle.isComplete()) {
+        return NIXL_ERR_REPOST_ACTIVE;
+    }
     delete handle;
     return NIXL_SUCCESS;
 }
@@ -412,8 +424,9 @@ nixlPosixEngine::queryMem(const nixl_reg_dlist_t &descs,
     // Extract metadata from descriptors which are file names
     // Different plugins might customize parsing of metaInfo to get the file names
     std::vector<nixl_blob_t> metadata(descs.descCount());
-    for (int i = 0; i < descs.descCount(); ++i)
+    for (int i = 0; i < descs.descCount(); ++i) {
         metadata[i] = descs[i].metaInfo;
+    }
 
     return nixl::queryFileInfoList(metadata, resp);
 }

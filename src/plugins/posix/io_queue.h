@@ -52,6 +52,8 @@ public:
     post(void) = 0;
     virtual nixl_status_t
     poll(void) = 0;
+    virtual bool
+    canEnqueue(size_t count) const = 0;
 
     /** Cancel I/Os owned by @p ctx synchronously when possible; return the number of async
      * cancellations that will invoke @p clb. */
@@ -95,6 +97,11 @@ public:
         for (uint32_t i = 0; i < ios_pool_size_; i++) {
             free_ios_.push_back(&ios_[i]);
         }
+    }
+
+    bool
+    canEnqueue(size_t count) const override {
+        return free_ios_.size() >= count;
     }
 
 protected:

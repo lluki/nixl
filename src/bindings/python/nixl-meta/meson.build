@@ -37,6 +37,7 @@ license_path = fs.copyfile(root_license_path)
 
 subdir('nixl')
 subdir('nixl_ep')
+subdir('nixl_shard')
 
 uv = find_program('uv', required: false)
 if uv.found()
@@ -56,6 +57,8 @@ if uv.found()
       nixl_api_copy,
       nixl_logging_copy,
       nixl_ep_init_copy,
+      nixl_shard_init_copy,
+      nixl_shard_agent_copy,
     ],
     output: [wheel_name],
     command: [uv, 'build', '--wheel', '--out-dir', build_dir, build_dir],

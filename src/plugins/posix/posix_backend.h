@@ -47,6 +47,11 @@ public:
     nixl_status_t
     checkXfer();
 
+    bool
+    isComplete() const {
+        return num_confirmed_ios_ == queue_depth_ && cancels_expected_ == cancels_seen_;
+    }
+
     // Exception classes
     class exception : public std::exception {
     private:
@@ -62,11 +67,6 @@ public:
     };
 
 private:
-    bool
-    isComplete() const {
-        return num_confirmed_ios_ == queue_depth_ && cancels_expected_ == cancels_seen_;
-    }
-
     unsigned
     requestCancellation();
     void

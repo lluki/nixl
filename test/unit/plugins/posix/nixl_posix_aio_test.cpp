@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "io_queue.h"
@@ -49,6 +50,42 @@ struct completionState {
     int cancel_completions = 0;
 };
 
+class deferredErrorQueue : public nixlPosixIOQueue {
+public:
+    deferredErrorQueue() : nixlPosixIOQueue(64, 16) {}
+
+    nixl_status_t
+    enqueue(int, void *, size_t, off_t, bool, nixlPosixIOQueueDoneCb clb, void *ctx) override {
+        clb_ = std::move(clb);
+        ctx_ = ctx;
+        return NIXL_SUCCESS;
+    }
+
+    nixl_status_t
+    post() override {
+        return NIXL_ERR_BACKEND;
+    }
+
+    nixl_status_t
+    poll() override {
+        return NIXL_ERR_BACKEND;
+    }
+
+    bool
+    canEnqueue(size_t) const override {
+        return true;
+    }
+
+    void
+    complete() {
+        clb_(ctx_, 0, 1);
+    }
+
+private:
+    nixlPosixIOQueueDoneCb clb_;
+    void *ctx_ = nullptr;
+};
+
 [[noreturn]] void
 failDlvsym(const char *symbol, const char *version) {
     const char *error = dlerror();
@@ -74,9 +111,9 @@ struct aioTest {
     std::vector<std::array<char, block_size>> buffers;
     std::unique_ptr<nixlPosixIOQueue> queue;
 
-    explicit aioTest(size_t buffer_count = request_count)
+    explicit aioTest(size_t buffer_count = request_count, uint32_t ios_pool_size = 128)
         : buffers(buffer_count),
-          queue(nixlPosixIOQueue::instantiate("AIO", 128, 16)) {
+          queue(nixlPosixIOQueue::instantiate("AIO", ios_pool_size, 16)) {
         char path[] = "/tmp/nixl_linux_aio_test_XXXXXX";
         if ((fd = mkstemp(path)) < 0) {
             throw std::runtime_error("mkstemp failed");
@@ -266,6 +303,55 @@ io_getevents(io_context_t ctx,
 int
 main() {
     {
+        nixl_b_params_t params{{"use_aio", "true"}};
+        nixlBackendInitParams init_params;
+        init_params.localAgent = "POSIXCapabilityTest";
+        init_params.type = "POSIX";
+        init_params.customParams = &params;
+        init_params.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT;
+        nixlPosixEngine engine(&init_params);
+
+        AIO_CHECK(!engine.getInitErr());
+        const auto &actual = engine.getCustomParams();
+        AIO_CHECK(actual.find("safe_error_release") != actual.end());
+        AIO_CHECK(actual.at("safe_error_release") == "true");
+    }
+    {
+        nixl_b_params_t params{{"use_aio", "true"}, {"safe_error_release", "true"}};
+        nixlBackendInitParams init_params;
+        init_params.localAgent = "POSIXCapabilitySpoofTest";
+        init_params.type = "POSIX";
+        init_params.customParams = &params;
+        init_params.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT;
+        nixlPosixEngine engine(&init_params);
+
+        AIO_CHECK(engine.getInitErr());
+    }
+    {
+        constexpr int capacity = 64;
+        aioTest test(capacity + 1, capacity);
+        nixlPosixFileMD file_md(test.fd, "");
+        aioRequest oversized(test, file_md, 0, capacity + 1);
+
+        AIO_CHECK(oversized.request.postXfer() == NIXL_ERR_NOT_ALLOWED);
+        AIO_CHECK(oversized.request.isComplete());
+    }
+    {
+        aioTest test(1);
+        nixlPosixFileMD file_md(test.fd, "");
+        std::unique_ptr<nixlPosixIOQueue> queue = std::make_unique<deferredErrorQueue>();
+        auto *deferred_queue = static_cast<deferredErrorQueue *>(queue.get());
+        aioRequest failed(test, file_md, 0, 1);
+        nixlPosixBackendReqH request(NIXL_WRITE, failed.local, failed.remote, queue);
+
+        AIO_CHECK(request.postXfer() == NIXL_IN_PROG);
+        AIO_CHECK(!request.isComplete());
+        AIO_CHECK(request.checkXfer() == NIXL_IN_PROG);
+        deferred_queue->complete();
+        AIO_CHECK(request.isComplete());
+        AIO_CHECK(request.checkXfer() == NIXL_ERR_BACKEND);
+    }
+    {
         setSubmitMode(submitMode::PARTIAL_ONCE);
         aioTest test;
         completionState state;
@@ -341,6 +427,10 @@ main() {
         AIO_CHECK(!context_probe_requested_events);
         AIO_CHECK(state.completions == request_count && state.errors == request_count);
         AIO_CHECK(test.queue->poll() == NIXL_ERR_BACKEND);
+        nixlPosixFileMD file_md(test.fd, "");
+        aioRequest rejected(test, file_md, 0, 1);
+        AIO_CHECK(rejected.request.postXfer() == NIXL_ERR_NOT_ALLOWED);
+        AIO_CHECK(rejected.request.isComplete());
         AIO_CHECK(test.queue->enqueue(test.fd,
                                       test.buffers[0].data(),
                                       block_size,
