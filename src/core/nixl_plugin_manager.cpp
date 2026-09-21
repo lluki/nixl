@@ -848,6 +848,10 @@ void nixlPluginManager::registerBuiltinPlugins() {
     NIXL_REGISTER_STATIC_PLUGIN(Backend, OBJ)
 #endif
 
+#ifdef STATIC_PLUGIN_GCS
+    NIXL_REGISTER_STATIC_PLUGIN(Backend, GCS)
+#endif
+
 #ifdef STATIC_PLUGIN_MOONCAKE
     NIXL_REGISTER_STATIC_PLUGIN(Backend, MOONCAKE)
 #endif
