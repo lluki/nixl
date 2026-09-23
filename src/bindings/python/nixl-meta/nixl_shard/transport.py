@@ -41,6 +41,7 @@ class RemoteDevice:
     host: str
     port: int
     logical_device_generation: int = 1
+    transport: str = "tcp"
 
     @property
     def endpoint(self) -> TcpEndpoint:
@@ -90,8 +91,7 @@ def _send_frame(sock: socket.socket, header: dict[str, Any], payload: bytes) -> 
     header = dict(header)
     header["payload_length"] = len(payload)
     encoded = _json_bytes(header)
-    sock.sendall(struct.pack("!I", len(encoded)))
-    sock.sendall(encoded)
+    sock.sendall(struct.pack("!I", len(encoded)) + encoded)
     if payload:
         sock.sendall(payload)
 
@@ -233,8 +233,9 @@ class TcpShardServer:
         max_request_bytes: int,
         max_staging_bytes: int,
         max_workers: int,
+        allow_remote: bool = False,
     ):
-        if not _is_loopback_host(endpoint.host):
+        if not allow_remote and not _is_loopback_host(endpoint.host):
             raise ValueError("TCP fallback server must bind to a loopback address")
         self._handler = handler
         self._timeout = timeout
@@ -270,6 +271,7 @@ class TcpShardServer:
             except OSError:
                 return
             connection.settimeout(self._timeout)
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             if not self._worker_slots.acquire(blocking=False):
                 try:
                     _send_frame(

@@ -32,16 +32,46 @@ The current vertical slice implements the batch-only local and remote
 - a loopback-only framed TCP fallback with bounded request, staging-byte, and worker limits,
   per-item completion results, deadlines, generation fencing, and orderly
   shutdown;
+- an opt-in UCX/RDMA data path using registered, bounded staging allocations;
+  TCP carries request metadata and terminal results with zero payload bytes;
 - an in-memory naming service with batched allocation/lookup/finalization,
   leases, eviction, device heartbeats, and stop/drain/offline management;
 - a batched client implementing reserve-store-commit and
   lookup-load-release, including bounded retries and backpressure.
 
-Set `tcp_listen_host` on the device-owning agent, read its `tcp_endpoint`,
-and add a matching `RemoteDevice` to the routing agent. TCP is currently the
-functional loopback transport and refuses non-loopback server binds; it stages
-remote payloads and will be replaced by the UCX data path without changing the
-public batch API.
+For UCX, set `ucx_listen_host` on the device-owning agent, read its
+`ucx_endpoint`, and add a matching `RemoteDevice(..., transport="ucx")` to
+the routing agent. The endpoint is the control socket; the agents exchange
+NIXL metadata there and transfer registered staging bytes through UCX. For
+example, on a GB200 pair with RDMA device `mlx5_0:1`, set
+`UCX_TLS=rc,cuda_copy` and `UCX_NET_DEVICES=mlx5_0:1` in both processes.
+`ucx_transfer_bytes` counts successful UCX payload bytes on the initiating
+agent. A server bound to `0.0.0.0` reports that wildcard in `ucx_endpoint`;
+route clients to the server's reachable address.
+
+The TCP fallback remains available with `tcp_listen_host`, `tcp_endpoint`,
+and the default `RemoteDevice(..., transport="tcp")`. Its server accepts
+loopback binds only. The batch API is identical for both transports.
+
+UCX uses `tcp_max_request_bytes`, `tcp_max_staging_bytes`,
+`tcp_max_workers`, and `tcp_request_timeout` for its control and staging
+limits. Each batch stages at most its summed item length on each side. Each
+UCX direction has its own NIXL agent and a lazy registered staging pool capped
+by `tcp_max_staging_bytes`. Registrations stay live for reuse until agent
+close, so metadata refreshes add stable descriptors without disconnecting
+inbound transfers. A transfer holds its staging lease until NIXL reports
+terminal completion. If control is lost while remote access may still be
+active, the server retains that allocation against the pool cap until process
+teardown. An uncertain NIXL release or failed deregistration similarly retains
+client staging. UCX transfers to the same peer are serialized while metadata
+is refreshed. Control connections and file operations can overlap, but this
+peer serialization can limit scaling at higher queue depths. Transport timings
+should account for control connection setup and initial staging registration.
+If the initiating agent
+loses a remote request before receiving its terminal reply, it suppresses its
+naming-service terminal report. The data-owning agent reports after file I/O
+and UCX transfer complete; a management fence remains the recovery path if
+the data-owning agent is unreachable.
 
 Bootstrap configuration calls the generation `logical_device_generation`;
 `agent_epoch` remains accepted as a compatibility alias for the V1 wire/API
@@ -67,8 +97,6 @@ The runtime marker is currently enabled for Linux AIO and POSIX AIO. io_uring
 terminal-submit recovery still needs an explicit kernel-owned request drain, so
 that queue remains fail-closed on an ambiguous fatal submission.
 
-The current remote path is the functional TCP fallback because UCX is not
-available in this validation environment. UCX/RDMA integration and performance
-validation remain follow-up work. Cancellation is best-effort: the public
+Cancellation is best-effort: the public
 result becomes `CANCELLED` only after the underlying local or remote operation
 is terminal, so registered buffers are never released early.

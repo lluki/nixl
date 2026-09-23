@@ -36,6 +36,7 @@ from .transport import (
     TcpShardTransport,
     TransportError,
 )
+from .ucx_transport import UcxShardServer, UcxShardTransport
 
 
 class CompletionStatus(str, Enum):
@@ -74,6 +75,8 @@ class AgentConfig:
     tcp_max_request_bytes: int = 64 * 1024 * 1024
     tcp_max_staging_bytes: int = 256 * 1024 * 1024
     tcp_max_workers: int = 8
+    ucx_listen_host: str | None = None
+    ucx_listen_port: int = 0
 
 
 @dataclass(frozen=True)
@@ -161,7 +164,7 @@ class _PendingBatch:
 
 @dataclass
 class _RemotePendingBatch:
-    future: Future[list[tuple[CompletionStatus, int, str]]]
+    future: Future[list[tuple[CompletionStatus, int, str, bool]]]
     items: tuple[_PendingItem, ...]
 
 
@@ -214,22 +217,22 @@ class ShardAgent:
             max_staging_bytes=config.tcp_max_staging_bytes,
         )
         self._tcp_server: TcpShardServer | None = None
+        self._ucx_server: UcxShardServer | None = None
+        self._ucx_transport: UcxShardTransport | None = None
+        self._ucx_outbound_nixl: Any = None
+        self._ucx_inbound_nixl: Any = None
         self._safe_posix_error_release = False
 
         try:
-            # Local POSIX completion is driven by _progress(), so it needs no
-            # native progress thread. Keep both threads for NIXL listeners.
+            native_threads = bool(config.listen_port)
             agent_config = nixl_agent_config(
-                config.listen_port != 0,
+                native_threads,
                 config.listen_port != 0,
                 config.listen_port,
                 backends=[],
-                # Local POSIX calls are serialized by self._lock. Avoid Abseil's
-                # lock graph for short-lived agents; retain native locking when
-                # NIXL has a listener thread.
                 sync_mode=(
                     nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT
-                    if config.listen_port
+                    if native_threads
                     else nixl_thread_sync_t.NIXL_THREAD_SYNC_NONE
                 ),
             )
@@ -240,6 +243,31 @@ class ShardAgent:
             if "POSIX" not in self._nixl.get_plugin_list():
                 raise RuntimeError("NIXL POSIX plugin is not available")
             self._nixl.create_backend("POSIX")
+
+            def open_ucx_agent(role: str) -> Any:
+                ucx_config = nixl_agent_config(
+                    True,
+                    False,
+                    0,
+                    backends=[],
+                    sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
+                )
+                ucx = nixl_agent(f"{agent_name}-{role}", ucx_config)
+                if "UCX" not in ucx.get_plugin_list():
+                    raise RuntimeError("NIXL UCX plugin is not available")
+                ucx.create_backend("UCX")
+                return ucx
+
+            if any(remote.transport == "ucx" for remote in config.remote_devices):
+                self._ucx_outbound_nixl = open_ucx_agent("ucx-out")
+                self._ucx_transport = UcxShardTransport(
+                    self._ucx_outbound_nixl,
+                    timeout=config.tcp_request_timeout,
+                    max_request_bytes=config.tcp_max_request_bytes,
+                    max_staging_bytes=config.tcp_max_staging_bytes,
+                )
+            if config.ucx_listen_host is not None:
+                self._ucx_inbound_nixl = open_ucx_agent("ucx-in")
             self._safe_posix_error_release = bool(
                 getattr(nixl_bindings, "HAVE_SAFE_POSIX_ERROR_RELEASE_CORE", False)
                 and self._nixl.get_backend_params("POSIX").get("safe_error_release")
@@ -259,10 +287,25 @@ class ShardAgent:
                     max_staging_bytes=config.tcp_max_staging_bytes,
                     max_workers=config.tcp_max_workers,
                 )
+            if config.ucx_listen_host is not None:
+                self._ucx_server = UcxShardServer(
+                    TcpEndpoint(config.ucx_listen_host, config.ucx_listen_port),
+                    lambda operation, items, payload: self._handle_remote_request(
+                        operation, items, payload, report_terminal=False
+                    ),
+                    self._ucx_inbound_nixl,
+                    terminal_callback=self._emit_remote_terminal_reports,
+                    timeout=config.tcp_request_timeout,
+                    max_request_bytes=config.tcp_max_request_bytes,
+                    max_staging_bytes=config.tcp_max_staging_bytes,
+                    max_workers=config.tcp_max_workers,
+                )
         except Exception:
             try:
                 if self._tcp_server is not None:
                     self._tcp_server.close()
+                if self._ucx_server is not None:
+                    self._ucx_server.close()
                 self._remote_executor.shutdown(wait=True, cancel_futures=True)
                 if config.create:
                     try:
@@ -293,6 +336,14 @@ class ShardAgent:
     def tcp_endpoint(self) -> TcpEndpoint | None:
         return None if self._tcp_server is None else self._tcp_server.endpoint
 
+    @property
+    def ucx_endpoint(self) -> TcpEndpoint | None:
+        return None if self._ucx_server is None else self._ucx_server.endpoint
+
+    @property
+    def ucx_transfer_bytes(self) -> int:
+        return 0 if self._ucx_transport is None else self._ucx_transport.transfer_bytes
+
     @staticmethod
     def _validate_config(config: AgentConfig) -> None:
         if config.size <= 0:
@@ -315,6 +366,8 @@ class ShardAgent:
             raise ValueError("TCP byte limits must be positive")
         if config.tcp_max_workers <= 0:
             raise ValueError("tcp_max_workers must be positive")
+        if config.ucx_listen_port < 0 or config.ucx_listen_port > 65535:
+            raise ValueError("UCX control port is invalid")
         remote_ids = [remote.logical_device_id for remote in config.remote_devices]
         if len(remote_ids) != len(set(remote_ids)):
             raise ValueError("remote logical device ids must be unique")
@@ -327,6 +380,8 @@ class ShardAgent:
                 raise ValueError("remote logical device generation must be positive")
             if not remote.host or remote.port <= 0 or remote.port > 65535:
                 raise ValueError("remote device endpoint is invalid")
+            if remote.transport not in ("tcp", "ucx"):
+                raise ValueError("remote device transport is invalid")
 
     @staticmethod
     def _open_file(config: AgentConfig) -> int:
@@ -471,6 +526,7 @@ class ShardAgent:
                     self._remote_devices[device_id].endpoint,
                     remote_items,
                     operation,
+                    self._remote_devices[device_id].transport,
                 )
             self._progress()
             return handles
@@ -548,6 +604,7 @@ class ShardAgent:
             tuple[OperationHandle, IoItem, _RegisteredMemory, BufferRegion]
         ],
         operation: str,
+        transport: str,
     ) -> None:
         batch_id = uuid.uuid4().hex
         pending_items = tuple(
@@ -557,7 +614,7 @@ class ShardAgent:
             for public_handle, item, _, _ in accepted
         )
         future = self._remote_executor.submit(
-            self._run_remote_batch, endpoint, tuple(accepted), operation
+            self._run_remote_batch, endpoint, tuple(accepted), operation, transport
         )
         self._remote_pending[batch_id] = _RemotePendingBatch(future, pending_items)
         for pending_item in pending_items:
@@ -570,7 +627,8 @@ class ShardAgent:
             tuple[OperationHandle, IoItem, _RegisteredMemory, BufferRegion], ...
         ],
         operation: str,
-    ) -> list[tuple[CompletionStatus, int, str]]:
+        transport: str,
+    ) -> list[tuple[CompletionStatus, int, str, bool]]:
         wire_items = [
             {
                 "device_id": item.device_id,
@@ -595,14 +653,18 @@ class ShardAgent:
                     for _, item, _, region in accepted
                 )
 
-            results, response_payload = self._transport.request(
+            selected_transport = (
+                self._ucx_transport if transport == "ucx" else self._transport
+            )
+            assert selected_transport is not None
+            results, response_payload = selected_transport.request(
                 endpoint,
                 "store" if operation == "WRITE" else "load",
                 wire_items,
                 store_payload if operation == "WRITE" else b"",
             )
             cursor = 0
-            converted: list[tuple[CompletionStatus, int, str]] = []
+            converted: list[tuple[CompletionStatus, int, str, bool]] = []
             for result, (_, item, _, region) in zip(results, accepted, strict=True):
                 try:
                     status = CompletionStatus(str(result["status"]))
@@ -624,28 +686,29 @@ class ShardAgent:
                         item.length,
                     )
                 cursor += item.length
-                converted.append((status, transferred, detail))
+                converted.append((status, transferred, detail, True))
             return converted
         except TransportError as exc:
             try:
                 status = CompletionStatus(exc.status)
             except ValueError:
                 status = CompletionStatus.INTERNAL
-            return [(status, 0, exc.detail) for _ in accepted]
+            return [(status, 0, exc.detail, False) for _ in accepted]
         except Exception as exc:
-            return [(CompletionStatus.INTERNAL, 0, str(exc)) for _ in accepted]
+            return [(CompletionStatus.INTERNAL, 0, str(exc), False) for _ in accepted]
 
     def _handle_remote_request(
         self,
         operation: str,
         items: Sequence[dict[str, Any]],
         payload: bytes,
+        *,
+        report_terminal: bool = True,
     ) -> tuple[list[dict[str, Any]], bytes]:
-        """Execute a TCP fallback request against the owned fixed file.
+        """Execute a remote request against the owned fixed file.
 
-        TCP is a functional stand-in for the planned UCX staging path.  The
-        transport owns the bounded staging buffers; this lock keeps shutdown
-        from deregistering and closing the file while a request is active.
+        The transport owns bounded staging until transfer and file I/O are
+        terminal. This lock keeps shutdown from closing the file meanwhile.
         """
 
         results: list[dict[str, Any]] = []
@@ -733,7 +796,7 @@ class ShardAgent:
                     terminal_reports.setdefault(report_key, report)
                 if operation == "load":
                     response.extend(loaded)
-            if self._config.io_terminal_callback is not None:
+            if report_terminal and self._config.io_terminal_callback is not None:
                 for report in terminal_reports.values():
                     try:
                         self._config.io_terminal_callback(report)
@@ -743,6 +806,35 @@ class ShardAgent:
                         # fallback for a failed callback.
                         pass
         return results, bytes(response)
+
+    def _emit_remote_terminal_reports(self, items: Sequence[dict[str, Any]]) -> None:
+        callback = self._config.io_terminal_callback
+        if callback is None:
+            return
+        reports: dict[tuple[str, ...], dict[str, Any]] = {}
+        for item in items:
+            report = item.get("terminal_report")
+            if not isinstance(report, dict):
+                continue
+            key = tuple(
+                repr(report.get(field))
+                for field in (
+                    "token_kind",
+                    "token_id",
+                    "service_epoch",
+                    "device_id",
+                    "agent_epoch",
+                    "extent_generation",
+                    "device_generation",
+                    "client_id",
+                )
+            )
+            reports.setdefault(key, report)
+        for report in reports.values():
+            try:
+                callback(report)
+            except Exception:
+                pass
 
     def _remote_pwrite(self, data: bytes, offset: int) -> int:
         if not self._config.direct_io:
@@ -944,7 +1036,8 @@ class ShardAgent:
                 results = pending.future.result()
             except Exception as exc:
                 results = [
-                    (CompletionStatus.INTERNAL, 0, str(exc)) for _ in pending.items
+                    (CompletionStatus.INTERNAL, 0, str(exc), False)
+                    for _ in pending.items
                 ]
             self._remote_pending.pop(batch_id, None)
             if len(results) != len(pending.items):
@@ -953,15 +1046,20 @@ class ShardAgent:
                         CompletionStatus.DATA_LOSS,
                         0,
                         "remote result count does not match pending batch",
+                        False,
                     )
                     for _ in pending.items
                 ]
-            for item, (status, transferred, detail) in zip(
+            for item, (status, transferred, detail, confirmed_terminal) in zip(
                 pending.items, results, strict=True
             ):
                 self._pending_handles.pop(item.handle.id, None)
                 self._record_completion(
-                    item.handle, status, transferred, detail, item.terminal_report
+                    item.handle,
+                    status,
+                    transferred,
+                    detail,
+                    item.terminal_report if confirmed_terminal else None,
                 )
 
     def cancel(self, handles: Sequence[OperationHandle]) -> None:
@@ -1052,6 +1150,12 @@ class ShardAgent:
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
                 self._tcp_server.close(timeout=remaining)
+            if self._ucx_server is not None:
+                teardown_started = True
+                remaining = (
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                self._ucx_server.close(timeout=remaining)
             while True:
                 with self._lock:
                     self._progress()
@@ -1072,6 +1176,8 @@ class ShardAgent:
             raise
 
     def _teardown_locked(self) -> None:
+        if self._ucx_transport is not None:
+            self._ucx_transport.close()
         for memory_id, registered in list(self._memory.items()):
             self._nixl.deregister_memory(registered.nixl_descs, backends=["POSIX"])
             del self._memory[memory_id]
