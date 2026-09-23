@@ -58,7 +58,13 @@ loopback binds only. The batch API is identical for both transports.
 
 UCX uses `tcp_max_request_bytes`, `tcp_max_staging_bytes`,
 `tcp_max_workers`, and `tcp_request_timeout` for its control and staging
-limits. Each batch stages at most its summed item length on each side. Each
+limits. Set `tcp_max_request_bytes` above the sum of the item lengths in the
+largest batch, and keep `tcp_max_staging_bytes` at least as large on both
+agents. For example, eight Qwen3-32B-FP8 KV pages of about 16 MiB each exceed
+the 64 MiB default request limit; a 256 MiB request limit and a 512 MiB staging
+limit passed the GB200 model-level L3 check. A rejected batch returns an error
+for each item and does not publish its reserved extents. Each batch stages at
+most its summed item length on each side. Each
 UCX direction has its own NIXL agent and a lazy registered staging pool capped
 by `tcp_max_staging_bytes`. Registrations stay live for reuse until agent
 close, so metadata refreshes add stable descriptors without disconnecting
