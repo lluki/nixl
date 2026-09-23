@@ -43,6 +43,9 @@ For UCX, set `ucx_listen_host` on the device-owning agent, read its
 `ucx_endpoint`, and add a matching `RemoteDevice(..., transport="ucx")` to
 the routing agent. The endpoint is the control socket; the agents exchange
 NIXL metadata there and transfer registered staging bytes through UCX. For
+`bootstrap.create_client`, use `ucx_listen_host` and `ucx_listen_port` in the
+local config and set `transport: "ucx"` on each UCX `remote_devices` entry.
+The bootstrap registers a `ucx://` endpoint with the naming service. For
 example, on a GB200 pair with RDMA device `mlx5_0:1`, set
 `UCX_TLS=rc,cuda_copy` and `UCX_NET_DEVICES=mlx5_0:1` in both processes.
 `ucx_transfer_bytes` counts successful UCX payload bytes on the initiating

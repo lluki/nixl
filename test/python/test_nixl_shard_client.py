@@ -330,3 +330,37 @@ def test_async_submission_has_bounded_admission(tmp_path, monkeypatch):
         release.set()
         client.close()
         agent.close(timeout=5)
+
+
+def test_bootstrap_configures_ucx_listener_and_peer_route(tmp_path):
+    client = create_client(
+        {
+            "file_path": tmp_path / "bootstrap-ucx.bin",
+            "size": 64 * 1024,
+            "device_id": 11,
+            "create": True,
+            "direct_io": False,
+            "embedded_service": True,
+            "embedded_service_name": str(tmp_path),
+            "ucx_listen_host": "127.0.0.1",
+            "ucx_listen_port": 0,
+            "remote_devices": [
+                {
+                    "device_id": 12,
+                    "host": "127.0.0.1",
+                    "port": 19100,
+                    "transport": "ucx",
+                }
+            ],
+        }
+    )
+    try:
+        agent = client._agent
+        endpoint = agent.ucx_endpoint
+        assert endpoint is not None
+        assert endpoint.port > 0
+        assert agent._config.remote_devices[0].transport == "ucx"
+        [registered] = client._config.service.list_devices()
+        assert registered.agent_endpoint == f"ucx://127.0.0.1:{endpoint.port}"
+    finally:
+        client.close()

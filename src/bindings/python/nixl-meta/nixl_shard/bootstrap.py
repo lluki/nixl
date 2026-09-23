@@ -85,6 +85,7 @@ def create_client(config: Mapping[str, Any]) -> ShardClient:
                     remote.get("agent_epoch", 1),
                 )
             ),
+            transport=str(remote.get("transport", "tcp")),
         )
         for remote in config.get("remote_devices", ())
     )
@@ -126,15 +127,19 @@ def create_client(config: Mapping[str, Any]) -> ShardClient:
                 config.get("tcp_max_staging_bytes", 256 * 1024 * 1024)
             ),
             tcp_max_workers=int(config.get("tcp_max_workers", 8)),
+            ucx_listen_host=config.get("ucx_listen_host"),
+            ucx_listen_port=int(config.get("ucx_listen_port", 0)),
         )
     )
     try:
-        endpoint = agent.tcp_endpoint
-        agent_endpoint = (
-            f"tcp://{endpoint.host}:{endpoint.port}"
-            if endpoint is not None
-            else f"inproc://{device_id}"
-        )
+        ucx_endpoint = agent.ucx_endpoint
+        tcp_endpoint = agent.tcp_endpoint
+        if ucx_endpoint is not None:
+            agent_endpoint = f"ucx://{ucx_endpoint.host}:{ucx_endpoint.port}"
+        elif tcp_endpoint is not None:
+            agent_endpoint = f"tcp://{tcp_endpoint.host}:{tcp_endpoint.port}"
+        else:
+            agent_endpoint = f"inproc://{device_id}"
         registration = service.register_device(
             DeviceRegistration(
                 device_id=device_id,
