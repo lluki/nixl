@@ -564,10 +564,21 @@ class ShardClient:
             location = locations[0]
             pending.append((index, key, regions, location, lease, logical_length))
 
+        prepare_ns = time.perf_counter_ns() - lookup_ended_ns
+        register_ns = 0
+        io_build_ns = 0
+        submit_ns = 0
+        wait_ns = 0
+        unregister_ns = 0
+        terminal_report_ns = 0
+        release_ns = 0
+        touch_ns = 0
         if pending:
             flat_regions = [region for entry in pending for region in entry[2]]
             try:
+                register_started_ns = time.perf_counter_ns()
                 memory = self._agent.register_memory(flat_regions)
+                register_ns = time.perf_counter_ns() - register_started_ns
             except BaseException:
                 self._abandon_leases([entry[4] for entry in pending])
                 raise
@@ -575,6 +586,7 @@ class ShardClient:
             handles: Sequence[Any] = ()
             groups: list[tuple[int, int]] = []
             try:
+                io_build_started_ns = time.perf_counter_ns()
                 io_items = []
                 memory_index = 0
                 for index, _, regions, location, lease, logical_length in pending:
@@ -605,8 +617,13 @@ class ShardClient:
                         device_offset += length
                         remaining -= length
                     groups.append((start, len(io_items) - start))
+                io_build_ns = time.perf_counter_ns() - io_build_started_ns
+                submit_started_ns = time.perf_counter_ns()
                 handles = self._agent.submit_batch_load(io_items)
+                submit_ns = time.perf_counter_ns() - submit_started_ns
+                wait_started_ns = time.perf_counter_ns()
                 completions = self._safe_wait(handles, started, timeout)
+                wait_ns = time.perf_counter_ns() - wait_started_ns
             except BaseException:
                 terminal = not handles
                 if handles:
@@ -624,7 +641,9 @@ class ShardClient:
                 raise
             finally:
                 if completions:
+                    unregister_started_ns = time.perf_counter_ns()
                     self._agent.unregister_memory(memory)
+                    unregister_ns = time.perf_counter_ns() - unregister_started_ns
 
             reports = []
             leases = []
@@ -670,10 +689,16 @@ class ShardClient:
                     }:
                         status = KVStatus.MISS
                     results[index] = KVResult(key, status, detail=failure.detail)
+            terminal_report_started_ns = time.perf_counter_ns()
             self._report_terminal(reports)
+            terminal_report_ns = time.perf_counter_ns() - terminal_report_started_ns
+            release_started_ns = time.perf_counter_ns()
             self._release_leases(leases)
+            release_ns = time.perf_counter_ns() - release_started_ns
             if touches:
+                touch_started_ns = time.perf_counter_ns()
                 self._metadata("batch_touch", touches)
+                touch_ns = time.perf_counter_ns() - touch_started_ns
 
         final = [result for result in results if result is not None]
         assert len(final) == len(items)
@@ -705,6 +730,15 @@ class ShardClient:
                 "lookup_started_ns": lookup_started_ns,
                 "lookup_ended_ns": lookup_ended_ns,
                 "metadata_lookup_ns": lookup_ns,
+                "prepare_ns": prepare_ns,
+                "register_memory_ns": register_ns,
+                "io_build_ns": io_build_ns,
+                "submit_ns": submit_ns,
+                "wait_ns": wait_ns,
+                "unregister_memory_ns": unregister_ns,
+                "terminal_report_ns": terminal_report_ns,
+                "release_lease_ns": release_ns,
+                "touch_ns": touch_ns,
                 "client_e2e_ns": client_e2e_ns,
             }
         )

@@ -666,7 +666,9 @@ class ShardAgent:
                 wire_items,
                 store_payload if operation == "WRITE" else b"",
             )
+            transport_returned_ns = time.perf_counter_ns()
             cursor = 0
+            destination_copy_ns = 0
             converted: list[tuple[CompletionStatus, int, str, bool]] = []
             for result, (_, item, _, region) in zip(results, accepted, strict=True):
                 try:
@@ -683,11 +685,13 @@ class ShardAgent:
                         f"successful {operation.lower()} has a short byte count",
                     )
                 if operation == "READ" and status is CompletionStatus.OK:
+                    copy_started_ns = time.perf_counter_ns()
                     ctypes.memmove(
                         region.address + item.memory_offset,
                         response_payload[cursor : cursor + item.length],
                         item.length,
                     )
+                    destination_copy_ns += time.perf_counter_ns() - copy_started_ns
                 cursor += item.length
                 converted.append((status, transferred, detail, True))
             if operation == "READ" and transport == "ucx" and results:
@@ -706,6 +710,11 @@ class ShardAgent:
                         "server_stage_ns": int(
                             results[0].get("_nixlshard_server_stage_ns", 0)
                         ),
+                        "client_staging_read_ns": int(
+                            results[0].get("_nixlshard_staging_read_ns", 0)
+                        ),
+                        "destination_copy_ns": destination_copy_ns,
+                        "transport_returned_ns": transport_returned_ns,
                         "rdma_transfer_ns": int(
                             results[0].get("_nixlshard_rdma_ns", 0)
                         ),

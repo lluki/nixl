@@ -117,7 +117,14 @@ needed. `server_stage_ns` measures the server's serial SSD reads and copy
 into registered DRAM staging for the entire UCX batch. `rdma_transfer_ns`
 measures the client's NIXL UCX transfer from that staging buffer through
 terminal completion. `agent_remote_ns` includes the UCX control protocol,
-transfer, and copy into the caller's buffer. The stage and RDMA fields are
-batch wall durations, not per-item times to add together. An SGLang request
+transfer, and copy into the caller's buffer. `client_staging_read_ns`
+measures the copy from registered UCX DRAM to a Python byte string;
+`destination_copy_ns` measures the serial byte-string slices and copies
+into caller buffers. `client_get` also reports buffer registration, I/O
+item construction, submission, wait, unregistration, terminal report, lease
+release, and touch durations. These are subspans of `agent_remote_ns` and
+`client_e2e_ns`, respectively, and must not be added again to the main
+breakdown. The stage and RDMA fields are batch wall durations, not per-item
+times to add together. An SGLang request
 may contain multiple batches, and concurrent batches may overlap; preserve
 the batch boundaries when attributing end-to-end latency.

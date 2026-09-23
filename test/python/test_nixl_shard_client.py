@@ -97,6 +97,9 @@ def test_get_trace_records_lookup_and_request_id(client_stack, monkeypatch, tmp_
     assert event["request_ids"] == ["trace-get"]
     assert event["metadata_lookup_ns"] > 0
     assert event["client_e2e_ns"] >= event["metadata_lookup_ns"]
+    assert event["register_memory_ns"] > 0
+    assert event["wait_ns"] > 0
+    assert event["terminal_report_ns"] > 0
     assert client.batch_exists([b"trace-key"]) == [True]
     get_event, exists_event = [
         json.loads(line) for line in trace_path.read_text().splitlines()

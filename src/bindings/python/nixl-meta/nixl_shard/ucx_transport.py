@@ -372,12 +372,20 @@ class UcxShardTransport:
                     if not isinstance(results, list) or len(results) != len(items):
                         raise TransportError("DATA_LOSS", "invalid UCX result count")
                     if operation == "load":
+                        staging_read_started_ns = time.perf_counter_ns()
+                        loaded = staging.read(length)
+                        staging_read_ns = (
+                            time.perf_counter_ns() - staging_read_started_ns
+                        )
                         for result in results:
                             result["_nixlshard_rdma_ns"] = transfer_ns
                             result["_nixlshard_rdma_started_ns"] = transfer_started_ns
                             result["_nixlshard_rdma_ended_ns"] = transfer_ended_ns
+                            result["_nixlshard_staging_read_ns"] = staging_read_ns
+                    else:
+                        loaded = b""
                     healthy = True
-                    return results, staging.read(length) if operation == "load" else b""
+                    return results, loaded
                 finally:
                     self._controls.release(endpoint, connection, healthy=healthy)
             except UcxOwnershipError:

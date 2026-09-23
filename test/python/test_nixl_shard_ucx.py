@@ -123,6 +123,8 @@ def test_ucx_repeated_multi_item_round_trip(tmp_path, monkeypatch):
             assert loads[0]["request_ids"] == ["load-0-0", "load-0-1"]
             assert loads[0]["server_stage_ns"] > 0
             assert loads[0]["rdma_transfer_ns"] > 0
+            assert loads[0]["client_staging_read_ns"] > 0
+            assert loads[0]["destination_copy_ns"] > 0
             client.unregister_memory(src)
             client.unregister_memory(dst)
             client.unregister_memory(large_src)
