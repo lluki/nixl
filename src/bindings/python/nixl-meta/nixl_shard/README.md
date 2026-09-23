@@ -73,9 +73,13 @@ terminal completion. If control is lost while remote access may still be
 active, the server retains that allocation against the pool cap until process
 teardown. An uncertain NIXL release or failed deregistration similarly retains
 client staging. UCX transfers to the same peer are serialized while metadata
-is refreshed. Control connections and file operations can overlap, but this
-peer serialization can limit scaling at higher queue depths. Transport timings
-should account for control connection setup and initial staging registration.
+is refreshed. Control TCP connections are reused across batches and capped at
+`tcp_max_workers` on the routing agent. The server closes an idle connection
+after at least 30 seconds and drains idle connections on shutdown; any failed
+exchange discards its socket. Control connections and file operations can
+overlap, but peer serialization can limit scaling at higher queue depths.
+Transport timings should account for initial control connection setup and
+staging registration.
 If the initiating agent
 loses a remote request before receiving its terminal reply, it suppresses its
 naming-service terminal report. The data-owning agent reports after file I/O

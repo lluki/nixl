@@ -19,7 +19,7 @@ from nixl_shard import (
 from nixl_shard import ucx_transport
 
 
-def test_ucx_repeated_multi_item_round_trip(tmp_path):
+def test_ucx_repeated_multi_item_round_trip(tmp_path, monkeypatch):
     server_config = AgentConfig(
         tmp_path / "ucx-server.bin",
         65536,
@@ -49,6 +49,17 @@ def test_ucx_repeated_multi_item_round_trip(tmp_path):
                 ),
             )
         ) as client:
+            opened = 0
+            create_connection = ucx_transport.socket.create_connection
+
+            def counted_connection(*args, **kwargs):
+                nonlocal opened
+                opened += 1
+                return create_connection(*args, **kwargs)
+
+            monkeypatch.setattr(
+                ucx_transport.socket, "create_connection", counted_connection
+            )
             source = bytearray(b"a" * 4096 + b"b" * 4096)
             target = bytearray(8192)
             src = client.register_memory([buffer_region_from_writable(source)])
@@ -91,10 +102,64 @@ def test_ucx_repeated_multi_item_round_trip(tmp_path):
             assert client.ucx_transfer_bytes == 8 * 4 * 4096 + 2 * 16384 + 2 * 4096
             assert client._ucx_transport._pool._allocated == 8192 + 16384
             assert server._ucx_server._pool._allocated == 8192 + 16384
+            assert opened == 1  # Nineteen batches used one control connection.
             client.unregister_memory(src)
             client.unregister_memory(dst)
             client.unregister_memory(large_src)
             client.unregister_memory(large_dst)
+
+
+def test_ucx_server_close_drains_idle_persistent_control(tmp_path):
+    try:
+        server = ShardAgent.open(
+            AgentConfig(
+                tmp_path / "ucx-close-server.bin",
+                32768,
+                logical_device_id=2,
+                create=True,
+                direct_io=False,
+                ucx_listen_host="127.0.0.1",
+                tcp_max_workers=4,
+            )
+        )
+    except RuntimeError as exc:
+        if "UCX plugin is not available" in str(exc):
+            pytest.skip(str(exc))
+        raise
+    endpoint = server.ucx_endpoint
+    assert endpoint is not None
+    client = ShardAgent.open(
+        AgentConfig(
+            tmp_path / "ucx-close-client.bin",
+            4096,
+            logical_device_id=1,
+            create=True,
+            direct_io=False,
+            tcp_max_workers=4,
+            remote_devices=(
+                RemoteDevice(2, endpoint.host, endpoint.port, transport="ucx"),
+            ),
+        )
+    )
+    try:
+        source = bytearray(b"x" * 32768)
+        memory = client.register_memory([buffer_region_from_writable(source)])
+        handles = [
+            client.submit_batch_store([IoItem(2, i * 4096, memory, 0, i * 4096, 4096)])[
+                0
+            ]
+            for i in range(8)
+        ]
+        assert all(
+            result.status is CompletionStatus.OK
+            for result in client.wait(handles, timeout=20)
+        )
+        assert 1 <= client._ucx_transport._controls._total <= 4
+        server.close(timeout=2)
+        client.unregister_memory(memory)
+    finally:
+        client.close(timeout=5)
+        server.close(timeout=5)
 
 
 def test_ucx_staging_deregister_error_retains_allocation(monkeypatch):

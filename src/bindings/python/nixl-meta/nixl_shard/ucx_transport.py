@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import select
 import socket
 import threading
 import time
@@ -127,6 +128,92 @@ class _StagingPool:
             raise first_error
 
 
+class _ControlPool:
+    """Reuse at most ``capacity`` request sockets across remote endpoints."""
+
+    def __init__(self, capacity: int):
+        self._capacity = capacity
+        self._total = 0
+        self._idle: dict[TcpEndpoint, list[socket.socket]] = {}
+        self._closed = False
+        self._condition = threading.Condition()
+
+    def acquire(self, endpoint: TcpEndpoint, timeout: float) -> socket.socket:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                if self._closed:
+                    raise TransportError("UNAVAILABLE", "UCX control pool is closed")
+                idle = self._idle.get(endpoint)
+                if idle:
+                    connection = idle.pop()
+                    try:
+                        stale = bool(select.select([connection], [], [], 0)[0])
+                    except (OSError, ValueError):
+                        stale = True
+                    if stale:
+                        connection.close()
+                        self._total -= 1
+                        continue
+                    return connection
+                if self._total < self._capacity:
+                    self._total += 1
+                    break
+                # An idle socket to another endpoint must not block a newly
+                # routed device when the global connection cap is full.
+                other = next(
+                    (
+                        sockets
+                        for key, sockets in self._idle.items()
+                        if key != endpoint and sockets
+                    ),
+                    None,
+                )
+                if other is not None:
+                    other.pop().close()
+                    self._total -= 1
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TransportError(
+                        "RESOURCE_EXHAUSTED", "UCX control connection limit reached"
+                    )
+                self._condition.wait(remaining)
+        try:
+            connection = socket.create_connection(
+                (endpoint.host, endpoint.port), timeout=timeout
+            )
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            connection.settimeout(None)
+            return connection
+        except BaseException:
+            with self._condition:
+                self._total -= 1
+                self._condition.notify_all()
+            raise
+
+    def release(
+        self, endpoint: TcpEndpoint, connection: socket.socket, *, healthy: bool
+    ) -> None:
+        with self._condition:
+            if healthy and not self._closed:
+                self._idle.setdefault(endpoint, []).append(connection)
+            else:
+                connection.close()
+                self._total -= 1
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            idle = [socket_ for sockets in self._idle.values() for socket_ in sockets]
+            self._idle.clear()
+            self._total -= len(idle)
+            self._condition.notify_all()
+        for connection in idle:
+            connection.close()
+
+
 class _UcxPeer:
     def __init__(self, agent: Any):
         self.agent = agent
@@ -198,11 +285,13 @@ class UcxShardTransport:
         timeout: float,
         max_request_bytes: int,
         max_staging_bytes: int,
+        max_connections: int,
     ):
         self._peer = _UcxPeer(agent)
         self._timeout = timeout
         self._max_request_bytes = max_request_bytes
         self._pool = _StagingPool(agent, max_staging_bytes)
+        self._controls = _ControlPool(max_connections)
         self._transfer_bytes = 0
 
     @property
@@ -227,10 +316,9 @@ class UcxShardTransport:
             if operation == "store":
                 staging.write(payload() if callable(payload) else payload)
             try:
-                with socket.create_connection(
-                    (endpoint.host, endpoint.port), timeout=self._timeout
-                ) as connection:
-                    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                connection = self._controls.acquire(endpoint, self._timeout)
+                healthy = False
+                try:
                     # Once the request can reach the server, wait for its
                     # terminal reply; the fixed-file I/O may have committed.
                     connection.settimeout(None)
@@ -280,7 +368,10 @@ class UcxShardTransport:
                     results = terminal.get("results")
                     if not isinstance(results, list) or len(results) != len(items):
                         raise TransportError("DATA_LOSS", "invalid UCX result count")
+                    healthy = True
                     return results, staging.read(length) if operation == "load" else b""
+                finally:
+                    self._controls.release(endpoint, connection, healthy=healthy)
             except UcxOwnershipError:
                 retain_staging = True
                 raise
@@ -297,6 +388,7 @@ class UcxShardTransport:
                 self._pool.release(staging, uncertain=retain_staging)
 
     def close(self) -> None:
+        self._controls.close()
         self._pool.close()
 
 
@@ -329,6 +421,25 @@ class UcxShardServer(TcpShardServer):
         )
 
     def _handle(self, connection: socket.socket) -> None:
+        idle_timeout = max(30.0, self._timeout * 4)
+        idle_deadline = time.monotonic() + idle_timeout
+        while not self._closed.is_set():
+            try:
+                readable, _, _ = select.select([connection], [], [], 0.1)
+            except (OSError, ValueError):
+                return
+            if not readable:
+                if time.monotonic() >= idle_deadline:
+                    return
+                continue
+            # Bound a partial header. Once the server advertises a registered
+            # address, _handle_one switches to a terminal wait with no timeout.
+            connection.settimeout(self._timeout)
+            if not self._handle_one(connection):
+                return
+            idle_deadline = time.monotonic() + idle_timeout
+
+    def _handle_one(self, connection: socket.socket) -> bool:
         length = 0
         staging = None
         transfer_pending = False
@@ -377,6 +488,7 @@ class UcxShardServer(TcpShardServer):
             _send_frame(
                 connection, {"version": _PROTOCOL_VERSION, "results": results}, b""
             )
+            return True
         except TransportError as exc:
             try:
                 _send_frame(
@@ -406,6 +518,7 @@ class UcxShardServer(TcpShardServer):
         finally:
             if staging is not None:
                 self._pool.release(staging, uncertain=transfer_pending)
+        return False
 
     def close(self, timeout: float | None = None) -> None:
         super().close(timeout)

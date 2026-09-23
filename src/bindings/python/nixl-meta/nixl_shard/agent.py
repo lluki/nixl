@@ -265,6 +265,7 @@ class ShardAgent:
                     timeout=config.tcp_request_timeout,
                     max_request_bytes=config.tcp_max_request_bytes,
                     max_staging_bytes=config.tcp_max_staging_bytes,
+                    max_connections=config.tcp_max_workers,
                 )
             if config.ucx_listen_host is not None:
                 self._ucx_inbound_nixl = open_ucx_agent("ucx-in")
