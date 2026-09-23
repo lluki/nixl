@@ -749,36 +749,15 @@ class ShardClient:
         if not keys:
             return []
         started_ns = time.perf_counter_ns()
-        lookups = [
-            _make(
-                LookupItem,
-                key=_key_bytes(key),
-                lease_ttl_s=self._config.read_lease_ttl_s,
-                client_id=self.client_id,
-                request_id=uuid.uuid4().hex,
-            )
-            for key in keys
-        ]
+        normalized_keys = [_key_bytes(key) for key in keys]
         lookup_started_ns = time.perf_counter_ns()
-        lookup_results = self._metadata("batch_lookup", lookups)
+        found = self._metadata("batch_exists", normalized_keys)
         lookup_ended_ns = time.perf_counter_ns()
         lookup_ns = lookup_ended_ns - lookup_started_ns
-        leases = [
-            getattr(result, "lease", getattr(result, "read_lease", None))
-            for result in lookup_results
-        ]
-        real_leases = [lease for lease in leases if lease is not None]
-        report_started_ns = time.perf_counter_ns()
-        self._report_terminal([self._terminal_report(lease) for lease in real_leases])
-        report_ns = time.perf_counter_ns() - report_started_ns
-        release_started_ns = time.perf_counter_ns()
-        self._release_leases(real_leases)
-        release_ns = time.perf_counter_ns() - release_started_ns
-        found = [
-            _result_code(result) in {"OK", "SUCCESS", "READY"}
-            and getattr(result, "mapping", None) is not None
-            for result in lookup_results
-        ]
+        if len(found) != len(normalized_keys) or any(
+            not isinstance(item, bool) for item in found
+        ):
+            raise RuntimeError("metadata batch_exists returned invalid results")
         with self._lock:
             self._metrics["exists_items"] += len(keys)
         client_ended_ns = time.perf_counter_ns()
@@ -788,14 +767,14 @@ class ShardClient:
                 "event": "client_exists",
                 "started_ns": started_ns,
                 "ended_ns": client_ended_ns,
-                "key_digests": [_key_digest(key) for key in keys],
+                "key_digests": [_key_digest(key) for key in normalized_keys],
                 "item_count": len(keys),
                 "hits": sum(found),
                 "lookup_started_ns": lookup_started_ns,
                 "lookup_ended_ns": lookup_ended_ns,
                 "metadata_lookup_ns": lookup_ns,
-                "terminal_report_ns": report_ns,
-                "release_lease_ns": release_ns,
+                "terminal_report_ns": 0,
+                "release_lease_ns": 0,
                 "client_e2e_ns": client_e2e_ns,
             }
         )

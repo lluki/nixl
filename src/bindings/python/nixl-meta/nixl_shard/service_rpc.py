@@ -62,6 +62,7 @@ _RPC_METHODS = {
     "batch_commit",
     "batch_abort",
     "batch_lookup",
+    "batch_exists",
     "batch_renew_read",
     "batch_release_read",
     "batch_touch",
@@ -398,6 +399,9 @@ class ShardNamingTCPClient:
 
     def batch_lookup(self, items: Sequence[LookupItem], **kwargs):
         return self._call("batch_lookup", list(items), **kwargs)
+
+    def batch_exists(self, keys: Sequence[bytes], **kwargs):
+        return self._call("batch_exists", list(keys), **kwargs)
 
     def batch_renew_read(self, items: Sequence[RenewReadItem], **kwargs):
         return self._call("batch_renew_read", list(items), **kwargs)

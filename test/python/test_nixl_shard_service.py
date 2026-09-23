@@ -128,6 +128,39 @@ def test_reserved_is_invisible_commit_publishes_and_immutable_put_converges():
     service.validate_invariants()
 
 
+def test_batch_exists_is_read_only_and_does_not_reserve_future_get():
+    service, _ = _service(pages=2)
+    reservation = _reserve(service, b"ready", "reserve-ready")
+    assert service.batch_exists([b"ready", b"missing"]) == [False, False]
+    _commit(service, reservation, "commit-ready")
+
+    before = service.get_metrics()
+    assert service.batch_exists([b"ready", b"missing", b"ready"]) == [
+        True,
+        False,
+        True,
+    ]
+    after = service.get_metrics()
+    assert after["leases_active"] == before["leases_active"] == 0
+    assert after["lookups"] == before["lookups"]
+    assert after["lookup_misses"] == before["lookup_misses"]
+
+    # Exists is a snapshot, not a lease. A stopped device can invalidate the
+    # object before the subsequent GET lookup.
+    service.stop_device(7, 11)
+    assert service.batch_exists([b"ready"]) == [False]
+    [miss] = service.batch_lookup([LookupItem(b"ready", "reader", "after-stop")])
+    assert miss.code is ResultCode.NOT_FOUND
+
+
+def test_batch_exists_preserves_batch_limits_and_key_validation():
+    service, _ = _service(max_batch_items=2)
+    with pytest.raises(BatchRejectedError, match="item limit"):
+        service.batch_exists([b"a", b"b", b"c"])
+    with pytest.raises(BatchRejectedError, match="non-empty bytes"):
+        service.batch_exists([b""])
+
+
 def test_batches_are_ordered_partial_and_idempotent_with_preflight_limits():
     service, _ = _service(pages=4, max_batch_items=3)
     items = [

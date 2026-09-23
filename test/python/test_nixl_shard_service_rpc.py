@@ -69,6 +69,7 @@ def test_tcp_proxy_round_trip_across_process_and_restart_epoch():
         [lookup] = client.batch_lookup([LookupItem(b"rpc-key", "rpc-reader", "lookup")])
         assert lookup.code is ResultCode.OK
         assert lookup.mapping == committed.mapping
+        assert client.batch_exists([b"rpc-key", b"missing"]) == [True, False]
         assert client.get_capacity(3).ready_bytes == PAGE
         assert client.validate_invariants() is None
 

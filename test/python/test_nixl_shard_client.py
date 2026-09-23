@@ -75,7 +75,13 @@ def test_batched_set_get_exists_and_duplicate(client_stack):
     loaded = client.batch_get(keys, destinations)
     assert [result.status for result in loaded] == [KVStatus.OK, KVStatus.OK]
     assert destinations == sources
+    before = client.get_metrics()["metadata_calls"]
     assert client.batch_exists([keys[0], b"missing"]) == [True, False]
+    assert client.get_metrics()["metadata_calls"] - before == 1
+    page_keys = [keys[0]] + [f"missing/{index}".encode() for index in range(46)]
+    before = client.get_metrics()["metadata_calls"]
+    assert client.batch_exists(page_keys) == [True] + [False] * 46
+    assert client.get_metrics()["metadata_calls"] - before == 1
     service.validate_invariants()
     assert service.get_metrics()["leases_active"] == 0
 
@@ -107,6 +113,8 @@ def test_get_trace_records_lookup_and_request_id(client_stack, monkeypatch, tmp_
     assert exists_event["event"] == "client_exists"
     assert exists_event["key_digests"] == get_event["key_digests"]
     assert exists_event["metadata_lookup_ns"] > 0
+    assert exists_event["terminal_report_ns"] == 0
+    assert exists_event["release_lease_ns"] == 0
 
 
 def test_ordered_mixed_results_and_numa_hint(client_stack):
@@ -300,7 +308,7 @@ def test_registration_failure_releases_read_lease(client_stack, monkeypatch):
 
 
 def test_metadata_batches_obey_byte_limit(tmp_path):
-    service = ShardNamingService(ServiceConfig(auto_evict=False, max_batch_bytes=300))
+    service = ShardNamingService(ServiceConfig(auto_evict=False, max_batch_bytes=80))
     agent = ShardAgent.open(
         AgentConfig(
             tmp_path / "byte-batches.bin",

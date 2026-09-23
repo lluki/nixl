@@ -628,6 +628,41 @@ class ShardNamingService:
                 for item in items
             ]
 
+    def batch_exists(
+        self,
+        keys: Sequence[bytes],
+        *,
+        batch_request_id: str = "",
+        deadline: Optional[float] = None,
+    ) -> list[bool]:
+        """Return a point-in-time readability check without acquiring leases.
+
+        A subsequent lookup may miss if an object is evicted or its device
+        becomes unavailable in the meantime.
+        """
+        with self._lock:
+            self._preflight(keys, deadline, batch_request_id)
+            if any(not isinstance(key, bytes) or not key for key in keys):
+                raise BatchRejectedError("keys must be non-empty bytes")
+            self._maintenance()
+            found = []
+            for key in keys:
+                obj = self._objects_by_key.get(key)
+                if obj is None or obj.state != "ready":
+                    found.append(False)
+                    continue
+                location = obj.mapping.locations[0]
+                device = self._devices.get(location.device_id)
+                found.append(
+                    device is not None
+                    and device.healthy
+                    and device.state is DeviceState.ONLINE
+                    and device.registration.agent_epoch == location.agent_epoch
+                    and device.registration.device_generation
+                    == location.device_generation
+                )
+            return found
+
     def batch_lookup(
         self,
         items: Sequence[LookupItem],
