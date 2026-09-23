@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import threading
 import time
@@ -32,6 +33,7 @@ from .service import (
     ReserveItem,
     TouchItem,
 )
+from .trace import emit_trace
 
 
 class KVStatus(str, Enum):
@@ -118,6 +120,10 @@ def _key_bytes(key: bytes | str) -> bytes:
             raise ValueError("key must not be empty")
         return encoded
     raise TypeError("key must be bytes or str")
+
+
+def _key_digest(key: bytes | str) -> str:
+    return hashlib.sha256(_key_bytes(key)).hexdigest()
 
 
 def _buffer_region(value: Any) -> BufferRegion:
@@ -478,6 +484,7 @@ class ShardClient:
             return []
         timeout = self._config.default_timeout_s if timeout is None else timeout
         started = time.monotonic()
+        started_ns = time.perf_counter_ns()
         results: list[KVResult | None] = [None] * len(items)
         valid: list[tuple[int, GetItem, bytes, tuple[BufferRegion, ...], int]] = []
         for index, item in enumerate(items):
@@ -510,7 +517,10 @@ class ShardClient:
             )
             for _, item, key, _, _ in valid
         ]
+        lookup_started_ns = time.perf_counter_ns()
         lookup_results = self._metadata("batch_lookup", lookups)
+        lookup_ended_ns = time.perf_counter_ns()
+        lookup_ns = lookup_ended_ns - lookup_started_ns
         pending: list[tuple[int, bytes, tuple[BufferRegion, ...], Any, Any, int]] = []
         for (index, _, key, regions, capacity), lookup in zip(
             valid, lookup_results, strict=True
@@ -567,7 +577,7 @@ class ShardClient:
             try:
                 io_items = []
                 memory_index = 0
-                for _, _, regions, location, lease, logical_length in pending:
+                for index, _, regions, location, lease, logical_length in pending:
                     start = len(io_items)
                     device_offset = location.offset
                     remaining = logical_length
@@ -588,6 +598,7 @@ class ShardClient:
                                 ),
                                 authority_epoch=getattr(lease, "service_epoch", None),
                                 terminal_report=self._terminal_report_dict(lease),
+                                request_id=items[index].request_id,
                             )
                         )
                         memory_index += 1
@@ -679,12 +690,31 @@ class ShardClient:
                 for result in final
                 if result.status is KVStatus.OK
             )
+        client_ended_ns = time.perf_counter_ns()
+        client_e2e_ns = client_ended_ns - started_ns
+        emit_trace(
+            {
+                "event": "client_get",
+                "started_ns": started_ns,
+                "ended_ns": client_ended_ns,
+                "request_ids": [item.request_id for item in items],
+                "key_digests": [_key_digest(item.key) for item in items],
+                "item_count": len(items),
+                "bytes": sum(result.logical_length for result in final if result.ok),
+                "statuses": [result.status.value for result in final],
+                "lookup_started_ns": lookup_started_ns,
+                "lookup_ended_ns": lookup_ended_ns,
+                "metadata_lookup_ns": lookup_ns,
+                "client_e2e_ns": client_e2e_ns,
+            }
+        )
         return final
 
     def batch_exists(self, keys: Sequence[bytes | str]) -> list[bool]:
         self._ensure_open()
         if not keys:
             return []
+        started_ns = time.perf_counter_ns()
         lookups = [
             _make(
                 LookupItem,
@@ -695,7 +725,10 @@ class ShardClient:
             )
             for key in keys
         ]
+        lookup_started_ns = time.perf_counter_ns()
         lookup_results = self._metadata("batch_lookup", lookups)
+        lookup_ended_ns = time.perf_counter_ns()
+        lookup_ns = lookup_ended_ns - lookup_started_ns
         leases = [
             getattr(result, "lease", getattr(result, "read_lease", None))
             for result in lookup_results
@@ -710,6 +743,22 @@ class ShardClient:
         ]
         with self._lock:
             self._metrics["exists_items"] += len(keys)
+        client_ended_ns = time.perf_counter_ns()
+        client_e2e_ns = client_ended_ns - started_ns
+        emit_trace(
+            {
+                "event": "client_exists",
+                "started_ns": started_ns,
+                "ended_ns": client_ended_ns,
+                "key_digests": [_key_digest(key) for key in keys],
+                "item_count": len(keys),
+                "hits": sum(found),
+                "lookup_started_ns": lookup_started_ns,
+                "lookup_ended_ns": lookup_ended_ns,
+                "metadata_lookup_ns": lookup_ns,
+                "client_e2e_ns": client_e2e_ns,
+            }
+        )
         return found
 
     def submit_batch_set(

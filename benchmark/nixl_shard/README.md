@@ -102,3 +102,22 @@ python benchmark/nixl_shard/nixlshard_e2e.py \
 For a small first check use `--sizes 4k 16k --batch-sizes 1 4 --rounds 1`.
 For a loopback baseline, run the server and client in one Pod using
 `--transport tcp` and `--remote-host 127.0.0.1`.
+
+## Opt-in GET timing trace
+
+Set `NIXLSHARD_TRACE_PATH=/path/to/trace.jsonl` in the client process to
+append `client_exists`, `client_get`, and `ucx_load` JSON records. Each
+`client_get` has request IDs propagated to the UCX data path, so its
+`ucx_load` record can be matched even when batches run concurrently.
+`client_exists` and `client_get` also contain SHA256 key digests to match
+an existence check that precedes a GET. The trace does not include raw keys.
+
+`metadata_lookup_ns` measures the naming RPC call, including its retry if
+needed. `server_stage_ns` measures the server's serial SSD reads and copy
+into registered DRAM staging for the entire UCX batch. `rdma_transfer_ns`
+measures the client's NIXL UCX transfer from that staging buffer through
+terminal completion. `agent_remote_ns` includes the UCX control protocol,
+transfer, and copy into the caller's buffer. The stage and RDMA fields are
+batch wall durations, not per-item times to add together. An SGLang request
+may contain multiple batches, and concurrent batches may overlap; preserve
+the batch boundaries when attributing end-to-end latency.

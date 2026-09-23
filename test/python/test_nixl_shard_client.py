@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -77,6 +78,32 @@ def test_batched_set_get_exists_and_duplicate(client_stack):
     assert client.batch_exists([keys[0], b"missing"]) == [True, False]
     service.validate_invariants()
     assert service.get_metrics()["leases_active"] == 0
+
+
+def test_get_trace_records_lookup_and_request_id(client_stack, monkeypatch, tmp_path):
+    trace_path = tmp_path / "client-trace.jsonl"
+    monkeypatch.setenv("NIXLSHARD_TRACE_PATH", str(trace_path))
+    client, _ = client_stack
+    source = bytearray(b"trace-value")
+    assert client.batch_set([b"trace-key"], [source])[0].ok
+    destination = bytearray(len(source))
+    result = client.batch_get(
+        [GetItem(b"trace-key", destination, request_id="trace-get")]
+    )
+    assert result[0].status is KVStatus.OK
+    assert destination == source
+    [event] = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert event["event"] == "client_get"
+    assert event["request_ids"] == ["trace-get"]
+    assert event["metadata_lookup_ns"] > 0
+    assert event["client_e2e_ns"] >= event["metadata_lookup_ns"]
+    assert client.batch_exists([b"trace-key"]) == [True]
+    get_event, exists_event = [
+        json.loads(line) for line in trace_path.read_text().splitlines()
+    ]
+    assert exists_event["event"] == "client_exists"
+    assert exists_event["key_digests"] == get_event["key_digests"]
+    assert exists_event["metadata_lookup_ns"] > 0
 
 
 def test_ordered_mixed_results_and_numa_hint(client_stack):

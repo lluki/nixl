@@ -344,6 +344,7 @@ class UcxShardTransport:
                             str(ready["ucx_metadata"]),
                             str(ready["ucx_agent_name"]),
                         )
+                        transfer_started_ns = time.perf_counter_ns()
                         self._peer.transfer(
                             "WRITE" if operation == "store" else "READ",
                             staging.address,
@@ -351,6 +352,8 @@ class UcxShardTransport:
                             length,
                             peer,
                         )
+                        transfer_ended_ns = time.perf_counter_ns()
+                        transfer_ns = transfer_ended_ns - transfer_started_ns
                         self._transfer_bytes += length
                     _send_frame(
                         connection,
@@ -368,6 +371,11 @@ class UcxShardTransport:
                     results = terminal.get("results")
                     if not isinstance(results, list) or len(results) != len(items):
                         raise TransportError("DATA_LOSS", "invalid UCX result count")
+                    if operation == "load":
+                        for result in results:
+                            result["_nixlshard_rdma_ns"] = transfer_ns
+                            result["_nixlshard_rdma_started_ns"] = transfer_started_ns
+                            result["_nixlshard_rdma_ended_ns"] = transfer_ended_ns
                     healthy = True
                     return results, staging.read(length) if operation == "load" else b""
                 finally:
@@ -457,8 +465,12 @@ class UcxShardServer(TcpShardServer):
                 )
             staging = self._pool.acquire(length, self._timeout)
             if operation == "load":
+                stage_started_ns = time.perf_counter_ns()
                 results, data = self._handler(operation, items, b"")
                 staging.write(data)
+                stage_ns = time.perf_counter_ns() - stage_started_ns
+                for result in results:
+                    result["_nixlshard_server_stage_ns"] = stage_ns
             # A lost control connection does not prove that an RDMA WRITE
             # stopped touching this address. Retain its registration and
             # budget until process teardown if completion is ambiguous.

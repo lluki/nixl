@@ -37,6 +37,7 @@ from .transport import (
     TransportError,
 )
 from .ucx_transport import UcxShardServer, UcxShardTransport
+from .trace import emit_trace
 
 
 class CompletionStatus(str, Enum):
@@ -658,6 +659,7 @@ class ShardAgent:
                 self._ucx_transport if transport == "ucx" else self._transport
             )
             assert selected_transport is not None
+            request_started_ns = time.perf_counter_ns()
             results, response_payload = selected_transport.request(
                 endpoint,
                 "store" if operation == "WRITE" else "load",
@@ -688,6 +690,34 @@ class ShardAgent:
                     )
                 cursor += item.length
                 converted.append((status, transferred, detail, True))
+            if operation == "READ" and transport == "ucx" and results:
+                request_ended_ns = time.perf_counter_ns()
+                emit_trace(
+                    {
+                        "event": "ucx_load",
+                        "started_ns": request_started_ns,
+                        "ended_ns": request_ended_ns,
+                        "request_ids": [item.request_id for _, item, _, _ in accepted],
+                        "item_count": len(accepted),
+                        "bytes": sum(item.length for _, item, _, _ in accepted),
+                        "statuses": [
+                            str(result.get("status", "")) for result in results
+                        ],
+                        "server_stage_ns": int(
+                            results[0].get("_nixlshard_server_stage_ns", 0)
+                        ),
+                        "rdma_transfer_ns": int(
+                            results[0].get("_nixlshard_rdma_ns", 0)
+                        ),
+                        "rdma_started_ns": int(
+                            results[0].get("_nixlshard_rdma_started_ns", 0)
+                        ),
+                        "rdma_ended_ns": int(
+                            results[0].get("_nixlshard_rdma_ended_ns", 0)
+                        ),
+                        "agent_remote_ns": request_ended_ns - request_started_ns,
+                    }
+                )
             return converted
         except TransportError as exc:
             try:

@@ -4,6 +4,7 @@
 """Focused UCX staging and repeated-metadata regression tests."""
 
 import ctypes
+import json
 import socket
 
 import pytest
@@ -20,6 +21,8 @@ from nixl_shard import ucx_transport
 
 
 def test_ucx_repeated_multi_item_round_trip(tmp_path, monkeypatch):
+    trace_path = tmp_path / "ucx-trace.jsonl"
+    monkeypatch.setenv("NIXLSHARD_TRACE_PATH", str(trace_path))
     server_config = AgentConfig(
         tmp_path / "ucx-server.bin",
         65536,
@@ -64,9 +67,20 @@ def test_ucx_repeated_multi_item_round_trip(tmp_path, monkeypatch):
             target = bytearray(8192)
             src = client.register_memory([buffer_region_from_writable(source)])
             dst = client.register_memory([buffer_region_from_writable(target)])
-            for _ in range(8):
+            for iteration in range(8):
                 stores = [IoItem(2, i * 4096, src, 0, i * 4096, 4096) for i in range(2)]
-                loads = [IoItem(2, i * 4096, dst, 0, i * 4096, 4096) for i in range(2)]
+                loads = [
+                    IoItem(
+                        2,
+                        i * 4096,
+                        dst,
+                        0,
+                        i * 4096,
+                        4096,
+                        request_id=f"load-{iteration}-{i}",
+                    )
+                    for i in range(2)
+                ]
                 assert all(
                     x.status is CompletionStatus.OK
                     for x in client.store_batch(stores, timeout=10)
@@ -103,6 +117,12 @@ def test_ucx_repeated_multi_item_round_trip(tmp_path, monkeypatch):
             assert client._ucx_transport._pool._allocated == 8192 + 16384
             assert server._ucx_server._pool._allocated == 8192 + 16384
             assert opened == 1  # Nineteen batches used one control connection.
+            trace = [json.loads(line) for line in trace_path.read_text().splitlines()]
+            loads = [event for event in trace if event["event"] == "ucx_load"]
+            assert len(loads) == 9
+            assert loads[0]["request_ids"] == ["load-0-0", "load-0-1"]
+            assert loads[0]["server_stage_ns"] > 0
+            assert loads[0]["rdma_transfer_ns"] > 0
             client.unregister_memory(src)
             client.unregister_memory(dst)
             client.unregister_memory(large_src)
