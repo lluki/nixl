@@ -316,12 +316,15 @@ class UcxShardTransport:
             if operation == "store":
                 staging.write(payload() if callable(payload) else payload)
             try:
+                control_started_ns = time.perf_counter_ns()
                 connection = self._controls.acquire(endpoint, self._timeout)
+                control_acquire_ns = time.perf_counter_ns() - control_started_ns
                 healthy = False
                 try:
                     # Once the request can reach the server, wait for its
                     # terminal reply; the fixed-file I/O may have committed.
                     connection.settimeout(None)
+                    request_send_started_ns = time.perf_counter_ns()
                     _send_frame(
                         connection,
                         {
@@ -331,7 +334,10 @@ class UcxShardTransport:
                         },
                         b"",
                     )
+                    request_send_ns = time.perf_counter_ns() - request_send_started_ns
+                    ready_wait_started_ns = time.perf_counter_ns()
                     ready, ready_length = _recv_header(connection)
+                    ready_wait_ns = time.perf_counter_ns() - ready_wait_started_ns
                     if ready_length or ready.get("version") != _PROTOCOL_VERSION:
                         raise TransportError("DATA_LOSS", "invalid UCX ready frame")
                     if ready.get("error_status"):
@@ -340,10 +346,12 @@ class UcxShardTransport:
                             str(ready.get("detail", "")),
                         )
                     with self._peer.lock:
+                        peer_connect_started_ns = time.perf_counter_ns()
                         peer = self._peer.connect(
                             str(ready["ucx_metadata"]),
                             str(ready["ucx_agent_name"]),
                         )
+                        peer_connect_ns = time.perf_counter_ns() - peer_connect_started_ns
                         transfer_started_ns = time.perf_counter_ns()
                         self._peer.transfer(
                             "WRITE" if operation == "store" else "READ",
@@ -355,12 +363,16 @@ class UcxShardTransport:
                         transfer_ended_ns = time.perf_counter_ns()
                         transfer_ns = transfer_ended_ns - transfer_started_ns
                         self._transfer_bytes += length
+                    transferred_send_started_ns = time.perf_counter_ns()
                     _send_frame(
                         connection,
                         {"version": _PROTOCOL_VERSION, "phase": "transferred"},
                         b"",
                     )
+                    transferred_send_ns = time.perf_counter_ns() - transferred_send_started_ns
+                    terminal_wait_started_ns = time.perf_counter_ns()
                     terminal, terminal_length = _recv_header(connection)
+                    terminal_wait_ns = time.perf_counter_ns() - terminal_wait_started_ns
                     if terminal_length or terminal.get("version") != _PROTOCOL_VERSION:
                         raise TransportError("DATA_LOSS", "invalid UCX terminal frame")
                     if terminal.get("error_status"):
@@ -382,6 +394,12 @@ class UcxShardTransport:
                             result["_nixlshard_rdma_started_ns"] = transfer_started_ns
                             result["_nixlshard_rdma_ended_ns"] = transfer_ended_ns
                             result["_nixlshard_staging_read_ns"] = staging_read_ns
+                            result["_nixlshard_control_acquire_ns"] = control_acquire_ns
+                            result["_nixlshard_request_send_ns"] = request_send_ns
+                            result["_nixlshard_ready_wait_ns"] = ready_wait_ns
+                            result["_nixlshard_peer_connect_ns"] = peer_connect_ns
+                            result["_nixlshard_transferred_send_ns"] = transferred_send_ns
+                            result["_nixlshard_terminal_wait_ns"] = terminal_wait_ns
                     else:
                         loaded = b""
                     healthy = True
@@ -504,7 +522,12 @@ class UcxShardServer(TcpShardServer):
             transfer_pending = False
             if operation == "store":
                 results, _ = self._handler(operation, items, staging.read(length))
+            terminal_callback_started_ns = time.perf_counter_ns()
             self._terminal_callback(items)
+            terminal_callback_ns = time.perf_counter_ns() - terminal_callback_started_ns
+            if operation == "load":
+                for result in results:
+                    result["_nixlshard_server_terminal_callback_ns"] = terminal_callback_ns
             _send_frame(
                 connection, {"version": _PROTOCOL_VERSION, "results": results}, b""
             )

@@ -669,6 +669,7 @@ class ShardAgent:
             transport_returned_ns = time.perf_counter_ns()
             cursor = 0
             destination_copy_ns = 0
+            destination_slice_ns = 0
             converted: list[tuple[CompletionStatus, int, str, bool]] = []
             for result, (_, item, _, region) in zip(results, accepted, strict=True):
                 try:
@@ -685,10 +686,13 @@ class ShardAgent:
                         f"successful {operation.lower()} has a short byte count",
                     )
                 if operation == "READ" and status is CompletionStatus.OK:
+                    slice_started_ns = time.perf_counter_ns()
+                    item_payload = response_payload[cursor : cursor + item.length]
+                    destination_slice_ns += time.perf_counter_ns() - slice_started_ns
                     copy_started_ns = time.perf_counter_ns()
                     ctypes.memmove(
                         region.address + item.memory_offset,
-                        response_payload[cursor : cursor + item.length],
+                        item_payload,
                         item.length,
                     )
                     destination_copy_ns += time.perf_counter_ns() - copy_started_ns
@@ -714,6 +718,14 @@ class ShardAgent:
                             results[0].get("_nixlshard_staging_read_ns", 0)
                         ),
                         "destination_copy_ns": destination_copy_ns,
+                        "destination_slice_ns": destination_slice_ns,
+                        "control_acquire_ns": int(results[0].get("_nixlshard_control_acquire_ns", 0)),
+                        "request_send_ns": int(results[0].get("_nixlshard_request_send_ns", 0)),
+                        "ready_wait_ns": int(results[0].get("_nixlshard_ready_wait_ns", 0)),
+                        "peer_connect_ns": int(results[0].get("_nixlshard_peer_connect_ns", 0)),
+                        "transferred_send_ns": int(results[0].get("_nixlshard_transferred_send_ns", 0)),
+                        "terminal_wait_ns": int(results[0].get("_nixlshard_terminal_wait_ns", 0)),
+                        "server_terminal_callback_ns": int(results[0].get("_nixlshard_server_terminal_callback_ns", 0)),
                         "transport_returned_ns": transport_returned_ns,
                         "rdma_transfer_ns": int(
                             results[0].get("_nixlshard_rdma_ns", 0)

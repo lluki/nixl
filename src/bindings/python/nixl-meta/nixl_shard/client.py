@@ -768,8 +768,12 @@ class ShardClient:
             for result in lookup_results
         ]
         real_leases = [lease for lease in leases if lease is not None]
+        report_started_ns = time.perf_counter_ns()
         self._report_terminal([self._terminal_report(lease) for lease in real_leases])
+        report_ns = time.perf_counter_ns() - report_started_ns
+        release_started_ns = time.perf_counter_ns()
         self._release_leases(real_leases)
+        release_ns = time.perf_counter_ns() - release_started_ns
         found = [
             _result_code(result) in {"OK", "SUCCESS", "READY"}
             and getattr(result, "mapping", None) is not None
@@ -790,6 +794,8 @@ class ShardClient:
                 "lookup_started_ns": lookup_started_ns,
                 "lookup_ended_ns": lookup_ended_ns,
                 "metadata_lookup_ns": lookup_ns,
+                "terminal_report_ns": report_ns,
+                "release_lease_ns": release_ns,
                 "client_e2e_ns": client_e2e_ns,
             }
         )
