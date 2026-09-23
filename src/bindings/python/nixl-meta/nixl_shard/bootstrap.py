@@ -166,6 +166,10 @@ def create_client(config: Mapping[str, Any]) -> ShardClient:
                 reservation_ttl_s=float(config.get("reservation_ttl_s", 30.0)),
                 read_lease_ttl_s=float(config.get("read_lease_ttl_s", 30.0)),
                 max_inflight_batches=int(config.get("max_inflight_batches", 16)),
+                lazy_release=bool(config.get("lazy_release", False)),
+                max_pending_lazy_releases=int(
+                    config.get("max_pending_lazy_releases", 16)
+                ),
                 close_agent_on_close=True,
                 heartbeat_device_id=device_id,
                 heartbeat_agent_epoch=logical_device_generation,

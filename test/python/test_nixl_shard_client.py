@@ -153,6 +153,86 @@ def test_async_batch_retains_buffers_until_wait(client_stack):
     assert destination == source
 
 
+def test_lazy_release_is_bounded_and_close_drains_even_without_wait(
+    client_stack, monkeypatch
+):
+    base, service = client_stack
+    source = bytearray(b"lazy-value")
+    assert base.batch_set([b"lazy-key"], [source])[0].ok
+    client = ShardClient(
+        ClientConfig(
+            service=service,
+            agent=base._agent,
+            lazy_release=True,
+            max_pending_lazy_releases=1,
+        )
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original = service.batch_report_io_terminal
+    calls = 0
+
+    def block_first_report(items, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(5)
+        return original(items, **kwargs)
+
+    monkeypatch.setattr(service, "batch_report_io_terminal", block_first_report)
+    try:
+        for iteration in range(3):
+            destination = bytearray(len(source))
+            assert client.batch_get([b"lazy-key"], [destination])[0].ok
+            assert destination == source
+            if iteration == 0:
+                assert entered.wait(5)
+        metrics = client.get_metrics()
+        assert metrics["lazy_release_enqueued"] == 2
+        assert metrics["lazy_release_fallbacks"] == 1
+        assert metrics["lazy_release_pending"] == 2
+        # The first two leases remain pinned while the report is delayed.
+        assert service.get_metrics()["leases_active"] == 2
+        closer = threading.Thread(target=lambda: client.close(wait=False))
+        closer.start()
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+        release.set()
+        closer.join(timeout=5)
+        assert not closer.is_alive()
+        assert client.get_metrics()["lazy_release_pending"] == 0
+        assert client.get_metrics()["lazy_release_completed"] == 2
+        assert service.get_metrics()["leases_active"] == 0
+        service.validate_invariants()
+    finally:
+        release.set()
+        client.close()
+
+
+def test_lazy_release_reports_background_metadata_failure(client_stack, monkeypatch):
+    base, service = client_stack
+    source = bytearray(b"lazy-error")
+    assert base.batch_set([b"lazy-error-key"], [source])[0].ok
+    client = ShardClient(
+        ClientConfig(service=service, agent=base._agent, lazy_release=True)
+    )
+
+    def fail_release(items, **kwargs):
+        raise TimeoutError("release unavailable")
+
+    monkeypatch.setattr(service, "batch_release_read", fail_release)
+    try:
+        destination = bytearray(len(source))
+        assert client.batch_get([b"lazy-error-key"], [destination])[0].ok
+        assert destination == source
+        client.close()
+        assert client.get_metrics()["lazy_release_failed"] == 1
+        assert "release unavailable" in client.get_lazy_release_errors()[0]
+    finally:
+        client.close()
+
+
 def test_destination_too_small_releases_lease(client_stack):
     client, service = client_stack
     assert client.batch_set([b"large"], [bytearray(b"0123456789")])[0].ok

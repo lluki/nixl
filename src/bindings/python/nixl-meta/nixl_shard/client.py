@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import logging
+import queue
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -59,6 +62,10 @@ class ClientConfig:
     reservation_ttl_s: float = 30.0
     read_lease_ttl_s: float = 30.0
     max_inflight_batches: int = 16
+    # After completed GET I/O, defer terminal report, lease release, and touch.
+    # Defaults to synchronous metadata cleanup and its error semantics.
+    lazy_release: bool = False
+    max_pending_lazy_releases: int = 16
     close_agent_on_close: bool = False
     heartbeat_device_id: int | None = None
     heartbeat_agent_epoch: int | None = None
@@ -208,6 +215,8 @@ class ShardClient:
             raise ValueError("lease durations must be positive")
         if config.max_inflight_batches <= 0:
             raise ValueError("max_inflight_batches must be positive")
+        if config.max_pending_lazy_releases <= 0:
+            raise ValueError("max_pending_lazy_releases must be positive")
         if (config.heartbeat_device_id is None) != (
             config.heartbeat_agent_epoch is None
         ):
@@ -225,6 +234,12 @@ class ShardClient:
         self._lock = threading.RLock()
         self._async: dict[str, tuple[_AsyncBatch, int]] = {}
         self._closed = False
+        self._lazy_release_queue: (
+            queue.Queue[tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]] | None]
+            | None
+        ) = None
+        self._lazy_release_thread: threading.Thread | None = None
+        self._lazy_release_errors: deque[str] = deque(maxlen=16)
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._metrics = {
@@ -237,7 +252,20 @@ class ShardClient:
             "data_bytes": 0,
             "heartbeat_successes": 0,
             "heartbeat_failures": 0,
+            "lazy_release_enqueued": 0,
+            "lazy_release_completed": 0,
+            "lazy_release_failed": 0,
+            "lazy_release_fallbacks": 0,
+            "lazy_release_pending": 0,
         }
+        if config.lazy_release:
+            self._lazy_release_queue = queue.Queue(config.max_pending_lazy_releases)
+            self._lazy_release_thread = threading.Thread(
+                target=self._lazy_release_loop,
+                name="nixlshard-lazy-release",
+                daemon=True,
+            )
+            self._lazy_release_thread.start()
         if config.heartbeat_device_id is not None:
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop,
@@ -573,6 +601,7 @@ class ShardClient:
         terminal_report_ns = 0
         release_ns = 0
         touch_ns = 0
+        lazy_release_enqueued = False
         if pending:
             flat_regions = [region for entry in pending for region in entry[2]]
             try:
@@ -689,16 +718,22 @@ class ShardClient:
                     }:
                         status = KVStatus.MISS
                     results[index] = KVResult(key, status, detail=failure.detail)
-            terminal_report_started_ns = time.perf_counter_ns()
-            self._report_terminal(reports)
-            terminal_report_ns = time.perf_counter_ns() - terminal_report_started_ns
-            release_started_ns = time.perf_counter_ns()
-            self._release_leases(leases)
-            release_ns = time.perf_counter_ns() - release_started_ns
-            if touches:
-                touch_started_ns = time.perf_counter_ns()
-                self._metadata("batch_touch", touches)
-                touch_ns = time.perf_counter_ns() - touch_started_ns
+            # The agent has completed every read and released local registration.
+            # The metadata service retains the extent until the lease is both
+            # released and marked terminal, so delayed cleanup cannot reuse it
+            # while a transfer is in flight.
+            lazy_release_enqueued = self._enqueue_lazy_release(reports, leases, touches)
+            if not lazy_release_enqueued:
+                terminal_report_started_ns = time.perf_counter_ns()
+                self._report_terminal(reports)
+                terminal_report_ns = time.perf_counter_ns() - terminal_report_started_ns
+                release_started_ns = time.perf_counter_ns()
+                self._release_leases(leases)
+                release_ns = time.perf_counter_ns() - release_started_ns
+                if touches:
+                    touch_started_ns = time.perf_counter_ns()
+                    self._metadata("batch_touch", touches)
+                    touch_ns = time.perf_counter_ns() - touch_started_ns
 
         final = [result for result in results if result is not None]
         assert len(final) == len(items)
@@ -739,6 +774,7 @@ class ShardClient:
                 "terminal_report_ns": terminal_report_ns,
                 "release_lease_ns": release_ns,
                 "touch_ns": touch_ns,
+                "lazy_release_enqueued": lazy_release_enqueued,
                 "client_e2e_ns": client_e2e_ns,
             }
         )
@@ -862,6 +898,11 @@ class ShardClient:
         with self._lock:
             return dict(self._metrics)
 
+    def get_lazy_release_errors(self) -> list[str]:
+        """Return recent background cleanup errors, oldest first."""
+        with self._lock:
+            return list(self._lazy_release_errors)
+
     def close(self, wait: bool = True) -> None:
         with self._lock:
             if self._closed:
@@ -871,6 +912,13 @@ class ShardClient:
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=self._config.default_timeout_s)
         self._executor.shutdown(wait=wait, cancel_futures=not wait)
+        # Drain accepted cleanup even for close(wait=False). A GET still running
+        # after that call sees _closed and performs its cleanup synchronously.
+        if self._lazy_release_queue is not None:
+            self._lazy_release_queue.put(None)
+            self._lazy_release_queue.join()
+            assert self._lazy_release_thread is not None
+            self._lazy_release_thread.join()
         if self._config.close_agent_on_close:
             self._agent.close(timeout=self._config.default_timeout_s)
         if (
@@ -897,6 +945,65 @@ class ShardClient:
             with self._lock:
                 metric = "heartbeat_successes" if success else "heartbeat_failures"
                 self._metrics[metric] += 1
+
+    def _enqueue_lazy_release(
+        self, reports: Sequence[Any], leases: Sequence[Any], touches: Sequence[Any]
+    ) -> bool:
+        with self._lock:
+            cleanup_queue = self._lazy_release_queue
+            if cleanup_queue is None:
+                return False
+            if self._closed:
+                self._metrics["lazy_release_fallbacks"] += 1
+                return False
+            try:
+                cleanup_queue.put_nowait(
+                    (tuple(reports), tuple(leases), tuple(touches))
+                )
+            except queue.Full:
+                self._metrics["lazy_release_fallbacks"] += 1
+                return False
+            self._metrics["lazy_release_enqueued"] += 1
+            self._metrics["lazy_release_pending"] += 1
+            return True
+
+    def _lazy_release_loop(self) -> None:
+        cleanup_queue = self._lazy_release_queue
+        assert cleanup_queue is not None
+        while True:
+            item = cleanup_queue.get()
+            try:
+                if item is None:
+                    return
+                reports, leases, touches = item
+                errors = []
+                for phase, operation in (
+                    ("terminal_report", lambda: self._report_terminal(reports)),
+                    ("release_read", lambda: self._release_leases(leases)),
+                    (
+                        "touch",
+                        lambda: (
+                            self._metadata("batch_touch", touches) if touches else None
+                        ),
+                    ),
+                ):
+                    try:
+                        operation()
+                    except Exception as exc:
+                        errors.append(f"{phase}: {type(exc).__name__}: {exc}")
+                with self._lock:
+                    self._metrics["lazy_release_pending"] -= 1
+                    if errors:
+                        self._metrics["lazy_release_failed"] += 1
+                        self._lazy_release_errors.extend(errors)
+                    else:
+                        self._metrics["lazy_release_completed"] += 1
+                for error in errors:
+                    logging.getLogger(__name__).error(
+                        "NIXLShard lazy release failed: %s", error
+                    )
+            finally:
+                cleanup_queue.task_done()
 
     def _submit_async(
         self, method: Any, items: Sequence[Any], second: Any, timeout: float | None
@@ -1128,7 +1235,19 @@ class ShardClient:
             )
             for lease in leases
         ]
-        self._metadata("batch_release_read", items)
+        results = self._metadata("batch_release_read", items)
+        # The lease may have expired and been reclaimed after I/O terminal.
+        failures = [
+            result
+            for result in results
+            if _result_code(result) not in {"OK", "SUCCESS", "NOT_FOUND"}
+        ]
+        if failures:
+            first = failures[0]
+            raise RuntimeError(
+                "metadata authority rejected read lease release: "
+                f"{_result_code(first)} {getattr(first, 'detail', '')}"
+            )
 
     @staticmethod
     def _completion_status(status: CompletionStatus) -> KVStatus:
