@@ -217,12 +217,21 @@ class ShardAgent:
         self._safe_posix_error_release = False
 
         try:
+            # Local POSIX completion is driven by _progress(), so it needs no
+            # native progress thread. Keep both threads for NIXL listeners.
             agent_config = nixl_agent_config(
-                True,
+                config.listen_port != 0,
                 config.listen_port != 0,
                 config.listen_port,
                 backends=[],
-                sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
+                # Local POSIX calls are serialized by self._lock. Avoid Abseil's
+                # lock graph for short-lived agents; retain native locking when
+                # NIXL has a listener thread.
+                sync_mode=(
+                    nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT
+                    if config.listen_port
+                    else nixl_thread_sync_t.NIXL_THREAD_SYNC_NONE
+                ),
             )
             agent_name = config.agent_name or (
                 f"nixlshard-{config.logical_device_id}-{uuid.uuid4().hex[:12]}"

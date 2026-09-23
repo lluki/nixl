@@ -112,7 +112,6 @@ def test_batch_local_posix_round_trip(tmp_path):
                     IoItem(9, 8192, memory, 0, 4096, 4096),
                 ]
             )
-            assert len(agent._pending) == 1
             store_results = agent.wait(stores, timeout=5)
             assert [result.status for result in store_results] == [
                 CompletionStatus.OK,
@@ -166,7 +165,7 @@ def test_writable_buffer_protocol_round_trip(tmp_path):
         agent.unregister_memory(memory)
 
 
-def test_inflight_limit_is_per_item_and_recovers(tmp_path):
+def test_inflight_limit_is_per_item_and_recovers(tmp_path, monkeypatch):
     path = tmp_path / "device.bin"
     allocation = nixl_utils.malloc_passthru(8192)
     try:
@@ -181,6 +180,17 @@ def test_inflight_limit_is_per_item_and_recovers(tmp_path):
             )
         ) as agent:
             memory = agent.register_memory([BufferRegion(allocation, 8192)])
+            original_transfer = agent._nixl.transfer
+            original_check = agent._nixl.check_xfer_state
+
+            def hold_posted_transfer(handle):
+                original_transfer(handle)
+                return "PROC"
+
+            # The POSIX backend can finish in transfer(). Hold the public
+            # completion long enough to exercise active ownership and capacity.
+            monkeypatch.setattr(agent._nixl, "transfer", hold_posted_transfer)
+            monkeypatch.setattr(agent._nixl, "check_xfer_state", lambda handle: "PROC")
             handles = agent.submit_batch_store(
                 [
                     IoItem(2, 0, memory, 0, 0, 4096),
@@ -189,6 +199,8 @@ def test_inflight_limit_is_per_item_and_recovers(tmp_path):
             )
             with pytest.raises(RuntimeError, match="active operation"):
                 agent.unregister_memory(memory)
+            monkeypatch.setattr(agent._nixl, "transfer", original_transfer)
+            monkeypatch.setattr(agent._nixl, "check_xfer_state", original_check)
             results = agent.wait(handles, timeout=5)
             assert [result.status for result in results] == [
                 CompletionStatus.OK,
