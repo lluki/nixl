@@ -51,8 +51,12 @@ agent.close()
 Keys identify immutable, complete values. A successful load returns exactly the
 stored length; mismatched destination length fails. Segments concatenate in caller
 order. Keep registered memory valid until every referencing handle is released.
-The registration token protects lifetime; this first implementation copies caller
-segments through an aligned owned staging pool registered with NIXL once.
+Raw-address registration does not retain a Python buffer object: the caller must
+keep that object alive through release. The token prevents deregistration while
+handles reference it. This first implementation copies caller segments through
+an aligned owned staging pool registered with NIXL once.
+Store packing and successful load copies are gated against cancellation, so
+neither begins after polling has reported a terminal timeout.
 
 Submission returns a handle without connecting peers or waiting for payload I/O.
 `poll()` returns `None` while pending, then a stable per-object status list.
@@ -98,6 +102,9 @@ Default unit size is 64 KiB. Direct I/O uses aligned private buffers and units
 divisible by 4096. Maximum object size is the configured staging slot size.
 Batches contain at most 128 objects; staging, live handles, connections, imported
 peer identities, hint caches and remote cleanup records all have fixed bounds.
+The owner allows 272 control connections for up to 128 peers, including separate
+normal and cleanup channels plus a small control margin. An exists batch shares
+one deadline across all contacted owners; failed calls contribute to its timer.
 
 A timed-out remote operation quarantines its staging destination until the same
 owner incarnation confirms quiescence. Repeated cleanup preserves cancellation

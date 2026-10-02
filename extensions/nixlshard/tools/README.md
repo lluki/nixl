@@ -64,3 +64,57 @@ Each configure embeds `NIXLSHARD_BUILD_GIT` in the Python binding so callers
 can identify the source checkout that produced it. A Git marker identifies
 the current commit; uncommitted changes still require a clean-source check
 when publishing benchmark results.
+
+# GPU serving correctness smoke
+
+The source SGLang pin `20518d8518375f49be0d14ead7ea474dbc2721d0` requires
+Torch 2.13 / CUDA 13 and sglang-kernel 0.4.7. The image's Torch 2.9 / CUDA 12.9
+stack supports the native adapter tests but cannot load that newer kernel ABI.
+Use an isolated Python environment for serving; preserve the image packages:
+
+```bash
+python3 -m venv --system-site-packages /raid/nixlshard-v2/runtime/torch213-cu130
+runtime_python=/raid/nixlshard-v2/runtime/torch213-cu130/bin/python
+export TMPDIR=/raid/nixlshard-v2/runtime/tmp
+export PIP_CACHE_DIR=/raid/nixlshard-v2/runtime/pip-cache
+mkdir -p "$TMPDIR" "$PIP_CACHE_DIR"
+"$runtime_python" -m pip install torch==2.13.0+cu130 torchvision==0.28.0+cu130 \
+    --index-url https://download.pytorch.org/whl/cu130
+"$runtime_python" -m pip install --no-deps torchaudio==2.11.0+cu130 \
+    --index-url https://download.pytorch.org/whl/cu130
+"$runtime_python" -m pip install --no-deps sglang-kernel==0.4.7 \
+    compressed-tensors==0.18.0 \
+    transformers==5.12.1 tokenizers==0.22.2 xgrammar==0.2.1
+"$runtime_python" -m pip install cuda-python==13.4.1 flashinfer-python==0.6.18 \
+    apache-tvm-ffi==0.1.11 cuda-tile==1.6.0rc5 'nvidia-cutlass-dsl[cu13]==4.6.2'
+"$runtime_python" -m pip install --no-deps flashinfer-cubin==0.6.18 \
+    --index-url https://flashinfer.ai/whl
+"$runtime_python" -m pip install --no-deps flashinfer-jit-cache==0.6.18 \
+    --index-url https://flashinfer.ai/whl/cu130
+source /workspace/install/nixlshard/env.sh
+export PYTHONPATH=/workspace/src/sglang/python:$PYTHONPATH
+"$runtime_python" extensions/nixlshard/tools/model-smoke.py \
+    --model-path /raid/models/qwen2.5-0.5b \
+    --model-revision local-qwen2.5-0.5b-sha256-9b54e1ff84127de01ba2b7f2ba86c0cec4bdc3e1c1edbd2d75566168ab5bfdc5
+```
+
+The revision above is the frozen local weights, tokenizer, and configuration
+manifest digest used on the development host. Supply the corresponding immutable
+revision for another model. This recipe inherits the image's other dependencies;
+it is a development serving environment rather than a standalone deployment lock.
+
+The helper starts an A100-compatible BF16 server with one outstanding request,
+waits for a completed SSD backup, flushes device and host caches, and repeats the
+same prompt. It requires storage-hit tokens with zero device/host hit tokens and
+identical generated token IDs. Results, metrics, configuration, server logs, and
+runtime versions go into a new directory under `/raid/nixlshard-v2/model-smoke`.
+The server process group is stopped afterward. Stop serving and native benchmark
+processes before reinstalling libraries into the activated prefix.
+
+This smoke selects `page_first_direct` and the `direct` HiCache I/O backend.
+The initial `page_first` kernel path crashed in upstream GPU-to-host staging:
+JIT compilation used the image's CUDA 12.9 toolkit against a CUDA 13 runtime,
+whose `cudaMemcpyBatchAsync` signature differs. The direct path uses the matching
+prebuilt CUDA 13 kernel and passed the end-to-end SSD replay. Validate a matching
+CUDA 13 compiler before enabling that JIT path. This smoke establishes integration
+correctness; it does not establish the target model's TTFT overhead or RDMA speed.
