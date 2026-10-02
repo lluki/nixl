@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <filesystem>
 #include <iostream>
 #include <libaio.h>
 #include <memory>
@@ -44,6 +45,7 @@ submitMode submit_mode = submitMode::PASS_THROUGH;
 int submit_calls = 0;
 int completion_deferrals = 0;
 int context_probe_calls = 0;
+int release_failures_remaining = 0, release_attempts = 0;
 bool context_probe_requested_events = false;
 long first_requested = 0;
 int first_submitted = 0;
@@ -87,11 +89,12 @@ struct aioTest {
     explicit aioTest(size_t buffer_count = request_count)
         : buffers(buffer_count),
           queue(nixlPosixIOQueue::instantiate("AIO", 128, 16)) {
-        char path[] = "/tmp/nixl_linux_aio_test_XXXXXX";
-        if ((fd = mkstemp(path)) < 0) {
+        auto pattern = (std::filesystem::temp_directory_path() / "nixl_linux_aio_test_XXXXXX").string();
+        std::vector<char> path(pattern.begin(), pattern.end()); path.push_back('\0');
+        if ((fd = mkstemp(path.data())) < 0) {
             throw std::runtime_error("mkstemp failed");
         }
-        unlink(path);
+        unlink(path.data());
         for (size_t i = 0; i < buffers.size(); i++) {
             std::memset(buffers[i].data(), static_cast<int>(i + 1), buffers[i].size());
         }
@@ -174,6 +177,7 @@ setSubmitMode(submitMode mode) {
     submit_calls = 0;
     completion_deferrals = 0;
     context_probe_calls = 0;
+    release_failures_remaining = release_attempts = 0;
     context_probe_requested_events = false;
     first_requested = 0;
     first_submitted = 0;
@@ -239,6 +243,21 @@ io_submit(io_context_t ctx, long nr, struct iocb **iocbpp) {
     }
 
     return real_submit(ctx, nr, iocbpp);
+}
+
+extern "C" int
+io_queue_release(io_context_t ctx) {
+    using release_fn_t = int (*)(io_context_t);
+    static auto real_release = reinterpret_cast<release_fn_t>(dlsym(RTLD_NEXT, "io_queue_release"));
+    if (!real_release) {
+        failDlvsym("io_queue_release", "default");
+    }
+    release_attempts++;
+    if (release_failures_remaining > 0) {
+        release_failures_remaining--;
+        return -EAGAIN;
+    }
+    return real_release(ctx);
 }
 
 extern "C" int
@@ -463,6 +482,29 @@ main() {
         AIO_CHECK(waits == 0 && test.drain() == NIXL_SUCCESS);
         AIO_CHECK(submit_calls == 1);
         AIO_CHECK(cancelled.completions == 1 && cancelled.errors == 1);
+    }
+    {
+        setSubmitMode(submitMode::TERMINAL_CONTEXT);
+        aioTest test;
+        completionState state;
+        AIO_CHECK(test.enqueue(state, 0, request_count));
+        AIO_CHECK(test.queue->post() == NIXL_IN_PROG);
+        AIO_CHECK(first_submitted > 0 && first_submitted < first_requested);
+        const int pending_kernel_callbacks = first_submitted;
+        release_failures_remaining = 2;
+        AIO_CHECK(test.queue->post() == NIXL_IN_PROG); // first failed release
+        AIO_CHECK(release_attempts == 1);
+        // Unsubmitted I/Os can fail immediately; submitted buffers/context remain owned.
+        AIO_CHECK(state.completions == request_count - pending_kernel_callbacks);
+        AIO_CHECK(state.errors == state.completions);
+        AIO_CHECK(test.queue->poll() == NIXL_IN_PROG); // second failed release
+        AIO_CHECK(release_attempts == 2);
+        AIO_CHECK(state.completions == request_count - pending_kernel_callbacks);
+        AIO_CHECK(test.queue->poll() == NIXL_ERR_BACKEND); // release finally quiesces kernel
+        AIO_CHECK(release_attempts == 3);
+        AIO_CHECK(state.completions == request_count && state.errors == request_count);
+        AIO_CHECK(test.queue->poll() == NIXL_ERR_BACKEND);
+        AIO_CHECK(release_attempts == 3); // no double callbacks or release after confirmation
     }
     {
         constexpr int scoped_request_count = 65;

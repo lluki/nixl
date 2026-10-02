@@ -357,6 +357,10 @@ nixlPosixIOQueueLinuxAIO::enterTerminalError() {
         int ret = io_queue_release(io_ctx_);
         if (ret < 0) {
             NIXL_ERROR << "io_queue_release failed: " << nixl_strerror(-ret);
+            // A failed context release does not prove that the kernel stopped
+            // using these IOCBs, buffers or callback contexts. Keep ownership
+            // intact and retry the barrier from terminal-state polling.
+            return;
         }
         io_ctx_active_ = false;
     }
@@ -396,6 +400,12 @@ nixlPosixIOQueueLinuxAIO::cancel(void *ctx, nixlPosixIOQueueCancelDoneCb) {
 nixl_status_t
 nixlPosixIOQueueLinuxAIO::poll(void) {
     if (terminal_error_) {
+        if (io_ctx_active_) {
+            enterTerminalError();
+            if (io_ctx_active_) {
+                return NIXL_IN_PROG;
+            }
+        }
         return NIXL_ERR_BACKEND;
     }
 
