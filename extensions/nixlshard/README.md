@@ -118,3 +118,11 @@ are component counters rather than end-to-end TTFT attribution.
 The development A100/TCP environment validates behavior. The target
 Qwen3-32B-FP8/GB200/RDMA TTFT budget still requires its specified hardware and model
 revision. No target overhead claim is made by local debug-file measurements.
+
+Run `python tools/bench-native.py` from this directory for verified local and
+two-process UCX TCP loads with one request outstanding. It creates disposable
+mock SSD files beneath `/raid/nixlshard-v2` and records component counters.
+Run `python tools/bench-baselines.py` for matching `fio` Linux AIO direct-file
+reads and two-process UCX PUT baselines (`fio` and UCX `ucx_perftest` required).
+Baseline UCX progresses actively, while the runtime uses its configured progress
+thread and polling delay; this difference belongs in any comparison.
