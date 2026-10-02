@@ -166,7 +166,7 @@ struct Agent::Impl {
             auto peer = std::make_shared<Peer>(); peer->endpoint = ep; peers.emplace(owner, peer);
         }
         server = std::make_unique<wire::Server>(config.listen,
-            [this](std::string_view request) { return serve(request); }, config.timeout_ms, 16);
+            [this](std::string_view request) { return serve(request); }, config.timeout_ms, 2 * peer_limit + 16);
         try {
             for (std::size_t i = 0; i < config.workers; ++i) workers.emplace_back([this] { worker(); });
             maintenance = std::thread([this] { maintain(); });
@@ -327,7 +327,7 @@ struct Agent::Impl {
         }
         return {0, result};
     }
-    Status store_object(const Object &object, std::size_t slot, Clock::time_point deadline) {
+    Status store_object(const Object &object, std::size_t slot, Clock::time_point deadline, Batch &batch) {
         const auto bytes = object_bytes(object);
         if (disks.empty()) return Status::no_space;
         auto first = std::hash<std::string>{}(object.key) % disks.size();
@@ -348,7 +348,11 @@ struct Agent::Impl {
             if (allocation.already_present) return Status::success;
             Finally rollback{[&disk, &allocation] { disk.abort(allocation.id); }};
             std::memset(address(slot), 0, allocation.slots.size() * disk.unit_bytes());
-            copy(object, address(slot), true);
+            {
+                std::lock_guard lock(batch.mutex);
+                if (batch.canceled || Clock::now() >= deadline) return Status::timeout;
+                copy(object, address(slot), true);
+            }
             status = disk_io(id, allocation, slot, true, deadline);
             if (status != Status::success) return status;
             status = disk.publish(allocation.id);
@@ -453,7 +457,7 @@ struct Agent::Impl {
                     bool quarantined = false;
                     Finally release_slot{[this, slot, &quarantined] { if (!quarantined) free_slot(*slot); }};
                     try {
-                        result = batch->store ? store_object(batch->objects[i], *slot, batch->deadline) :
+                        result = batch->store ? store_object(batch->objects[i], *slot, batch->deadline, *batch) :
                                  load_object(batch->objects[i], *slot, batch->deadline, quarantined);
                         std::lock_guard lock(batch->mutex);
                         if (batch->canceled || Clock::now() >= batch->deadline) result = Status::timeout;
@@ -492,6 +496,7 @@ struct Agent::Impl {
             if (operation == wire::cleanup) {
                 auto expected = r.str(2048), id = r.str(4096); r.finish();
                 if (expected != identity) return status_reply(Status::not_ready);
+                count("remote_cleanup_requests");
                 std::lock_guard lock(incoming_mutex);
                 auto it = incoming.find(id);
                 wire::Writer w; w.u8(static_cast<unsigned>(Status::success));
@@ -702,6 +707,7 @@ struct Agent::Impl {
         if (keys.size() > batch_limit || (!owners.empty() && keys.size() != owners.size()))
             throw std::invalid_argument("invalid exists batch");
         if (stopping.load()) throw std::runtime_error("agent closing");
+        const auto deadline = Clock::now() + std::chrono::milliseconds(config.timeout_ms);
         std::vector<bool> results(keys.size(), false);
         std::map<std::string, std::vector<std::size_t>> groups;
         for (std::size_t i = 0; i < keys.size(); ++i) {
@@ -713,15 +719,18 @@ struct Agent::Impl {
             if (!owner.empty() && owner != config.name) groups[owner].push_back(i);
         }
         for (auto &[owner, indices] : groups) {
+            if (Clock::now() >= deadline) break;
             auto peer = get_peer(owner); if (!peer) continue;
             std::unique_lock lock(peer->mutex, std::try_to_lock);
             if (!lock.owns_lock() || !peer->channel || !peer->channel->usable()) continue;
             try {
                 wire::Writer w; w.u8(wire::exists); w.str(peer->identity); w.u32(indices.size());
                 for (auto i : indices) w.str(keys[i]);
-                auto start = Clock::now();
-                auto response = peer->channel->call(w.data, config.timeout_ms);
-                elapsed("exists_control_ns", start);
+                const auto start = Clock::now();
+                Finally timed{[this, start] { elapsed("exists_control_ns", start); }};
+                const auto remaining = std::max<std::int64_t>(1,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - start).count());
+                auto response = peer->channel->call(w.data, static_cast<unsigned>(remaining));
                 wire::Reader r(response); if (read_status(r) != Status::success) { r.finish(); continue; }
                 if (r.u32() != indices.size()) throw std::invalid_argument("invalid exists response");
                 for (auto i : indices) results[i] = r.u8() != 0;

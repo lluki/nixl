@@ -44,7 +44,7 @@ if get_option('build_tests')
   nixlshard_test_env.set('NIXL_PLUGIN_DIR',
     join_paths(get_option('prefix'), get_option('libdir'), 'plugins'))
   nixlshard_test_env.set('UCX_TLS', 'tcp,self,cuda_copy')
-  foreach name : ['storage', 'agent', 'metadata', 'remote', 'timeout']
+  foreach name : ['storage', 'agent', 'metadata', 'remote', 'timeout', 'admission']
     exe = executable('nixlshard-' + name + '-test', 'tests/' + name + '_test.cpp',
       dependencies: nixlshard_dep)
     test('nixlshard-' + name, exe, suite: 'nixlshard',
@@ -54,4 +54,8 @@ if get_option('build_tests')
     ['tests/wire_test.cpp', 'src/wire.cpp'],
     include_directories: nixlshard_inc, dependencies: thread_dep)
   test('nixlshard-wire', wire_test, suite: 'nixlshard', timeout: 120)
+  cancellation_test = executable('nixlshard-cancellation-test', 'tests/cancellation_test.cpp',
+    dependencies: [nixlshard_dep, dl_dep], link_args: ['-Wl,--export-dynamic'])
+  test('nixlshard-cancellation', cancellation_test, suite: 'nixlshard',
+    env: nixlshard_test_env, timeout: 120)
 endif
