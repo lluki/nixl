@@ -112,9 +112,10 @@ The server process group is stopped afterward. Stop serving and native benchmark
 processes before reinstalling libraries into the activated prefix.
 
 This smoke selects `page_first_direct` and the `direct` HiCache I/O backend.
-The initial `page_first` kernel path crashed in upstream GPU-to-host staging:
-JIT compilation used the image's CUDA 12.9 toolkit against a CUDA 13 runtime,
-whose `cudaMemcpyBatchAsync` signature differs. The direct path uses the matching
-prebuilt CUDA 13 kernel and passed the end-to-end SSD replay. Validate a matching
-CUDA 13 compiler before enabling that JIT path. This smoke establishes integration
+The initial `page_first` kernel path crashed in upstream GPU-to-host staging.
+A CUDA ABI mismatch is suspected: JIT compilation used the image's CUDA 12.9
+toolkit against a CUDA 13 runtime, whose `cudaMemcpyBatchAsync` signature differs.
+The direct path uses the matching prebuilt CUDA 13 kernel and passed the
+end-to-end SSD replay. Validate a matching CUDA 13 compiler before enabling that
+JIT path; the crash's root cause is not yet confirmed. This smoke establishes integration
 correctness; it does not establish the target model's TTFT overhead or RDMA speed.
