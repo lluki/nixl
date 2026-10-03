@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure client streaming TTFT with verified cold/SSD/host/GPU cache sources.
+"""Measure client streaming TTFT with verified cold/SSD/host/GPU/remote cache sources.
 
 Use a dedicated, already-running SGLang server with metrics enabled, stream
 interval one, immutable NIXLShard model revision, and enough storage capacity.
@@ -229,15 +229,17 @@ def validate_cache(scenario, result, expected_prefix):
         ):
             raise AssertionError(f"cold request had cache hits: {values}")
     else:
-        desired = {"ssd": "storage", "host": "host", "gpu": "device"}[scenario]
+        desired = {"ssd": "storage", "remote": "storage", "host": "host", "gpu": "device"}[scenario]
         if values[desired] < expected_prefix or any(
             values[name] for name in ("device", "host", "storage") if name != desired
         ):
             raise AssertionError(
                 f"{scenario} request was not an isolated >= {expected_prefix}-token hit: {values}"
             )
-        if scenario == "ssd" and values["storage_backend"] != "HiCacheNixlShard":
+        if scenario in ("ssd", "remote") and values["storage_backend"] != "HiCacheNixlShard":
             raise AssertionError(f"SSD hit did not identify HiCacheNixlShard: {values}")
+        if scenario == "remote" and values["storage"] != expected_prefix:
+            raise AssertionError(f"remote storage prefix differs from expected complete pages: {values}")
     return values
 
 
@@ -293,6 +295,42 @@ def metric_total(snapshot, name):
     return sum(value for key, value in snapshot.items() if key.split("{", 1)[0] == name)
 
 
+def metric_deltas(before, after):
+    return {key: value - before.get(key, 0) for key, value in after.items()}
+
+
+def native_bytes(snapshot, component):
+    series = [value for key, value in snapshot.items()
+              if key.startswith("sglang:nixlshard_component_bytes_total{")
+              and f'component="{component}"' in key]
+    if not series:
+        raise ValueError(f"native byte counter missing for {component}")
+    return sum(series)
+
+
+def remote_counter_proof(requester, owner, expected_bytes):
+    observed = {
+        "requester_remote_read_bytes": native_bytes(requester, "remote_read"),
+        "requester_staging_copy_bytes": native_bytes(requester, "staging_copy"),
+        "requester_posix_read_bytes": native_bytes(requester, "posix_read"),
+        "requester_ucx_write_bytes": native_bytes(requester, "ucx_write"),
+        "requester_posix_write_bytes": native_bytes(requester, "posix_write"),
+        "owner_posix_read_bytes": native_bytes(owner, "posix_read"),
+        "owner_ucx_write_bytes": native_bytes(owner, "ucx_write"),
+        "owner_posix_write_bytes": native_bytes(owner, "posix_write"),
+        "owner_staging_copy_bytes": native_bytes(owner, "staging_copy"),
+    }
+    expected = {key: (0 if key in ("requester_posix_read_bytes", "requester_ucx_write_bytes",
+                                 "requester_posix_write_bytes", "owner_posix_write_bytes",
+                                 "owner_staging_copy_bytes")
+                      else expected_bytes) for key in observed}
+    if any(value < 0 or value > expected[key] for key, value in observed.items()):
+        raise AssertionError(f"remote counter window has incorrect/extra payload I/O: {observed}")
+    return {"expected_bytes": expected_bytes, "observed": observed,
+            "exact": observed == expected,
+            "scope": "cumulative native bytes through full generation/export settling; not a first-token timing window"}
+
+
 def percentile(values, percent):
     """Linear interpolation on sorted samples; raw samples remain authoritative."""
     ordered = sorted(values)
@@ -338,16 +376,18 @@ class Experiment:
             },
         }
 
-    def snapshot(self, directory, label):
-        metrics = self.client.request("/metrics")
+    def snapshot(self, directory, label, client=None):
+        client = client or self.client
+        metrics = client.request("/metrics")
         (directory / f"{label}-metrics.txt").write_text(metrics)
         result = {"metrics": metrics_snapshot(metrics)}
-        if self.args.native_stats_url:
-            result["native_stats"] = self.client.request(self.args.native_stats_url)
+        diagnostic_url = self.args.native_stats_url if client is self.client else None
+        if diagnostic_url:
+            result["native_stats"] = client.request(diagnostic_url)
             self.native_diagnostic_received = True
         result["native_component_counters"] = native_component_availability(
             result["metrics"],
-            self.args.native_stats_url,
+            diagnostic_url,
             self.native_diagnostic_received,
         )
         self.native_prometheus_families.update(
@@ -358,18 +398,18 @@ class Experiment:
         )
         return result
 
-    def flush(self):
-        result = self.client.request("/flush_cache?timeout=10", {})
+    def flush(self, client=None):
+        result = (client or self.client).request("/flush_cache?timeout=10", {})
         if "Cache flushed" not in str(result):
             raise RuntimeError(f"upper-tier flush failed: {result}")
         return result
 
-    def await_backup(self, before, expected):
+    def await_backup(self, before, expected, client=None):
         baseline = metric_total(before["metrics"], "sglang:backuped_tokens_total")
         deadline = time.monotonic() + self.args.backup_timeout
         last_total, stable_since = None, None
         while time.monotonic() < deadline:
-            snapshot = metrics_snapshot(self.client.request("/metrics"))
+            snapshot = metrics_snapshot((client or self.client).request("/metrics"))
             total = metric_total(snapshot, "sglang:backuped_tokens_total")
             if total - baseline >= expected:
                 if total != last_total:
@@ -384,8 +424,10 @@ class Experiment:
             time.sleep(0.05)
         raise TimeoutError("seed backup did not complete and settle before SSD flush")
 
-    def generate_record(self, directory, role, ids):
-        result = self.client.generate(self.payload(ids), self.incremental)
+    def generate_record(self, directory, role, ids, client=None, incremental=None):
+        result = (client or self.client).generate(
+            self.payload(ids), self.incremental if incremental is None else incremental
+        )
         (directory / f"{role}.json").write_text(json.dumps(result, indent=2) + "\n")
         if len(result["output_ids"]) != self.args.output_tokens:
             raise AssertionError(
@@ -532,9 +574,191 @@ class Experiment:
         }
 
 
+class RemoteExperiment(Experiment):
+    """Matched requester cold control, owner seed, then validated remote replay."""
+
+    def __init__(self, *args, owner_client, owner_incremental, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.owner_client = owner_client
+        self.owner_incremental = owner_incremental
+
+    @staticmethod
+    def journal(directory, phase, **details):
+        with (directory / "remote-journal.jsonl").open("a") as stream:
+            stream.write(json.dumps({"phase": phase, "monotonic_ns": time.monotonic_ns(),
+                                     **details}) + "\n")
+            stream.flush()
+
+    def archive_phase(self, directory, phase):
+        if self.archives is not None:
+            self.archives.archive(directory, directory.name + "-" + phase + ".zip")
+
+    def settle_remote(self, directory, requester_before, owner_before,
+                      expected_bytes, role):
+        start = time.monotonic()
+        deadline = start + self.args.backup_timeout
+        poll = 0
+        while True:
+            label = role if not poll else f"{role}-poll-{poll:03d}"
+            requester_after = self.snapshot(directory, label)
+            owner_after = self.snapshot(directory, "owner-" + label, self.owner_client)
+            requester_delta = metric_deltas(requester_before["metrics"], requester_after["metrics"])
+            owner_delta = metric_deltas(owner_before["metrics"], owner_after["metrics"])
+            proof = remote_counter_proof(requester_delta, owner_delta, expected_bytes)
+            self.journal(directory, "remote_counter_observation", role=role,
+                         observation=poll, proof=proof)
+            if proof["exact"]:
+                proof["export_settle_seconds"] = time.monotonic() - start
+                proof["requester_metric_deltas"] = requester_delta
+                proof["owner_metric_deltas"] = owner_delta
+                return requester_after, owner_after, proof
+            if time.monotonic() >= deadline:
+                raise TimeoutError("remote payload counters never reached the exact expected transfer")
+            time.sleep(0.05)
+            poll += 1
+
+    def sample(self, scenario, context, repetition, warmup, ids=None, reference=None):
+        if scenario != "remote":
+            raise ValueError("remote experiment only supports the remote scenario")
+        self.sequence += 1
+        directory = self.artifact_dir / f"{self.sequence:04d}-{context}-remote"
+        directory.mkdir()
+        ids = self.prompt(context) if ids is None else ids
+        (directory / "request.json").write_text(json.dumps(self.payload(ids), indent=2) + "\n")
+        expected_tokens = ((context - 1) // self.args.page_size) * self.args.page_size
+        expected_bytes = expected_tokens // self.args.page_size * self.args.kv_bytes_per_page
+        record = {"scenario": "remote", "context_tokens": context,
+                  "repeat": repetition, "warmup": warmup, "artifact": directory.name,
+                  "passed": False, "discovery_preflight": []}
+        try:
+            self.journal(directory, "cold_control_started")
+            self.flush()
+            cold_before = self.snapshot(directory, "cold-control-before")
+            cold = self.generate_record(directory, "cold-control", ids)
+            cold_after = self.snapshot(directory, "cold-control-after")
+            cold_cache = validate_cache("cold", cold, expected_tokens)
+            cold_delta = metric_deltas(cold_before["metrics"], cold_after["metrics"])
+            if any(native_bytes(cold_delta, component) != 0
+                   for component in ("remote_read", "posix_read", "ucx_write")):
+                raise AssertionError("cold control performed payload reads or UCX writes")
+            record.update(cold_control_ttft_ms=cold["ttft_ms"], cold_control_cache=cold_cache,
+                          cold_control_metric_deltas=cold_delta)
+            self.journal(directory, "cold_control_completed", ttft_ms=cold["ttft_ms"])
+
+            self.journal(directory, "owner_seed_started")
+            self.flush(self.owner_client)
+            owner_seed_before = self.snapshot(directory, "owner-before-seed", self.owner_client)
+            reference = self.generate_record(directory, "owner-seed", ids, self.owner_client,
+                                             self.owner_incremental)
+            validate_cache("cold", reference, expected_tokens)
+            if reference["output_ids"] != cold["output_ids"] or reference["text"] != cold["text"]:
+                raise AssertionError("owner seed differs from requester deterministic cold control")
+            backup_tokens = ((context + self.args.output_tokens - 1) //
+                             self.args.page_size) * self.args.page_size
+            record["owner_backup"] = self.await_backup(owner_seed_before, backup_tokens,
+                                                       self.owner_client)
+            record["owner_expected_backup_tokens"] = backup_tokens
+            self.snapshot(directory, "owner-after-seed", self.owner_client)
+            self.journal(directory, "owner_seed_completed", backup=record["owner_backup"])
+            self.archive_phase(directory, "owner-seed")
+
+            # Unknown native MD keys are resolved asynchronously. Preserve every
+            # discovery request, exclude it from measured TTFT, and flush upper
+            # tiers before each attempt. Requester disks=[] prevents local SSD hits.
+            deadline = time.monotonic() + self.args.backup_timeout
+            ready = False
+            for attempt in range(1, self.args.remote_discovery_attempts + 1):
+                if time.monotonic() >= deadline:
+                    break
+                self.journal(directory, "discovery_started", attempt=attempt)
+                self.flush()
+                before = self.snapshot(directory, f"discovery-{attempt:03d}-before")
+                owner_before = self.snapshot(directory, f"owner-discovery-{attempt:03d}-before",
+                                             self.owner_client)
+                probe = self.generate_record(directory, f"discovery-{attempt:03d}", ids)
+                if probe["output_ids"] != reference["output_ids"] or probe["text"] != reference["text"]:
+                    raise AssertionError("discovery output differs from deterministic cold output")
+                detail = {"attempt": attempt, "cache": cache_details(probe),
+                          "ttft_ms": probe["ttft_ms"]}
+                record["discovery_preflight"].append(detail)
+                try:
+                    validate_cache("remote", probe, expected_tokens)
+                except AssertionError as error:
+                    detail["not_ready"] = str(error)
+                    self.journal(directory, "discovery_not_ready", **detail)
+                    time.sleep(self.args.settle_seconds)
+                    continue
+                _, _, proof = self.settle_remote(
+                    directory, before, owner_before, expected_bytes,
+                    f"discovery-{attempt:03d}-after"
+                )
+                detail["remote_proof"] = proof
+                self.journal(directory, "discovery_ready", attempt=attempt)
+                ready = True
+                break
+            if not ready:
+                raise TimeoutError("requester never observed a complete isolated remote cache hit")
+            self.archive_phase(directory, "discovery-ready")
+
+            self.flush()
+            time.sleep(self.args.settle_seconds)
+            requester_before = self.snapshot(directory, "before")
+            owner_before = self.snapshot(directory, "owner-before", self.owner_client)
+            self.journal(directory, "measured_remote_started")
+            result = self.generate_record(directory, "measured", ids)
+            self.journal(directory, "measured_remote_stream_completed", ttft_ms=result["ttft_ms"])
+            if result["meta_info"].get("prompt_tokens") != context:
+                raise AssertionError("served prompt tokens differ from requested context")
+            cache = validate_cache("remote", result, expected_tokens)
+            after, owner_after, proof = self.settle_remote(
+                directory, requester_before, owner_before, expected_bytes, "after"
+            )
+            if result["output_ids"] != reference["output_ids"] or result["text"] != reference["text"]:
+                raise AssertionError("remote replay differs from requester/owner cold output")
+            record.update(ttft_ms=result["ttft_ms"], stream_latency_ms=result["stream_latency_ms"],
+                          cache=cache, before=requester_before, after=after,
+                          owner_before=owner_before, owner_after=owner_after,
+                          metric_deltas=proof["requester_metric_deltas"],
+                          owner_metric_deltas=proof["owner_metric_deltas"],
+                          remote_proof=proof, output_matches_cold=True,
+                          output_sha256=hashlib.sha256(json.dumps(result["output_ids"]).encode()).hexdigest(),
+                          passed=True)
+            return ids, result
+        except BaseException as error:
+            record["error"] = repr(error)
+            self.journal(directory, "failed", error=record["error"])
+            raise
+        finally:
+            self.samples.append(record)
+            (directory / "sample.json").write_text(json.dumps(record, indent=2) + "\n")
+            with (self.artifact_dir / "samples.jsonl").open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+                stream.flush()
+            if self.archives is not None:
+                self.archives.archive(directory, directory.name + ".zip")
+
+    def summary(self):
+        groups = super().summary()
+        for context in self.args.contexts:
+            values = [sample["cold_control_ttft_ms"] for sample in self.samples
+                      if sample["context_tokens"] == context and sample["passed"]
+                      and not sample["warmup"]]
+            if values:
+                groups[f"{context}:cold-control"] = {
+                    "count": len(values), "ttft_ms_p50": percentile(values, 50),
+                    "ttft_ms_p95": percentile(values, 95), "ttft_ms_samples": values,
+                    "scope": "same requester, unique prefix before owner seeding; no L3 hit, backend still enabled"}
+        return groups
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:31001")
+    parser.add_argument("--owner-base-url", help="second SGLang endpoint used to seed actual remote KV")
+    parser.add_argument("--owner-provenance-json", type=Path)
+    parser.add_argument("--kv-bytes-per-page", type=int, default=16 * 1024**2,
+                        help="logical page payload for exact remote byte proof")
+    parser.add_argument("--remote-discovery-attempts", type=int, default=8)
     parser.add_argument("--tokenizer-path", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument(
@@ -550,7 +774,7 @@ def main():
     parser.add_argument(
         "--scenarios",
         nargs="+",
-        choices=["cold", "ssd", "host", "gpu"],
+        choices=["cold", "ssd", "host", "gpu", "remote"],
         default=["cold", "ssd", "gpu"],
     )
     parser.add_argument("--repeats", type=int, default=10)
@@ -584,6 +808,15 @@ def main():
         parser.error("invalid repeats/warmups/output/page settings")
     if any(context <= args.page_size for context in args.contexts):
         parser.error("every context must exceed one cache page")
+    if "remote" in args.scenarios:
+        if args.scenarios != ["remote"] or not args.owner_base_url or not args.owner_provenance_json:
+            parser.error("remote requires an exclusive --scenarios remote profile and both owner options")
+        if args.owner_base_url.rstrip("/") == args.base_url.rstrip("/"):
+            parser.error("remote owner and requester endpoints must differ")
+        if args.kv_bytes_per_page <= 0 or args.remote_discovery_attempts < 1:
+            parser.error("remote bytes/page and discovery attempts must be positive")
+    elif args.owner_base_url or args.owner_provenance_json:
+        parser.error("owner options require --scenarios remote")
     if "host" in args.scenarios and (
         args.gpu_capacity_tokens <= 0
         or args.host_pressure_tokens <= args.gpu_capacity_tokens
@@ -598,7 +831,16 @@ def main():
         parser.error(
             "provenance model_revision must match the requested immutable revision"
         )
+    owner_provenance = None
+    if args.owner_base_url:
+        owner_provenance = json.loads(args.owner_provenance_json.read_text())
+        if owner_provenance.get("model_revision") != args.model_revision:
+            parser.error("owner provenance model revision differs from requested immutable revision")
+        if any(item.get("kv_bytes_per_page") != args.kv_bytes_per_page
+               for item in (provenance, owner_provenance)):
+            parser.error("both provenance files must confirm the configured logical KV bytes/page")
     client = Client(args.base_url, args.request_timeout)
+    owner_client = Client(args.owner_base_url, args.request_timeout) if args.owner_base_url else None
     experiment, passed, error = None, False, None
     runtime = None
     archives = None
@@ -637,6 +879,28 @@ def main():
             raise ValueError("cache preparation requires an --enable-metrics server")
         if server_args.get("hicache_storage_backend") != "nixlshard":
             raise ValueError("server does not report the NIXLShard storage backend")
+        owner_incremental = None
+        owner_initial_metrics = None
+        if owner_client is not None:
+            owner_info = owner_client.request("/server_info")
+            (args.artifact_dir / "owner-server-info.json").write_text(json.dumps(owner_info, indent=2) + "\n")
+            owner_args = owner_info.get("server_args", owner_info)
+            for key in ("model_path", "dtype", "kv_cache_dtype", "tp_size", "hicache_mem_layout"):
+                if owner_args.get(key) != server_args.get(key):
+                    raise ValueError(f"owner/requester serving namespace setting differs: {key}")
+            if (owner_args.get("stream_interval") != 1 or owner_args.get("page_size") != args.page_size
+                    or not owner_args.get("enable_metrics")
+                    or owner_args.get("hicache_storage_backend") != "nixlshard"):
+                raise ValueError("owner must expose compatible page/stream/cache/metrics settings")
+            owner_mode = owner_args.get("incremental_streaming_output")
+            if args.stream_output == "auto" and not isinstance(owner_mode, bool):
+                raise ValueError("owner did not report streaming mode")
+            owner_incremental = owner_mode if args.stream_output == "auto" else args.stream_output == "incremental"
+            owner_capacity = owner_args.get("max_total_tokens")
+            if owner_capacity is not None and max(args.contexts) + args.output_tokens > owner_capacity:
+                raise ValueError("contexts plus output tokens exceed owner GPU token capacity")
+            owner_initial_metrics = owner_client.request("/metrics")
+            (args.artifact_dir / "owner-initial-metrics.txt").write_text(owner_initial_metrics)
         if (
             "host" in args.scenarios
             and server_args.get("max_total_tokens") != args.gpu_capacity_tokens
@@ -650,6 +914,10 @@ def main():
             args.tokenizer_path, local_files_only=True
         )
         initial_metrics = client.request("/metrics")
+        if owner_client is not None:
+            for role, metrics in (("requester", initial_metrics), ("owner", owner_initial_metrics)):
+                if not native_component_availability(metrics_snapshot(metrics))["prometheus_all_fixed_families_observed"]:
+                    raise ValueError(f"{role} requires native metrics export for remote payload proof")
         (args.artifact_dir / "initial-metrics.txt").write_text(initial_metrics)
         runtime = {
             "arguments": {
@@ -660,6 +928,8 @@ def main():
             "client": "stdlib HTTP/1.1 persistent connection",
             "model_revision": args.model_revision,
             "server_provenance": provenance,
+            "owner_provenance": owner_provenance,
+            "owner_incremental_streaming_output": owner_incremental,
             "incremental_streaming_output": incremental,
             "measurement": "request submission to first received nonempty output-token SSE event",
             "one_generation_outstanding": True,
@@ -672,6 +942,8 @@ def main():
                 "backup counter settling is not proof of zero background I/O",
                 "host pressure requests are preparation and excluded from TTFT",
                 "HiCache direct GPU/host path is independent of SSD O_DIRECT",
+                "remote profiles explicitly prepare async MD/peer discovery before measured replay",
+                "remote byte-proof windows include full generation and metrics export settling, not only first-token latency",
             ],
         }
         (args.artifact_dir / "runtime.json").write_text(
@@ -679,9 +951,11 @@ def main():
         )
         if archives is not None:
             archives.archive(args.artifact_dir, "initial.zip", recursive=False)
-        experiment = Experiment(
-            args, client, tokenizer, args.artifact_dir, incremental, archives
-        )
+        if owner_client is not None:
+            experiment = RemoteExperiment(args, client, tokenizer, args.artifact_dir, incremental, archives,
+                                          owner_client=owner_client, owner_incremental=owner_incremental)
+        else:
+            experiment = Experiment(args, client, tokenizer, args.artifact_dir, incremental, archives)
         for context in args.contexts:
             for repeat in range(args.warmups + args.repeats):
                 warmup = repeat < args.warmups
@@ -700,6 +974,8 @@ def main():
         raise
     finally:
         client.close()
+        if owner_client is not None:
+            owner_client.close()
         if runtime is not None and experiment is not None:
             observed = (
                 set(runtime["native_component_counters"]["prometheus_counter_families"])

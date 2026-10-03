@@ -65,6 +65,66 @@ its raw response and fails the run; it is never silently renamed.
 samples; `samples.jsonl` and per-sample directories retain warmups and failures.
 Percentiles use linear interpolation.
 
+## Actual remote storage-hit profile
+
+Use `--scenarios remote` with two dedicated SGLang endpoints. Owner B has the
+assigned SSD/debug file; requester A uses `agent.disks: []`, which prevents
+requester writeback from turning later reads into local SSD hits. Both use the
+same immutable model revision, model path, rank topology, BF16 KV/page layout,
+native metadata server/peer records, and opt-in native metrics exporter. Record
+transport selection and NIC/host placement in both launch provenance files;
+UCX byte counters alone do not distinguish RC/RDMA from another UCX transport.
+Both provenance files must state `kv_bytes_per_page` matching the configured
+logical page size (16777216 for this Qwen TP1 profile).
+
+For each fresh prefix, A first generates a matched cold control, with zero
+cache hits and zero remote/SSD payload reads. B then generates the identical
+token IDs and completes its full eligible backup. The two cold outputs must
+match. The harness flushes A before bounded discovery preflights because native
+MD key/peer discovery is asynchronous. These preparation generations are
+journaled and excluded from measured TTFT; A's absent SSD prevents local-cache
+admission. Once a complete remote hit has been proven, A is flushed again and
+the measured streaming request replays exactly those IDs. Its output must match
+both cold references, with zero GPU/host hits and the exact eligible storage
+prefix.
+
+```bash
+python extensions/nixlshard/tools/bench-ttft.py \
+  --base-url http://REQUESTER:31001 --owner-base-url http://OWNER:31001 \
+  --tokenizer-path /scratch/qwen32b \
+  --model-revision c2d5a15ede2407bd2d2e6705851db3578777fed3 \
+  --provenance-json /scratch/requester-launch.json \
+  --owner-provenance-json /scratch/owner-launch.json \
+  --artifact-dir /scratch/remote-UNIQUE-RUN \
+  --scenarios remote --contexts 512 1024 2048 4096 8192 \
+  --warmups 1 --repeats 10 --kv-bytes-per-page 16777216 \
+  --gcs-prefix gs://dynamo-gcp-dev-02-nixl-object-perf-526392861238/runs/nixlshard-v2/remote-UNIQUE-RUN
+```
+
+`remote_proof` requires exact owner POSIX-read/UCX-write bytes and exact
+requester remote-read/staging bytes. Each equals
+`((context_tokens-1)//page_size)*kv_bytes_per_page`. Requester POSIX reads,
+requester UCX writes, either endpoint's POSIX writes, and owner staging copies
+must be zero in that window. Missing counters, extra transfers, partial/mixed
+hits, output mismatches, and unresolved discovery fail with raw evidence. The
+harness polls only metrics after generation to allow scheduler exports to catch
+up; it never sends owner generations during the measurement/counter window.
+If an idle owner cannot expose current counters, the proof fails rather than
+accepting stale zeros. No server diagnostics route is added by this harness.
+
+Each remote sample preserves `before`/`after` and `owner_before`/`owner_after`
+raw metrics, timer/byte/event deltas, discovery attempts, and SSE results.
+`cold_control_ttft_ms`, `cold_control_cache`, and `cold_control_metric_deltas`
+expose the matched control; `cold-control.json` preserves its complete stream.
+Summary groups use `CONTEXT:remote` and `CONTEXT:cold-control`, with warmups
+excluded from both. Intermediate immutable archives preserve the owner seed and
+discovery-ready phases before the final sample archive. Uploads and discovery
+change preparation pacing and must use identical flags across comparisons.
+Native counter windows extend through full generation and export settling;
+their overlapping timers do not isolate the first-token critical path or
+additive NIXLShard overhead. A no-hit cold control still has the backend enabled;
+it is not a backend-disabled overhead experiment.
+
 For ephemeral cluster pods, add `--gcs-prefix gs://dynamo-gcp-dev-02-nixl-object-perf-526392861238/runs/nixlshard-v2/UNIQUE-RUN`.
 With `google-cloud-storage` installed and ADC credentials supplied by the runtime,
 the harness uploads an initial provenance archive, one ZIP for each completed

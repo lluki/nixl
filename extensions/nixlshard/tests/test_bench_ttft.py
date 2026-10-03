@@ -435,6 +435,129 @@ class Tests(unittest.TestCase):
         self.assertTrue(complete["prometheus_all_fixed_families_observed"])
         self.assertTrue(complete["diagnostic_snapshot_received"])
 
+    @staticmethod
+    def remote_fixture(directory, corrupt_measured=False):
+        calls = []
+        components = ("staging_copy", "posix_read", "posix_write", "remote_read", "ucx_write")
+
+        class Tokenizer:
+            def encode(self, text, **kwargs):
+                return list(text.encode())
+
+        class Node:
+            def __init__(self, role):
+                self.role, self.generations, self.flushes = role, 0, 0
+                self.actual = {name: 0 for name in components}
+                self.exported = dict(self.actual)
+                self.export_delay = 0
+                self.backup = 0
+                self.seeded = False
+
+            def request(self, path, payload=None):
+                if path.startswith("/flush_cache"):
+                    self.flushes += 1
+                    return "Cache flushed"
+                if self.export_delay:
+                    self.export_delay -= 1
+                else:
+                    self.exported = dict(self.actual)
+                return (f"sglang:backuped_tokens_total {self.backup}\n" +
+                        "".join(f'sglang:nixlshard_component_bytes_total{{component="{key}"}} {value}\n'
+                                for key, value in self.exported.items()) +
+                        'sglang:nixlshard_component_seconds_total{component="posix_read"} 0.1\n' +
+                        'sglang:nixlshard_events_total{event="success"} 0\n')
+
+            def generate(self, payload, incremental):
+                self.generations += 1
+                calls.append(self.role)
+                hit = self.role == "requester" and owner.seeded and self.generations >= 3
+                if self.role == "owner":
+                    self.seeded = True
+                    self.backup += 128
+                    self.actual["posix_write"] += 8192
+                    self.actual["staging_copy"] += 8192
+                elif hit:
+                    amount = 8192 if corrupt_measured and self.generations == 4 else 4096
+                    self.actual["remote_read"] += amount
+                    self.actual["staging_copy"] += amount
+                    owner.actual["posix_read"] += amount
+                    owner.actual["ucx_write"] += amount
+                    self.export_delay = owner.export_delay = 1
+                details = {"storage": 64, "storage_backend": "HiCacheNixlShard"} if hit else {}
+                return {"ttft_ms": 2 if hit else 10, "stream_latency_ms": 20,
+                        "output_ids": [7], "text": "x", "frames": [],
+                        "meta_info": {"prompt_tokens": 128, "cached_tokens": 64 if hit else 0,
+                                      "cached_tokens_details": details,
+                                      "finish_reason": {"type": "length"}}}
+
+        owner, requester = Node("owner"), Node("requester")
+        args = SimpleNamespace(native_stats_url=None, output_tokens=1, page_size=64,
+                               kv_bytes_per_page=4096, backup_timeout=1, settle_seconds=0,
+                               remote_discovery_attempts=3, contexts=[128])
+        experiment = bench.RemoteExperiment(args, requester, Tokenizer(), directory, False,
+                                           owner_client=owner, owner_incremental=False)
+        return experiment, owner, requester, calls
+
+    def test_remote_discovery_preparation_and_export_lag_preserve_matched_controls(self):
+        with tempfile.TemporaryDirectory() as root:
+            experiment, owner, requester, calls = self.remote_fixture(Path(root))
+            experiment.sample("remote", 128, 0, False)
+            record = experiment.samples[0]
+            self.assertTrue(record["passed"])
+            self.assertEqual(calls, ["requester", "owner", "requester", "requester", "requester"])
+            self.assertEqual(requester.flushes, 4)
+            self.assertEqual(len(record["discovery_preflight"]), 2)
+            self.assertIn("not_ready", record["discovery_preflight"][0])
+            self.assertEqual(record["cold_control_ttft_ms"], 10)
+            self.assertEqual(record["ttft_ms"], 2)
+            self.assertTrue(record["remote_proof"]["exact"])
+            self.assertEqual(record["remote_proof"]["observed"]["owner_ucx_write_bytes"], 4096)
+            self.assertEqual(record["remote_proof"]["observed"]["requester_posix_read_bytes"], 0)
+            self.assertTrue(record["output_matches_cold"])
+            groups = experiment.summary()
+            self.assertEqual(groups["128:remote"]["ttft_ms_samples"], [2])
+            self.assertEqual(groups["128:cold-control"]["ttft_ms_samples"], [10])
+            sample_dir = Path(root) / record["artifact"]
+            for name in ("owner-before-stats.json", "owner-after-stats.json",
+                         "before-stats.json", "after-stats.json", "cold-control.json",
+                         "owner-seed.json", "remote-journal.jsonl"):
+                self.assertTrue((sample_dir / name).exists(), name)
+            observations = [json.loads(line) for line in
+                            (sample_dir / "remote-journal.jsonl").read_text().splitlines()]
+            measured = [item for item in observations
+                        if item["phase"] == "remote_counter_observation" and item["role"] == "after"]
+            self.assertEqual(len(measured), 2)
+            self.assertFalse(measured[0]["proof"]["exact"])
+            self.assertTrue(measured[-1]["proof"]["exact"])
+
+    def test_remote_wrong_transfer_amount_fails_without_hiding_raw_result(self):
+        with tempfile.TemporaryDirectory() as root:
+            experiment, owner, requester, calls = self.remote_fixture(Path(root), True)
+            with self.assertRaisesRegex(AssertionError, "incorrect/extra payload"):
+                experiment.sample("remote", 128, 0, False)
+            self.assertFalse(experiment.samples[0]["passed"])
+            self.assertEqual(experiment.summary(), {})
+            sample_dir = Path(root) / experiment.samples[0]["artifact"]
+            self.assertTrue((sample_dir / "measured.json").exists())
+            self.assertTrue((sample_dir / "owner-after-poll-001-stats.json").exists())
+            self.assertTrue((sample_dir / "sample.json").exists())
+
+    def test_remote_byte_proof_rejects_missing_or_local_only_evidence(self):
+        def counters(**values):
+            return {f'sglang:nixlshard_component_bytes_total{{component="{name}"}}': values.get(name, 0)
+                    for name in ("staging_copy", "posix_read", "posix_write", "remote_read", "ucx_write")}
+        with self.assertRaisesRegex(ValueError, "missing"):
+            bench.remote_counter_proof({}, {}, 4096)
+        requester = counters(staging_copy=4096, remote_read=4096, posix_read=4096)
+        owner = counters(posix_read=4096, ucx_write=4096)
+        with self.assertRaisesRegex(AssertionError, "incorrect/extra payload"):
+            bench.remote_counter_proof(requester, owner, 4096)
+        requester = counters(staging_copy=4096, remote_read=4096)
+        self.assertTrue(bench.remote_counter_proof(requester, owner, 4096)["exact"])
+        owner = counters(posix_read=4096, ucx_write=4096, posix_write=64)
+        with self.assertRaisesRegex(AssertionError, "incorrect/extra payload"):
+            bench.remote_counter_proof(requester, owner, 4096)
+
     def test_percentiles_and_available_counter_deltas(self):
         self.assertEqual(bench.percentile([30, 10, 20], 50), 20)
         self.assertEqual(bench.percentile([30, 10, 20], 95), 29)
