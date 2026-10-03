@@ -152,6 +152,8 @@ class TraceTests(unittest.TestCase):
     ):
         result, records = fixture()
         args = SimpleNamespace(page_size=64, kv_bytes_per_page=64)
+        result.update(output_ids=[7], meta_info={"cached_tokens":64,
+                      "cached_tokens_details":{"storage":64,"storage_backend":"HiCacheNixlShard"}})
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args.request_trace_dir = root

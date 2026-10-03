@@ -470,6 +470,13 @@ class Experiment:
         records = helper.read_request(trace_dir, result["request_id"])
         (directory / (field.replace("_", "-") + "-raw.json")).write_text(json.dumps(records, indent=2) + "\n")
         trace = helper.normalize(result, records, scenario, context, repeat, warmup)
+        trace["cache"] = cache_details(result)
+        trace["artifact"] = directory.name
+        trace["output_sha256"] = hashlib.sha256(json.dumps(result["output_ids"]).encode()).hexdigest()
+        proof = record.get("remote_proof") if scenario == "remote" else record.get("local_proof")
+        if proof:
+            trace["source_proof"] = {key: proof[key] for key in
+                ("exact", "expected_bytes", "observed", "observed_bytes", "scope") if key in proof}
         expected_bytes = ((context - 1) // self.args.page_size) * self.args.kv_bytes_per_page
         events = trace["native_events"]
         def total(stage):
