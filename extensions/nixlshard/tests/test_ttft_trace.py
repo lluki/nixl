@@ -74,6 +74,7 @@ def fixture():
     ]
     records = [
         event("api_request_received", 150),
+        event("scheduler_received", 175),
         event("metadata_query", 200, 350),
         event("first_forward_entry", 600),
         event("first_prefill_result", 850),
@@ -108,6 +109,12 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(sum(b["end_ns"] - b["start_ns"] for b in blocks), 900)
         self.assertEqual(rpc[0]["owner_posix_ns"] + rpc[0]["owner_ucx_ns"], 180)
         self.assertNotIn("owner_start_ns", rpc[0])
+        self.assertEqual([(b["start_ns"], b["end_ns"]) for b in blocks
+                          if b["category"] == "frontend_dispatch"], [(150, 175)])
+        self.assertEqual([(b["start_ns"], b["end_ns"]) for b in blocks
+                          if b["category"] == "framework_wait"], [(560, 600)])
+        self.assertEqual([(b["start_ns"], b["end_ns"]) for b in blocks
+                          if b["category"] == "output_handoff"], [(850, 900)])
         self.assertEqual(sample["service_windows"][0]["evidence"], ["native:7:1"])
         self.assertEqual(
             sample["service_windows"][0]["pattern_id"], "descriptor_count_1"

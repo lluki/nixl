@@ -52,10 +52,11 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True)
         return r["start_ns"], "sg:" + str(i)
 
     received, receive_ref = anchor("api_request_received")
+    scheduler, scheduler_ref = anchor("scheduler_received")
     forward, forward_ref = anchor("first_forward_entry")
     finished, finish_ref = anchor("first_prefill_result")
     api_output, output_ref = anchor("api_first_nonempty_output")
-    if not start <= received <= forward <= finished <= api_output <= token:
+    if not start <= received <= scheduler <= forward <= finished <= api_output <= token:
         raise ValueError(
             "request/forward/first-output anchors out of order or outside client window"
         )
@@ -78,8 +79,19 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True)
             )
 
     add(start, received, "frontend_stream", [receive_ref], 100)
+    add(received, scheduler, "frontend_dispatch", [receive_ref, scheduler_ref], 100,
+        scope="API adaptation/dispatch/IPC to scheduler receipt; wall envelope, not CPU-exclusive")
     add(forward, finished, "framework_h2d_forward", [forward_ref, finish_ref], 100)
     add(api_output, token, "frontend_stream", [output_ref], 100)
+    add(finished, api_output, "output_handoff", [finish_ref, output_ref], 100,
+        scope="prefill result processing/IPC/detokenization delivery; wall envelope")
+    completed = [(i, r) for i, r in enumerate(records) if r["stage"] == "native_batch"
+                 and r.get("terminal_observed")]
+    if completed:
+        i, last = max(completed, key=lambda item: item[1]["start_ns"])
+        if last["start_ns"] <= forward:
+            add(last["start_ns"], forward, "framework_wait", ["sg:" + str(i), forward_ref], 5,
+                scope="terminal native capture through release/cache ACK/commit/scheduler admission; wall envelope")
 
     for index, r in enumerate(records):
         if r["stage"] == "metadata_query":

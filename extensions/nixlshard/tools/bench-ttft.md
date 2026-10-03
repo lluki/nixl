@@ -240,7 +240,11 @@ request IDs/handles/events; evidence references use `sg:<index>` and
 `native:<handle>:<event-index>`. Successful remote RPCs require measured
 owner POSIX and UCX durations, exact RPC/copy payload bytes, and correct output.
 
-The wall partition preserves one framework/H2D/forward envelope. Payload
+The wall partition preserves one framework/H2D/forward envelope. Additional
+actual-anchor envelopes measure API-to-scheduler dispatch, terminal native
+capture through cache/ACK/scheduler handoff, and prefill-result-to-API output
+delivery. These include framework processing and waits, not CPU-exclusive
+execution; evidence references identify both boundaries. Payload
 intervals take precedence over metadata and queue occupancy; unknown gaps
 remain other. Owner durations compose a whole RPC only, with no invented
 cross-host timestamps. Intervals crossing first-forward remain explicit raw
