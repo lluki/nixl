@@ -202,3 +202,54 @@ Run the GPU-independent parser, timing and cache-provenance checks with:
 ```bash
 python -m unittest discover -s extensions/nixlshard/tests -p test_bench_ttft.py -v
 ```
+
+## Five tiers with request timelines
+
+Run the four-tier profile on a requester with a fresh assigned SSD file:
+`--scenarios cold gpu host ssd --contexts 512 1024 2048 4096 8192`,
+`--warmups 1 --repeats 5 --gpu-capacity-tokens 16384`,
+`--host-pressure-tokens 18432 --pressure-context 2048`. Its 16 GB host cache
+must retain the target while unique preparation prompts evict GPU pages.
+Host preparation waits for durable seed backup; a diskless requester cannot
+satisfy that condition. Then run the exclusive remote profile on the same
+requester with `agent.disks=[]` and the same model, pools and other flags.
+Disclose the assigned-disk versus diskless profile difference. Remote samples
+also retain their matched diskless cold controls.
+
+Add `--verify-native-payload --kv-bytes-per-page 16777216`. Local SSD reads
+must equal the eligible prefix bytes, with no remote reads or UCX writes.
+GPU/host/cold requests must have zero native payload reads. Aggregate staging
+bytes combine reads and background stores, so exact get-copy coverage uses
+the per-request trace. These counters establish route/amount, not additive
+first-token time.
+
+For diagnostics, launch trace-capable SGLang with
+`SGLANG_REQUEST_TIMELINE_DIR=/scratch/UNIQUE-RUN/request-timeline` and native
+`agent.enable_trace=true` (native `1a8ecc107a1e` or newer on both endpoints).
+Run the client on the requester host, passing `--request-trace-dir` and
+`--request-trace-boot-id` equal to that host's recorded kernel boot ID.
+Each generation has an explicit unique serving request ID; first-token and
+request-submission timestamps use CLOCK_MONOTONIC. Stream generations are
+never automatically retried.
+
+Each sample preserves raw selected serving events before validation and a
+`critical-path.json` normalized record. `request-diagnostics.json` supplies
+schema version, clock, study ID, contexts, samples and an initially empty
+bandwidth-reference list for the report collector. Native batches retain
+request IDs/handles/events; evidence references use `sg:<index>` and
+`native:<handle>:<event-index>`. Successful remote RPCs require measured
+owner POSIX and UCX durations, exact RPC/copy payload bytes, and correct output.
+
+The wall partition preserves one framework/H2D/forward envelope. Payload
+intervals take precedence over metadata and queue occupancy; unknown gaps
+remain other. Owner durations compose a whole RPC only, with no invented
+cross-host timestamps. Intervals crossing first-forward remain explicit raw
+overlaps inside the combined envelope and cannot supply a complete owner
+stack. Means of per-request exclusive blocks sum to mean TTFT; independent
+component medians generally do not sum to p50. Native service-window rates
+are separate from first-token attribution and use descriptor-count patterns
+for matching external fio/UCX references.
+
+Timeline serialization/flushing adds instrumentation cost and is included in
+the new measured curves. Record source/build/boot and both launch profiles;
+do not graft older uninstrumented curves onto this campaign.

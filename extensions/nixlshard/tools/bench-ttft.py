@@ -12,6 +12,7 @@ Cache-level TTFT differences do not measure attributable NIXLShard overhead.
 """
 
 import argparse
+import importlib.util
 import hashlib
 import http.client
 import io
@@ -115,7 +116,7 @@ class Client:
     def generate(self, payload, incremental=False):
         body = json.dumps(dict(payload, stream=True)).encode()
         # Include network submission/response delay, exclude JSON encoding/preparation.
-        start_ns = time.perf_counter_ns()
+        start_ns = time.monotonic_ns()
         self.connection.request(
             "POST",
             "/generate",
@@ -141,7 +142,7 @@ class Client:
                 line = response.readline(1 << 20)
                 if not line:
                     break
-                yield line, time.perf_counter_ns()
+                yield line, time.monotonic_ns()
 
         try:
             result = collect_stream(lines(), start_ns, incremental)
@@ -209,6 +210,10 @@ def collect_stream(lines, start_ns, incremental=False):
     if not meta.get("finish_reason"):
         raise ValueError("stream has no terminal finish reason")
     return {
+        "clock": "CLOCK_MONOTONIC",
+        "request_start_ns": start_ns,
+        "first_token_ns": first_ns,
+        "stream_end_ns": done_ns,
         "ttft_ms": (first_ns - start_ns) / 1e6,
         "stream_latency_ms": (done_ns - start_ns) / 1e6,
         "first_token_elapsed_ns": first_ns - start_ns,
@@ -434,9 +439,12 @@ class Experiment:
         raise TimeoutError("seed backup did not complete and settle before SSD flush")
 
     def generate_record(self, directory, role, ids, client=None, incremental=None):
+        payload = dict(self.payload(ids), rid=uuid.uuid4().hex)
+        (directory / f"{role}-request.json").write_text(json.dumps(payload, indent=2) + "\n")
         result = (client or self.client).generate(
-            self.payload(ids), self.incremental if incremental is None else incremental
+            payload, self.incremental if incremental is None else incremental
         )
+        result["request_id"] = payload["rid"]
         (directory / f"{role}.json").write_text(json.dumps(result, indent=2) + "\n")
         if len(result["output_ids"]) != self.args.output_tokens:
             raise AssertionError(
@@ -447,6 +455,57 @@ class Experiment:
                 "generation did not finish at the configured output length"
             )
         return result
+
+    def capture_trace(self, directory, result, record, scenario, context, repeat, warmup,
+                      field="critical_path"):
+        trace_dir = getattr(self.args, "request_trace_dir", None)
+        if not trace_dir:
+            return
+        helper_path = Path(__file__).with_name("ttft_trace.py")
+        spec = importlib.util.spec_from_file_location("nixlshard_ttft_trace", helper_path)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        records = helper.read_request(trace_dir, result["request_id"])
+        (directory / (field.replace("_", "-") + "-raw.json")).write_text(json.dumps(records, indent=2) + "\n")
+        trace = helper.normalize(result, records, scenario, context, repeat, warmup)
+        expected_bytes = ((context - 1) // self.args.page_size) * self.args.kv_bytes_per_page
+        events = trace["native_events"]
+        def total(stage):
+            return sum(e.get("bytes", 0) for e in events if e["stage"] == stage)
+        if scenario == "remote":
+            if total("remote_rpc") != expected_bytes or total("staging_copy") != expected_bytes or total("local_posix"):
+                raise AssertionError("request trace does not cover exact successful remote payload/copy bytes")
+            if any(e["stage"] == "remote_rpc" and e.get("bytes", 0) and
+                   ("owner_posix_ns" not in e or "owner_ucx_ns" not in e)
+                   for e in events):
+                raise AssertionError("successful remote payload missing owner timing")
+        elif scenario == "ssd":
+            if total("local_posix") != expected_bytes or total("staging_copy") != expected_bytes or total("remote_rpc"):
+                raise AssertionError("request trace does not cover exact local SSD payload/copy bytes")
+        elif any(total(stage) for stage in ("local_posix", "remote_rpc", "staging_copy")):
+            raise AssertionError("non-SSD tier performed traced native payload work")
+        path = directory / (field.replace("_", "-") + ".json")
+        path.write_text(json.dumps(trace, indent=2) + "\n")
+        record[field] = trace
+
+    def local_payload_proof(self, directory, scenario, before, expected_tokens):
+        expected = expected_tokens // self.args.page_size * self.args.kv_bytes_per_page if scenario == "ssd" else 0
+        deadline, poll = time.monotonic() + self.args.backup_timeout, 0
+        while True:
+            after = self.snapshot(directory, "payload-after" if not poll else f"payload-after-{poll:03d}")
+            delta = metric_deltas(before["metrics"], after["metrics"])
+            components = {name: native_bytes(delta, name) for name in
+                          ("posix_read", "staging_copy", "remote_read", "ucx_write")}
+            if components["remote_read"] or components["ucx_write"] or components["posix_read"] > expected:
+                raise AssertionError("unexpected native read path or payload size: " + repr(components))
+            if components["posix_read"] == expected and components["staging_copy"] >= expected:
+                return dict(exact=True, expected_bytes=expected, observed_bytes=components,
+                            after=after, metric_deltas=delta,
+                            scope="full generation/export window; staging counter combines reads and background stores; exact get-copy coverage comes from per-request trace")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("local native counters did not reach exact expected read payload")
+            time.sleep(0.05)
+            poll += 1
 
     def pressure(self, directory):
         remaining = self.args.host_pressure_tokens
@@ -481,6 +540,7 @@ class Experiment:
             json.dumps(self.payload(ids), indent=2) + "\n"
         )
         expected = ((context - 1) // self.args.page_size) * self.args.page_size
+        backup_expected = ((context + self.args.output_tokens - 1) // self.args.page_size) * self.args.page_size
         record = {
             "scenario": scenario,
             "context_tokens": context,
@@ -497,7 +557,7 @@ class Experiment:
                 seed_stats = self.snapshot(directory, "before-seed")
                 reference = self.generate_record(directory, "seed", ids)
                 validate_cache("cold", reference, expected)
-                record["backup"] = self.await_backup(seed_stats, expected)
+                record["backup"] = self.await_backup(seed_stats, backup_expected)
                 if scenario == "ssd":
                     record["preparation"] = {
                         "flush": self.flush(),
@@ -518,7 +578,7 @@ class Experiment:
             else:
                 # Wait for the preceding cold request's backup without evicting GPU KV.
                 record["backup"] = self.await_backup(
-                    self.samples[-1]["before"], expected
+                    self.samples[-1]["before"], backup_expected
                 )
                 record["preparation"] = {"no_generation_since_seed": True}
             before = self.snapshot(directory, "before")
@@ -553,6 +613,11 @@ class Experiment:
                         "cached replay output differs from its deterministic cold seed"
                     )
                 record["output_matches_cold"] = True
+            if getattr(self.args, "verify_native_payload", False) or getattr(self.args, "request_trace_dir", None):
+                record["local_proof"] = self.local_payload_proof(directory, scenario, before, expected)
+                record["after"] = record["local_proof"]["after"]
+                record["metric_deltas"] = record["local_proof"]["metric_deltas"]
+            self.capture_trace(directory, result, record, scenario, context, repetition, warmup)
             record["passed"] = True
             return ids, result
         except BaseException as error:
@@ -652,6 +717,7 @@ class RemoteExperiment(Experiment):
                 raise AssertionError("cold control performed payload reads or UCX writes")
             record.update(cold_control_ttft_ms=cold["ttft_ms"], cold_control_cache=cold_cache,
                           cold_control_metric_deltas=cold_delta)
+            self.capture_trace(directory, cold, record, "cold", context, repetition, warmup, "cold_control_critical_path")
             self.journal(directory, "cold_control_completed", ttft_ms=cold["ttft_ms"])
 
             self.journal(directory, "owner_seed_started")
@@ -732,6 +798,7 @@ class RemoteExperiment(Experiment):
                           remote_proof=proof, output_matches_cold=True,
                           output_sha256=hashlib.sha256(json.dumps(result["output_ids"]).encode()).hexdigest(),
                           passed=True)
+            self.capture_trace(directory, result, record, scenario, context, repetition, warmup)
             return ids, result
         except BaseException as error:
             record["error"] = repr(error)
@@ -807,7 +874,21 @@ def main():
         "--gcs-prefix",
         help="gs://bucket/unique-run-prefix for incremental immutable sample archives (ADC credentials)",
     )
+    parser.add_argument("--verify-native-payload", action="store_true",
+                        help="require exact per-tier native read/copy bytes (fixed native Prometheus metrics)")
+    parser.add_argument("--request-trace-dir", type=Path,
+                        help="same-host serving SGLANG_REQUEST_TIMELINE_DIR; requires native agent.enable_trace")
+    parser.add_argument("--request-trace-boot-id",
+                        help="required serving host boot ID proving client/server monotonic clock scope")
     args = parser.parse_args()
+    if args.request_trace_dir:
+        if not args.request_trace_boot_id or Path("/proc/sys/kernel/random/boot_id").read_text().strip() != args.request_trace_boot_id:
+            parser.error("trace client and serving must use the same recorded kernel boot ID")
+        if args.kv_bytes_per_page <= 0:
+            parser.error("trace requires exact positive --kv-bytes-per-page")
+        args.verify_native_payload = True
+    if args.verify_native_payload and args.kv_bytes_per_page <= 0:
+        parser.error("payload proof requires positive --kv-bytes-per-page")
     if (
         args.repeats < 1
         or args.warmups < 0
@@ -1008,6 +1089,14 @@ def main():
             "percentile_method": "linear interpolation on ordered samples",
             "ttft_scope": "client streaming latency; includes network and server work",
         }
+        if experiment is not None and args.request_trace_dir:
+            trace_samples = [sample[field] for sample in experiment.samples if sample["passed"]
+                             for field in ("critical_path", "cold_control_critical_path") if field in sample]
+            (args.artifact_dir / "request-diagnostics.json").write_text(json.dumps(
+                dict(schema_version=1, clock="CLOCK_MONOTONIC",
+                     study_id=args.artifact_dir.name, contexts=args.contexts,
+                     samples=trace_samples, baselines=[],
+                     serving_boot_id=args.request_trace_boot_id), indent=2) + "\n")
         (args.artifact_dir / "summary.json").write_text(
             json.dumps(summary, indent=2) + "\n"
         )
