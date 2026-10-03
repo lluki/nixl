@@ -36,6 +36,11 @@ The SM80 target is for the development host's A100 GPUs. Change it for other
 GPU architectures. UCX NUMA build support does not implement cache device
 placement; clients remain responsible for assigning suitable device paths.
 
+For GB200 ARM64 development, the documented image already provides CUDA 13 and
+UCX at `/usr/local/ucx`. Select its prefix with `NIXLSHARD_UCX_DIR=/usr/local/ucx`
+and select SM100 with `NIXLSHARD_CUDA_ARCH_LIST=100`; the helper still builds and
+selects an isolated shared Abseil prefix.
+
 Run from the NIXL source checkout:
 
 ```bash

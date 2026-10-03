@@ -10,6 +10,7 @@ install_dir=${NIXLSHARD_INSTALL_DIR:-/workspace/install/nixlshard}
 ucx_dir=${NIXLSHARD_UCX_DIR:-/workspace/deps/ucx}
 abseil_dir=${NIXLSHARD_ABSEIL_DIR:-/workspace/deps/abseil}
 jobs=${NIXLSHARD_BUILD_JOBS:-16}
+cuda_arch_list=${NIXLSHARD_CUDA_ARCH_LIST:-80}
 
 if [[ ! -f "$ucx_dir/include/ucp/api/ucp.h" ]]; then
     echo "Missing UCX development prefix: $ucx_dir" >&2
@@ -40,7 +41,7 @@ PKG_CONFIG=/usr/bin/pkg-config PKG_CONFIG_PATH="$abseil_dir/lib/pkgconfig${PKG_C
     --prefix="$install_dir" --libdir=lib --buildtype=release \
     -Denable_plugins=UCX,POSIX -Ducx_path="$ucx_dir" \
     -Dbuild_nixlshard=true -Dbuild_tests=true -Dbuild_examples=false \
-    -Dwith_trace=false -Dnixl_cuda_arch_list=80
+    -Dwith_trace=false -Dnixl_cuda_arch_list="$cuda_arch_list"
 ninja -C "$build_dir" -j "$jobs"
 meson install -C "$build_dir" --no-rebuild
 
