@@ -289,7 +289,17 @@ class Tests(unittest.TestCase):
                 if path.startswith("/flush_cache"):
                     self.device.clear()
                     return "Cache flushed"
-                return f'sglang:backuped_tokens_total{{rank="0"}} {self.backed_up}\n'
+                native = (
+                    'sglang:nixlshard_component_seconds_total{component="posix_read"} 1\n'
+                    'sglang:nixlshard_component_bytes_total{component="posix_read"} 8192\n'
+                    'sglang:nixlshard_events_total{event="success"} 1\n'
+                    if self.backed_up
+                    else ""
+                )
+                return (
+                    f'sglang:backuped_tokens_total{{rank="0"}} {self.backed_up}\n'
+                    + native
+                )
 
             def generate(self, payload, incremental):
                 key = tuple(payload["input_ids"])
@@ -359,6 +369,12 @@ class Tests(unittest.TestCase):
                 bench.main()
             summary = json.loads((artifact / "summary.json").read_text())
             self.assertTrue(summary["passed"])
+            runtime = json.loads((artifact / "runtime.json").read_text())
+            components = runtime["native_component_counters"]
+            self.assertTrue(components["prometheus_counters_available"])
+            self.assertTrue(components["prometheus_all_fixed_families_observed"])
+            self.assertIsNone(components["agent_diagnostic_url"])
+            self.assertFalse(components["diagnostic_snapshot_received"])
             self.assertEqual(
                 {key: value["count"] for key, value in summary["groups"].items()},
                 {"128:cold": 1, "128:gpu": 1, "128:ssd": 1},
@@ -396,6 +412,28 @@ class Tests(unittest.TestCase):
             "# HELP sglang:nixlshard_component_seconds_total observed wall seconds\n"
         )
         self.assertEqual(snapshot, {seconds: 1.75, byte_counts: 8192, events: 3})
+
+    def test_prometheus_native_availability_is_distinct_from_full_diagnostic_url(self):
+        unavailable = bench.native_component_availability(
+            {
+                "sglang:backuped_tokens_total": 64,
+                "sglang:nixlshard_events_created": 123,
+            },
+            "/native-diagnostic",
+        )
+        self.assertFalse(unavailable["prometheus_counters_available"])
+        self.assertEqual(unavailable["agent_diagnostic_url"], "/native-diagnostic")
+        self.assertFalse(unavailable["diagnostic_snapshot_received"])
+        partial = bench.native_component_availability(
+            {'sglang:nixlshard_events_total{event="timeout"}': 0}
+        )
+        self.assertTrue(partial["prometheus_counters_available"])
+        self.assertFalse(partial["prometheus_all_fixed_families_observed"])
+        complete = bench.native_component_availability(
+            bench.NATIVE_COUNTER_FAMILIES, "/native-diagnostic", received=True
+        )
+        self.assertTrue(complete["prometheus_all_fixed_families_observed"])
+        self.assertTrue(complete["diagnostic_snapshot_received"])
 
     def test_percentiles_and_available_counter_deltas(self):
         self.assertEqual(bench.percentile([30, 10, 20], 50), 20)

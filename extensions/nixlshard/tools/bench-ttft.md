@@ -74,11 +74,36 @@ another run. Archives include raw SSE events and metrics, with hashes recorded i
 `gcs-archives.json`. Uploads happen outside timed generation and failures fail the
 run. In-flight samples can still be lost if the pod disappears before completion.
 
-Prometheus snapshots/deltas record the
-available framework cache and staging histograms. The generic collector does
-**not** expose adapter `native_*` component counters over HTTP; these are
-explicitly marked unavailable unless a separately supplied diagnostic path
-is passed with `--native-stats-url`.
+Prometheus snapshots/deltas record available framework cache and staging
+histograms. SGLang source `d9115436cdda18801c9381f7ee6cc46edb8b1a95` additionally
+provides a backend-owned native counter exporter. Add top-level
+`"export_native_metrics": true` to storage extra configuration and launch with
+`--enable-metrics`; both gates are required, and native export defaults off.
+
+The fixed `sglang:nixlshard_component_seconds_total`,
+`sglang:nixlshard_component_bytes_total`, and `sglang:nixlshard_events_total`
+families expose seven known native timer components in seconds, five byte
+components, and fixed status/resource events. They exclude current slot gauges
+and arbitrary Agent fields. Timers aggregate concurrent workers/background
+work and overlap, including owner I/O inside remote control latency. Exported
+totals update when SGLang collects backend stats, rather than querying the
+Agent from HTTP.
+
+`runtime.json.native_component_counters` records the families actually
+observed across the run, including whether all three fixed families appeared.
+Per-sample snapshots record availability at that collection. The initial
+metrics scrape is saved too, so counters appearing after initial collection
+are reflected in the final runtime record. The separate optional
+`--native-stats-url` records a caller-supplied diagnostic path and whether a
+snapshot was received; it can provide full Agent fields if such an external
+diagnostic facility exists. It is not needed for the fixed Prometheus families,
+and this harness adds no server endpoint.
+
+Record baseline and explicitly instrumented profiles separately, with their
+exact SGLang source hash, loaded native build marker, resolved export setting
+and hardware/storage provenance. Export and metric observations have their
+own cost. These aggregate intervals exclude Python/controller/model work and
+must not be summed or subtracted into TTFT or attributable NIXLShard overhead.
 
 The workload uses coherent repeated text truncated to exact token-ID context
 lengths, plus a unique leading nonce. It has deterministic temperature-zero
@@ -87,6 +112,27 @@ does not prove zero background I/O. End-to-end cache-tier differences do not
 isolate attributable NIXLShard overhead, and component counters must not be
 summed/subtracted into that claim. HiCache `direct` is GPU/host movement;
 SSD O_DIRECT is the separate `agent.direct_io` storage setting.
+
+Long runs can exceed the execution tool's foreground timeout. Launch the same
+command in the background, keeping its log outside the new artifact directory,
+and save its PID. For example:
+
+```bash
+nohup python extensions/nixlshard/tools/bench-ttft.py \
+  --tokenizer-path /scratch/qwen32b \
+  --model-revision c2d5a15ede2407bd2d2e6705851db3578777fed3 \
+  --provenance-json /scratch/ttft-provenance.json \
+  --artifact-dir /scratch/ttft-UNIQUE-RUN \
+  --contexts 512 2048 4096 --warmups 1 --repeats 5 \
+  --scenarios cold ssd gpu \
+  --gcs-prefix gs://dynamo-gcp-dev-02-nixl-object-perf-526392861238/runs/nixlshard-v2/UNIQUE-RUN \
+  > /scratch/ttft-UNIQUE-RUN.log 2>&1 < /dev/null &
+echo $! > /scratch/ttft-UNIQUE-RUN.pid
+```
+
+Poll the log and completed sample artifacts; avoid issuing concurrent generation
+requests. Background execution does not protect against pod deletion, so retain
+the incremental GCS archives.
 
 Run the GPU-independent parser, timing and cache-provenance checks with:
 

@@ -264,6 +264,31 @@ def metrics_snapshot(text):
     return result
 
 
+NATIVE_COUNTER_FAMILIES = frozenset(
+    (
+        "sglang:nixlshard_component_seconds_total",
+        "sglang:nixlshard_component_bytes_total",
+        "sglang:nixlshard_events_total",
+    )
+)
+
+
+def native_component_availability(metric_names, diagnostic_url=None, received=False):
+    observed = sorted(
+        {name.split("{", 1)[0] for name in metric_names} & NATIVE_COUNTER_FAMILIES
+    )
+    return {
+        "prometheus_counter_families": observed,
+        "prometheus_counters_available": bool(observed),
+        "prometheus_all_fixed_families_observed": set(observed)
+        == NATIVE_COUNTER_FAMILIES,
+        "agent_diagnostic_url": diagnostic_url,
+        "diagnostic_snapshot_received": received,
+        "scope": "fixed cumulative native counters; aggregate worker/background intervals "
+        "overlap and exclude framework/model work; do not sum into TTFT",
+    }
+
+
 def metric_total(snapshot, name):
     return sum(value for key, value in snapshot.items() if key.split("{", 1)[0] == name)
 
@@ -287,6 +312,8 @@ class Experiment:
         self.artifact_dir, self.incremental = artifact_dir, incremental
         self.sequence, self.samples = 0, []
         self.archives = archives
+        self.native_prometheus_families = set()
+        self.native_diagnostic_received = False
 
     def prompt(self, length):
         # The nonce appears before the first complete cache page: no shared page keys.
@@ -317,6 +344,15 @@ class Experiment:
         result = {"metrics": metrics_snapshot(metrics)}
         if self.args.native_stats_url:
             result["native_stats"] = self.client.request(self.args.native_stats_url)
+            self.native_diagnostic_received = True
+        result["native_component_counters"] = native_component_availability(
+            result["metrics"],
+            self.args.native_stats_url,
+            self.native_diagnostic_received,
+        )
+        self.native_prometheus_families.update(
+            result["native_component_counters"]["prometheus_counter_families"]
+        )
         (directory / f"{label}-stats.json").write_text(
             json.dumps(result, indent=2) + "\n"
         )
@@ -564,6 +600,7 @@ def main():
         )
     client = Client(args.base_url, args.request_timeout)
     experiment, passed, error = None, False, None
+    runtime = None
     archives = None
     try:
         if args.gcs_prefix:
@@ -612,6 +649,8 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_path, local_files_only=True
         )
+        initial_metrics = client.request("/metrics")
+        (args.artifact_dir / "initial-metrics.txt").write_text(initial_metrics)
         runtime = {
             "arguments": {
                 key: str(value) if isinstance(value, Path) else value
@@ -625,10 +664,8 @@ def main():
             "measurement": "request submission to first received nonempty output-token SSE event",
             "one_generation_outstanding": True,
             "incremental_gcs_archives": args.gcs_prefix,
-            "native_component_counters": (
-                "optional diagnostic endpoint snapshots"
-                if args.native_stats_url
-                else "unavailable: generic SGLang metrics do not export adapter native_* counters"
+            "native_component_counters": native_component_availability(
+                metrics_snapshot(initial_metrics), args.native_stats_url
             ),
             "limitations": [
                 "cache-level TTFT differences do not isolate NIXLShard overhead",
@@ -663,6 +700,17 @@ def main():
         raise
     finally:
         client.close()
+        if runtime is not None and experiment is not None:
+            observed = (
+                set(runtime["native_component_counters"]["prometheus_counter_families"])
+                | experiment.native_prometheus_families
+            )
+            runtime["native_component_counters"] = native_component_availability(
+                observed, args.native_stats_url, experiment.native_diagnostic_received
+            )
+            (args.artifact_dir / "runtime.json").write_text(
+                json.dumps(runtime, indent=2) + "\n"
+            )
         summary = {
             "passed": passed,
             "error": error,
