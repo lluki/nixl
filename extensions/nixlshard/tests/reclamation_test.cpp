@@ -92,8 +92,13 @@ struct Fixture {
     void identify_maintenance() {
         // Only maintenance checkpoints this idle fixture: identify it so EIO
         // is injected solely into the store worker's eviction commit.
+        const auto before = agent->stats()["metadata_checkpoint_ns"];
         maintenance_thread.store(pthread_t{}); injected_errors.store(0); fault.store(3);
         eventually([] { return maintenance_thread.load() != pthread_t{}; });
+        // Its completed timer is recorded after releasing the commit lock. The
+        // error test needs a worker eviction, rather than healthy-disk fallback
+        // during this identification checkpoint's remaining sync barriers.
+        eventually([&] { return agent->stats()["metadata_checkpoint_ns"] > before; });
         fault.store(0);
     }
 };
@@ -140,6 +145,18 @@ void contention_retries() {
     CHECK(wait(*f.agent, handle) == std::vector<Status>{Status::success});
     f.release(handle);
     CHECK(f.agent->batch_exists({"replacement", "old"}) == (std::vector<bool>{true, false}));
+}
+void healthy_disk_wins_before_contended_disk_unblocks() {
+    Fixture f(true);
+    f.seed(disk_zero_key("old"));
+    BlockedCheckpoint checkpoint(*f.agent);
+    auto key = disk_zero_key("replacement");
+    auto handle = f.submit(key);
+    CHECK(wait(*f.agent, handle) == std::vector<Status>{Status::success});
+    f.release(handle);
+    CHECK(!resume.load()); // Acceptance used disk two while disk one stays busy.
+    CHECK(f.agent->batch_exists({key, disk_zero_key("old")}) == (std::vector<bool>{true, true}));
+    checkpoint.unblock();
 }
 void contention_keeps_deadline_and_cancel_gate() {
     Fixture f(false, 150);
@@ -203,6 +220,7 @@ extern "C" int fdatasync(int fd) {
 int main() {
     try {
         contention_retries();
+        healthy_disk_wins_before_contended_disk_unblocks();
         contention_keeps_deadline_and_cancel_gate();
         eviction_error_preserved();
         healthy_disk_wins_after_error();

@@ -336,54 +336,56 @@ struct Agent::Impl {
             std::lock_guard lock(batch.mutex);
             return batch.canceled || Clock::now() >= deadline;
         };
-        for (std::size_t probe = 0; probe < disks.size(); ++probe) {
-            if (expired()) return Status::timeout;
-            auto id = (first + probe) % disks.size();
-            auto &disk = *disks[id];
-            Allocation allocation;
-            auto status = disk.reserve(object.key, bytes, allocation);
-            // Eagerly reclaim one victim at a time; every successful removal is durable.
-            while (status == Status::no_space) {
+        for (;;) {
+            bool retry_busy = false;
+            for (std::size_t probe = 0; probe < disks.size(); ++probe) {
                 if (expired()) return Status::timeout;
-                auto evicted = disk.evict_one();
-                if (evicted == Status::busy) {
-                    // A checkpoint or competing reclaimer can temporarily own the
-                    // commit lock. Retry without extending the batch deadline or
-                    // holding its cancellation gate across I/O/backoff.
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                auto id = (first + probe) % disks.size();
+                auto &disk = *disks[id];
+                Allocation allocation;
+                auto status = disk.reserve(object.key, bytes, allocation);
+                // Eagerly reclaim one victim at a time; every removal is durable.
+                while (status == Status::no_space) {
+                    if (expired()) return Status::timeout;
+                    auto evicted = disk.evict_one();
+                    if (evicted == Status::busy) {
+                        // Try healthy assigned disks before waiting on a checkpoint,
+                        // competing reclaimer, or temporarily pinned victim.
+                        retry_busy = true; status = Status::busy; break;
+                    }
+                    if (evicted != Status::success) {
+                        status = evicted == Status::not_found ? Status::no_space : evicted;
+                        break;
+                    }
+                    count("evictions");
                     if (expired()) return Status::timeout;
                     status = disk.reserve(object.key, bytes, allocation);
+                }
+                if (status != Status::success) {
+                    // Preserve a real disk error if every assigned disk declines.
+                    if (last != Status::io_error) last = status;
                     continue;
                 }
-                if (evicted != Status::success) {
-                    status = evicted == Status::not_found ? Status::no_space : evicted;
-                    break;
+                if (allocation.already_present) return Status::success;
+                Finally rollback{[&disk, &allocation] { disk.abort(allocation.id); }};
+                std::memset(address(slot), 0, allocation.slots.size() * disk.unit_bytes());
+                {
+                    std::lock_guard lock(batch.mutex);
+                    if (batch.canceled || Clock::now() >= deadline) return Status::timeout;
+                    copy(object, address(slot), true);
                 }
-                count("evictions");
-                if (expired()) return Status::timeout;
-                status = disk.reserve(object.key, bytes, allocation);
+                status = disk_io(id, allocation, slot, true, deadline);
+                if (status != Status::success) return status;
+                status = disk.publish(allocation.id);
+                if (status == Status::success) { rollback.fn = {}; count("stores"); }
+                return status;
             }
-            if (status != Status::success) {
-                // Healthy assigned disks can still accept the object. Preserve a
-                // real disk error if all remaining disks decline admission.
-                if (last != Status::io_error) last = status;
-                continue;
-            }
-            if (allocation.already_present) return Status::success;
-            Finally rollback{[&disk, &allocation] { disk.abort(allocation.id); }};
-            std::memset(address(slot), 0, allocation.slots.size() * disk.unit_bytes());
-            {
-                std::lock_guard lock(batch.mutex);
-                if (batch.canceled || Clock::now() >= deadline) return Status::timeout;
-                copy(object, address(slot), true);
-            }
-            status = disk_io(id, allocation, slot, true, deadline);
-            if (status != Status::success) return status;
-            status = disk.publish(allocation.id);
-            if (status == Status::success) { rollback.fn = {}; count("stores"); }
-            return status;
+            if (expired()) return Status::timeout;
+            if (!retry_busy) return last;
+            // Only defer after scanning the entire assigned set. Neither waiting
+            // nor another pass extends the original deadline or holds the gate.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        return Clock::now() >= deadline ? Status::timeout : last;
     }
     std::string owner_hint(const Object &object) {
         if (!object.hint.empty()) return object.hint;
