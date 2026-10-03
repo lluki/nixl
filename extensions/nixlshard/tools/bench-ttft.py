@@ -243,6 +243,8 @@ def validate_cache(scenario, result, expected_prefix):
         ):
             raise AssertionError(f"cold request had cache hits: {values}")
     else:
+        if values["cached_tokens"] != sum(values[name] for name in ("device", "host", "storage")):
+            raise AssertionError(f"cache source totals differ from cached_tokens: {values}")
         desired = {"ssd": "storage", "remote": "storage", "host": "host", "gpu": "device"}[scenario]
         if values[desired] < expected_prefix or any(
             values[name] for name in ("device", "host", "storage") if name != desired
@@ -252,7 +254,7 @@ def validate_cache(scenario, result, expected_prefix):
             )
         if scenario in ("ssd", "remote") and values["storage_backend"] != "HiCacheNixlShard":
             raise AssertionError(f"SSD hit did not identify HiCacheNixlShard: {values}")
-        if scenario == "remote" and values["storage"] != expected_prefix:
+        if scenario in ("ssd", "remote") and values["storage"] != expected_prefix:
             raise AssertionError(f"remote storage prefix differs from expected complete pages: {values}")
     return values
 

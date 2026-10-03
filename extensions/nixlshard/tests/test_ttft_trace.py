@@ -86,6 +86,17 @@ def fixture():
 
 
 class TraceTests(unittest.TestCase):
+    def test_tier_masks_require_consistent_totals_and_exact_storage_prefix(self):
+        result = {"meta_info": {"cached_tokens": 64, "cached_tokens_details": {
+            "storage": 64, "storage_backend": "HiCacheNixlShard"}}}
+        self.assertEqual(bench.validate_cache("ssd", result, 64)["storage"], 64)
+        result["meta_info"]["cached_tokens"] = 128
+        with self.assertRaisesRegex(AssertionError, "totals differ"):
+            bench.validate_cache("ssd", result, 64)
+        result["meta_info"]["cached_tokens_details"]["storage"] = 128
+        with self.assertRaisesRegex(AssertionError, "prefix differs"):
+            bench.validate_cache("ssd", result, 64)
+
     def test_rpc_composition_survives_overlapping_metadata_queue_boundaries(self):
         result, records = fixture()
         sample = trace.normalize(result, records, "remote", 128, 0, False)
