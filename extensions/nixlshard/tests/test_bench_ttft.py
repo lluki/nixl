@@ -36,6 +36,54 @@ def encoded_frames(events):
 
 
 class Tests(unittest.TestCase):
+    def test_admin_authentication_and_error_echo_do_not_record_token(self):
+        key = "test-private-control-token"
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                authorized = self.headers.get("Authorization") == "Bearer " + key
+                body = json.dumps({"admin_api_key": key, "page_size": 64}).encode()
+                self.send_response(200 if authorized and self.path == "/server_info" else 403)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = bench.Client(f"http://127.0.0.1:{server.server_port}", auth_token=key)
+        try:
+            observation = bench.redact_credentials(client.request("/server_info"))
+            self.assertEqual(observation["page_size"], 64)
+            self.assertNotIn(key, json.dumps(observation))
+            with self.assertRaises(RuntimeError) as error:
+                client.request("/failure")
+            self.assertNotIn(key, str(error.exception))
+        finally:
+            client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(1)
+
+    def test_serving_credentials_are_removed_before_artifacts_and_archives(self):
+        key = "test-private-admin-value"
+        source = {"admin_api_key": key, "api_key": None, "page_size": 64,
+                  "launch_command": ["python", "--admin-api-key", key],
+                  "nested": {"echo": "arguments: " + key},
+                  "list_only": ["--api-key", "other-private-token"]}
+        safe = bench.redact_credentials(source)
+        serialized = json.dumps(safe)
+        self.assertNotIn(key, serialized)
+        self.assertNotIn("other-private-token", serialized)
+        self.assertEqual(safe["page_size"], 64)
+        self.assertIsNone(safe["api_key"])
+        self.assertEqual(source["admin_api_key"], key)
+        self.assertEqual(safe["launch_command"][-1], "<redacted>")
+        self.assertEqual(safe["nested"]["echo"], "arguments: <redacted>")
+
     def test_idle_http_keepalive_reconnects_observations_without_retrying_generation(self):
         requests = []
 

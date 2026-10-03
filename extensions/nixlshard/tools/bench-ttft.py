@@ -27,6 +27,43 @@ import uuid
 import zipfile
 
 
+def redact_credentials(value):
+    """Copy serving observations without credential fields or echoed CLI secrets."""
+    fields = {"api_key", "admin_api_key", "ssl_keyfile_password", "hf_token",
+              "access_token", "auth_token", "authorization"}
+    flags = {"--" + field.replace("_", "-") for field in fields}
+    secrets = set()
+
+    def collect(item):
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key.lower() in fields and isinstance(child, str) and child:
+                    secrets.add(child)
+                collect(child)
+        elif isinstance(item, (list, tuple)):
+            for index, child in enumerate(item):
+                if isinstance(child, str) and child in flags and index + 1 < len(item):
+                    secret = item[index + 1]
+                    if isinstance(secret, str) and secret:
+                        secrets.add(secret)
+                collect(child)
+
+    collect(value)
+
+    def scrub(item):
+        if isinstance(item, dict):
+            return {key: "<redacted>" if key.lower() in fields and child else scrub(child)
+                    for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [scrub(child) for child in item]
+        if isinstance(item, str):
+            for secret in sorted(secrets, key=len, reverse=True):
+                item = item.replace(secret, "<redacted>")
+        return item
+
+    return scrub(value)
+
+
 class GcsArchives:
     """One immutable archive per completed sample, outside measured generation."""
 
@@ -75,7 +112,7 @@ class GcsArchives:
 
 
 class Client:
-    def __init__(self, base, timeout=120):
+    def __init__(self, base, timeout=120, auth_token=None):
         parsed = urllib.parse.urlsplit(base)
         if parsed.scheme not in ("http", "https") or parsed.path not in ("", "/"):
             raise ValueError("base URL must be an http(s) origin")
@@ -86,6 +123,16 @@ class Client:
         )
         self.connection = connection(parsed.hostname, parsed.port, timeout=timeout)
         self.timeout = timeout
+        self._auth_token = auth_token
+
+    def _headers(self, **extra):
+        headers = {"Content-Type": "application/json", **extra}
+        if self._auth_token:
+            headers["Authorization"] = "Bearer " + self._auth_token
+        return headers
+
+    def _safe_error(self, value):
+        return value.replace(self._auth_token, "<redacted>") if self._auth_token else value
 
     def request(self, path, payload=None):
         body = None if payload is None else json.dumps(payload).encode()
@@ -97,7 +144,7 @@ class Client:
             try:
                 self.connection.request(
                     "GET" if body is None else "POST", path, body,
-                    {"Content-Type": "application/json"},
+                    self._headers(),
                 )
                 response = self.connection.getresponse()
                 raw = response.read().decode()
@@ -107,7 +154,7 @@ class Client:
                 if not safe_retry or attempt:
                     raise
         if response.status != 200:
-            raise RuntimeError(f"HTTP {response.status} for {path}: {raw[:2000]}")
+            raise RuntimeError(f"HTTP {response.status} for {path}: {self._safe_error(raw[:2000])}")
         try:
             return json.loads(raw)
         except ValueError:
@@ -121,12 +168,12 @@ class Client:
             "POST",
             "/generate",
             body,
-            {"Content-Type": "application/json", "Accept": "text/event-stream"},
+            self._headers(Accept="text/event-stream"),
         )
         response = self.connection.getresponse()
         if response.status != 200:
             raise RuntimeError(
-                f"generation HTTP {response.status}: {response.read()[:2000]!r}"
+                f"generation HTTP {response.status}: {self._safe_error(response.read()[:2000].decode(errors='replace'))}"
             )
         if "text/event-stream" not in response.getheader("Content-Type", ""):
             raise RuntimeError("generation did not return a streaming SSE response")
@@ -839,6 +886,8 @@ class RemoteExperiment(Experiment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:31001")
+    parser.add_argument("--admin-key-file", type=Path,
+                        help="local requester admin key file; contents never recorded")
     parser.add_argument("--owner-base-url", help="second SGLang endpoint used to seed actual remote KV")
     parser.add_argument("--owner-provenance-json", type=Path)
     parser.add_argument("--kv-bytes-per-page", type=int, default=16 * 1024**2,
@@ -925,20 +974,23 @@ def main():
             "host scenario requires known GPU capacity and pressure exceeding it"
         )
     args.artifact_dir.mkdir(parents=True, exist_ok=False)
-    provenance = json.loads(args.provenance_json.read_text())
+    provenance = redact_credentials(json.loads(args.provenance_json.read_text()))
     if provenance.get("model_revision") != args.model_revision:
         parser.error(
             "provenance model_revision must match the requested immutable revision"
         )
     owner_provenance = None
     if args.owner_base_url:
-        owner_provenance = json.loads(args.owner_provenance_json.read_text())
+        owner_provenance = redact_credentials(json.loads(args.owner_provenance_json.read_text()))
         if owner_provenance.get("model_revision") != args.model_revision:
             parser.error("owner provenance model revision differs from requested immutable revision")
         if any(item.get("kv_bytes_per_page") != args.kv_bytes_per_page
                for item in (provenance, owner_provenance)):
             parser.error("both provenance files must confirm the configured logical KV bytes/page")
-    client = Client(args.base_url, args.request_timeout)
+    admin_key = args.admin_key_file.read_text().strip() if args.admin_key_file else None
+    if args.admin_key_file and not admin_key:
+        parser.error("admin key file must not be empty")
+    client = Client(args.base_url, args.request_timeout, admin_key)
     owner_client = Client(args.owner_base_url, args.request_timeout) if args.owner_base_url else None
     experiment, passed, error = None, False, None
     runtime = None
@@ -946,7 +998,7 @@ def main():
     try:
         if args.gcs_prefix:
             archives = GcsArchives(args.gcs_prefix, args.artifact_dir)
-        info = client.request("/server_info")
+        info = redact_credentials(client.request("/server_info"))
         (args.artifact_dir / "server-info.json").write_text(
             json.dumps(info, indent=2) + "\n"
         )
@@ -981,7 +1033,7 @@ def main():
         owner_incremental = None
         owner_initial_metrics = None
         if owner_client is not None:
-            owner_info = owner_client.request("/server_info")
+            owner_info = redact_credentials(owner_client.request("/server_info"))
             (args.artifact_dir / "owner-server-info.json").write_text(json.dumps(owner_info, indent=2) + "\n")
             owner_args = owner_info.get("server_args", owner_info)
             for key in ("model_path", "dtype", "kv_cache_dtype", "tp_size", "hicache_mem_layout"):

@@ -257,3 +257,14 @@ for matching external fio/UCX references.
 Timeline serialization/flushing adds instrumentation cost and is included in
 the new measured curves. Record source/build/boot and both launch profiles;
 do not graft older uninstrumented curves onto this campaign.
+
+For servers with an admin gate, pass `--admin-key-file /workspace/private/KEY`.
+The client reads the key locally for authorization; it records no key contents.
+Serving observations and launch/provenance copies redact known credential
+fields and echoed values before any artifact write or incremental upload.
+Keep the private key file outside artifact roots and separately redact server
+startup logs, since the pinned serving source reports raw configuration.
+Runtime storage detach/attach requires an idle server and an admin gate; verify
+the closed backend has no open descriptor to the disposable debug file before
+unlinking it. Reset between independent context epochs when materialized cache
+data must remain bounded, and record those preparations outside timed requests.
