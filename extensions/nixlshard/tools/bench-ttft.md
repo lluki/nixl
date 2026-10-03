@@ -87,6 +87,9 @@ admission. Once a complete remote hit has been proven, A is flushed again and
 the measured streaming request replays exactly those IDs. Its output must match
 both cold references, with zero GPU/host hits and the exact eligible storage
 prefix.
+Read-only observations and upper-tier cache flushes reconnect and retry once
+when an idle HTTP keepalive connection has closed. Generation requests are
+never retried, so a connection failure cannot silently duplicate model work.
 
 ```bash
 python extensions/nixlshard/tools/bench-ttft.py \

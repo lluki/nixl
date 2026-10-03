@@ -88,14 +88,23 @@ class Client:
 
     def request(self, path, payload=None):
         body = None if payload is None else json.dumps(payload).encode()
-        self.connection.request(
-            "GET" if body is None else "POST",
-            path,
-            body,
-            {"Content-Type": "application/json"},
-        )
-        response = self.connection.getresponse()
-        raw = response.read().decode()
+        # The other server can be idle longer than Uvicorn's keepalive timeout
+        # while generation runs. Retry safe observations/upper-tier flush once
+        # on a fresh connection, never retry generation or arbitrary POSTs.
+        safe_retry = body is None or path.split("?", 1)[0] == "/flush_cache"
+        for attempt in range(2 if safe_retry else 1):
+            try:
+                self.connection.request(
+                    "GET" if body is None else "POST", path, body,
+                    {"Content-Type": "application/json"},
+                )
+                response = self.connection.getresponse()
+                raw = response.read().decode()
+                break
+            except (http.client.HTTPException, ConnectionError, OSError):
+                self.connection.close()
+                if not safe_retry or attempt:
+                    raise
         if response.status != 200:
             raise RuntimeError(f"HTTP {response.status} for {path}: {raw[:2000]}")
         try:

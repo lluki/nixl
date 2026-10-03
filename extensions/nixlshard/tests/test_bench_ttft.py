@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 import tempfile
 import sys
+import socket
 import threading
 import time
 import unittest
@@ -35,6 +36,56 @@ def encoded_frames(events):
 
 
 class Tests(unittest.TestCase):
+    def test_idle_http_keepalive_reconnects_observations_without_retrying_generation(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                requests.append(self.path)
+                body = b"metrics"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                if len(requests) == 1:
+                    def idle_close():
+                        try:
+                            self.connection.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        self.connection.close()
+                    threading.Timer(0.02, idle_close).start()
+
+            def do_POST(self):
+                requests.append(self.path)
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = bench.Client(f"http://127.0.0.1:{server.server_port}", timeout=1)
+        try:
+            self.assertEqual(client.request("/metrics"), "metrics")
+            time.sleep(0.04)
+            self.assertEqual(client.request("/metrics"), "metrics")
+            with self.assertRaises(bench.http.client.RemoteDisconnected):
+                client.generate({"input_ids": [1]}, False)
+            self.assertEqual(requests, ["/metrics", "/metrics", "/generate"])
+        finally:
+            client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(1)
+
     def test_incremental_archives_preserve_complete_samples_and_fail_on_upload_error(
         self,
     ):
