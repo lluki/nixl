@@ -382,6 +382,21 @@ class Tests(unittest.TestCase):
                 ).is_file()
             )
 
+    def test_native_component_metric_families_are_captured_without_unrelated_nixl_fields(
+        self,
+    ):
+        seconds = 'sglang:nixlshard_component_seconds_total{component="posix_read",model_name="test model",tp_rank="0"}'
+        byte_counts = (
+            'sglang:nixlshard_component_bytes_total{component="posix_read",tp_rank="0"}'
+        )
+        events = 'sglang:nixlshard_events_total{event="timeout",tp_rank="0"}'
+        snapshot = bench.metrics_snapshot(
+            f"{seconds} 1.75\n{byte_counts} 8192\n{events} 3\n"
+            "nixl_unrelated_diagnostic 99\n"
+            "# HELP sglang:nixlshard_component_seconds_total observed wall seconds\n"
+        )
+        self.assertEqual(snapshot, {seconds: 1.75, byte_counts: 8192, events: 3})
+
     def test_percentiles_and_available_counter_deltas(self):
         self.assertEqual(bench.percentile([30, 10, 20], 50), 20)
         self.assertEqual(bench.percentile([30, 10, 20], 95), 29)

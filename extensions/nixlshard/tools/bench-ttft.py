@@ -252,7 +252,7 @@ def metrics_snapshot(text):
                 "cached_tokens",
                 "storage",
                 "hicache",
-                "nixl",
+                "nixlshard",
             )
         ):
             continue
