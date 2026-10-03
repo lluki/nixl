@@ -58,4 +58,8 @@ if get_option('build_tests')
     dependencies: [nixlshard_dep, dl_dep], link_args: ['-Wl,--export-dynamic'])
   test('nixlshard-cancellation', cancellation_test, suite: 'nixlshard',
     env: nixlshard_test_env, timeout: 120)
+  reclamation_test = executable('nixlshard-reclamation-test', 'tests/reclamation_test.cpp',
+    dependencies: [nixlshard_dep, dl_dep], link_args: ['-Wl,--export-dynamic'])
+  test('nixlshard-reclamation', reclamation_test, suite: 'nixlshard',
+    env: nixlshard_test_env, timeout: 120)
 endif

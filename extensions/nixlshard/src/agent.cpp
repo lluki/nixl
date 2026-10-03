@@ -332,19 +332,43 @@ struct Agent::Impl {
         if (disks.empty()) return Status::no_space;
         auto first = std::hash<std::string>{}(object.key) % disks.size();
         Status last = Status::no_space;
+        auto expired = [&] {
+            std::lock_guard lock(batch.mutex);
+            return batch.canceled || Clock::now() >= deadline;
+        };
         for (std::size_t probe = 0; probe < disks.size(); ++probe) {
+            if (expired()) return Status::timeout;
             auto id = (first + probe) % disks.size();
             auto &disk = *disks[id];
             Allocation allocation;
             auto status = disk.reserve(object.key, bytes, allocation);
             // Eagerly reclaim one victim at a time; every successful removal is durable.
-            while (status == Status::no_space && Clock::now() < deadline) {
+            while (status == Status::no_space) {
+                if (expired()) return Status::timeout;
                 auto evicted = disk.evict_one();
-                if (evicted != Status::success) break;
+                if (evicted == Status::busy) {
+                    // A checkpoint or competing reclaimer can temporarily own the
+                    // commit lock. Retry without extending the batch deadline or
+                    // holding its cancellation gate across I/O/backoff.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (expired()) return Status::timeout;
+                    status = disk.reserve(object.key, bytes, allocation);
+                    continue;
+                }
+                if (evicted != Status::success) {
+                    status = evicted == Status::not_found ? Status::no_space : evicted;
+                    break;
+                }
                 count("evictions");
+                if (expired()) return Status::timeout;
                 status = disk.reserve(object.key, bytes, allocation);
             }
-            if (status != Status::success) { last = status; continue; }
+            if (status != Status::success) {
+                // Healthy assigned disks can still accept the object. Preserve a
+                // real disk error if all remaining disks decline admission.
+                if (last != Status::io_error) last = status;
+                continue;
+            }
             if (allocation.already_present) return Status::success;
             Finally rollback{[&disk, &allocation] { disk.abort(allocation.id); }};
             std::memset(address(slot), 0, allocation.slots.size() * disk.unit_bytes());
