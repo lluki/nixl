@@ -41,9 +41,11 @@ the SHA256 of that key's distinct content. Generation and hash checking occur
 outside the timed native batch.
 Submission, observed terminal statuses, and checkpoint attempts are journaled
 before potentially blocking native cleanup, preserving active-phase evidence
-when the hard watchdog fires. Batch `elapsed_ns` includes submission/polling
-through terminal status plus the release call; the intervening flushed-terminal
-journal gap is reported separately. `wall_elapsed_ns` includes that gap.
+when the hard watchdog fires. Batch `elapsed_ns` and `wall_elapsed_ns` both
+report observed submission-through-release wall time, including the flushed
+terminal-journal instrumentation gap. The gap is reported separately without
+subtraction: I/O may drain during logging, so subtraction would understate the
+observed time until cleanup finishes. Group medians and p95 use this full time.
 
 Non-success statuses are reported in the raw artifacts and summary. A completed
 correctness check can coexist with failed cache stores or reads; inspect

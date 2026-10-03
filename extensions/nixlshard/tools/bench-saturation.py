@@ -127,7 +127,7 @@ def batch(agent, operation, items, deadline_seconds, raw, phase):
               "submit_ns": submitted - start, "terminal_ns": terminal - start,
               "release_ns": released - release_start,
               "journal_gap_ns": release_start - terminal,
-              "elapsed_ns": terminal - start + released - release_start,
+              "elapsed_ns": released - start,
               "wall_elapsed_ns": released - start,
               "counter_deltas": counter_delta(agent.stats(), before)}
     append(raw, record)
@@ -217,7 +217,7 @@ def run_worker(args, output, run_id):
                   "capacity_pages": capacity_pages,
                   "padded_payload_bytes": padded_payload,
                   "one_batch_outstanding": True,
-                  "batch_latency_scope": "submit-through-terminal plus release-call elapsed; terminal-journal gap separately recorded and excluded; wall_elapsed_ns includes it",
+                  "batch_latency_scope": "observed submission-through-release wall time includes terminal-journal instrumentation; journal_gap_ns separately recorded without subtraction because I/O can drain during logging",
                   "incremental_gcs_prefix": args.gcs_prefix,
                   "upload_pacing_scope": "copy/zip/upload gaps after fill chunks and measured iterations; compare identical upload flags across native prefixes",
                   "scope": "local debug-file cache under reuse; not SGLang/TTFT or physical SSD claims",
