@@ -3,6 +3,10 @@
 #include "nixlshard/wire.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <libaio.h>
+#include <sys/syscall.h>
 #include <chrono>
 #include <functional>
 #include <filesystem>
@@ -11,6 +15,20 @@
 #include <stdexcept>
 #include <thread>
 #include <unistd.h>
+
+namespace {
+std::atomic<bool> fail_group_read{false};
+std::atomic<unsigned> injected_read_errors{0};
+}
+extern "C" int io_submit(io_context_t ctx, long nr, struct iocb **ios) {
+    if (fail_group_read.load() && nr > 0 && ios[0]->aio_lio_opcode == IO_CMD_PREAD) {
+        ++injected_read_errors; return -EIO;
+    }
+    // POSIX plugins load libaio locally; RTLD_NEXT from this executable cannot
+    // reliably resolve it. Match libaio's negative-errno syscall convention.
+    const auto result = ::syscall(SYS_io_submit, ctx, nr, ios);
+    return result < 0 ? -errno : static_cast<int>(result);
+}
 
 using namespace nixlshard;
 #define CHECK(x) do { if (!(x)) throw std::runtime_error(std::string("check failed: ") + #x + " line " + std::to_string(__LINE__)); } while (false)
@@ -60,6 +78,111 @@ std::string peer_identity(const Endpoint &endpoint) {
     CHECK(static_cast<Status>(reader.u8()) == Status::success);
     auto incarnation = reader.str(); reader.str(); reader.finish();
     return incarnation;
+}
+void grouped_loads_preserve_layout_and_statuses() {
+    File file;
+    auto owner_cfg = config("group-owner"); owner_cfg.staging_slot_bytes = 32768;
+    owner_cfg.disks = {{file.path, 16384 + 128 * 4096, 4096, 16384, true}};
+    Agent owner(owner_cfg);
+    std::array<uint8_t, 8192> source{}, destination{};
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<uint8_t>((i * 7 + 13) % 211);
+    auto src = owner.register_memory(reinterpret_cast<uintptr_t>(source.data()), source.size());
+    auto put = owner.batch_store({{"one", {{src, 0, 64}}, {}}, {"two", {{src, 4096, 3000}}, {}}});
+    CHECK(wait(owner, put) == std::vector<Status>({Status::success, Status::success})); owner.release(put);
+    auto reader_cfg = config("group-reader"); reader_cfg.staging_slot_bytes = 32768;
+    reader_cfg.remote_batch_limit = 8; reader_cfg.peers[owner_cfg.name] = owner.endpoint();
+    Agent reader(reader_cfg);
+    auto dst = reader.register_memory(reinterpret_cast<uintptr_t>(destination.data()), destination.size());
+    eventually([&] { return reader.batch_exists({"one", "two"}, {owner_cfg.name, owner_cfg.name}) == std::vector<bool>({true, true}); });
+    destination.fill(201);
+    auto get = reader.batch_load({
+        {"one", {{dst, 13, 17}, {dst, 100, 47}}, owner_cfg.name},
+        {"missing", {{dst, 200, 32}}, owner_cfg.name},
+        {"two", {{dst, 512, 3000}}, owner_cfg.name},
+        {"one", {{dst, 4000, 64}}, owner_cfg.name},
+        {"one", {{dst, 4200, 63}}, owner_cfg.name}});
+    CHECK(wait(reader, get) == std::vector<Status>({Status::success, Status::not_found,
+          Status::success, Status::success, Status::invalid_input})); reader.release(get);
+    auto expected = std::array<uint8_t, 8192>{}; expected.fill(201);
+    std::copy_n(source.begin(), 17, expected.begin() + 13);
+    std::copy_n(source.begin() + 17, 47, expected.begin() + 100);
+    std::copy_n(source.begin() + 4096, 3000, expected.begin() + 512);
+    std::copy_n(source.begin(), 64, expected.begin() + 4000);
+    CHECK(destination == expected);
+    // A bulk read error cannot fabricate successes or issue UCX writes.
+    auto write_before = owner.stats()["ucx_write_bytes"];
+    destination.fill(201); fail_group_read.store(true);
+    get = reader.batch_load({{"one", {{dst, 0, 64}}, owner_cfg.name},
+                             {"two", {{dst, 512, 3000}}, owner_cfg.name}});
+    auto failed = wait(reader, get); fail_group_read.store(false); reader.release(get);
+    CHECK(failed == std::vector<Status>({Status::io_error, Status::io_error}));
+    CHECK(injected_read_errors.load() > 0);
+    CHECK(std::all_of(destination.begin(), destination.end(), [](uint8_t x) { return x == 201; }));
+    CHECK(owner.stats()["ucx_write_bytes"] == write_before);
+    CHECK(reader.stats()["remote_load_batch_requests"] == 2);
+    CHECK(reader.stats()["remote_read_bytes"] == 3128);
+    CHECK(owner.stats()["posix_read_bytes"] == 3 * 4096);
+    CHECK(owner.stats()["ucx_write_bytes"] == 3128);
+    // Metadata failure must not erase independently known per-page outcomes.
+    {
+        wire::Connection control(owner.endpoint(), 1000);
+        wire::Writer request; request.u8(wire::load_batch); request.str("bad-group-metadata");
+        request.str(peer_identity(owner.endpoint())); request.str("bogus"); request.str("bogus");
+        request.u64(1234); request.u32(3); request.u32(1000);
+        request.str("one"); request.u64(64); request.str("missing"); request.u64(32);
+        request.str("one"); request.u64(63);
+        auto response = control.call(request.data, 1000); wire::Reader result(response);
+        CHECK(static_cast<Status>(result.u8()) == Status::success && result.u32() == 3);
+        CHECK(static_cast<Status>(result.u8()) == Status::not_ready);
+        CHECK(static_cast<Status>(result.u8()) == Status::not_found);
+        CHECK(static_cast<Status>(result.u8()) == Status::invalid_input); result.finish();
+        CHECK(owner.stats()["ucx_write_bytes"] == 3128);
+        // Checked target arithmetic rejects overflow before metadata import/I/O.
+        wire::Writer overflow; overflow.u8(wire::load_batch); overflow.str("overflow-group");
+        overflow.str(peer_identity(owner.endpoint())); overflow.str("bogus"); overflow.str("bogus");
+        overflow.u64(UINT64_MAX - 31); overflow.u32(2); overflow.u32(1000);
+        overflow.str("one"); overflow.u64(64); overflow.str("one"); overflow.u64(64);
+        response = control.call(overflow.data, 1000); wire::Reader rejected(response);
+        CHECK(static_cast<Status>(rejected.u8()) == Status::invalid_input); rejected.finish();
+        CHECK(owner.stats()["posix_read_bytes"] == 3 * 4096);
+    }
+    // Caller aliases retain the original per-object publication order.
+    destination.fill(201); expected.fill(201);
+    get = reader.batch_load({{"one", {{dst, 0, 64}}, owner_cfg.name},
+                             {"two", {{dst, 32, 3000}}, owner_cfg.name}});
+    CHECK(wait(reader, get) == std::vector<Status>({Status::success, Status::success})); reader.release(get);
+    std::copy_n(source.begin(), 64, expected.begin());
+    std::copy_n(source.begin() + 4096, 3000, expected.begin() + 32);
+    CHECK(destination == expected);
+    // The one-object tail retains the original wire path.
+    CHECK(load(reader, {"one", {{dst, 5000, 64}}, owner_cfg.name}) == Status::success);
+    CHECK(reader.stats()["remote_load_batch_requests"] == 3);
+    reader.deregister_memory(dst); owner.deregister_memory(src);
+    reader.close(); owner.close();
+}
+void grouped_padding_falls_back_to_individual_loads() {
+    File file;
+    auto cfg = config("padding-owner"); cfg.staging_slot_bytes = 4096;
+    cfg.disks = {{file.path, 16384 + 32 * 4096, 4096, 16384, true}};
+    Agent owner(cfg);
+    std::array<uint8_t, 192> source{}, destination{};
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<uint8_t>(i);
+    auto src = owner.register_memory(reinterpret_cast<uintptr_t>(source.data()), source.size());
+    auto put = owner.batch_store({{"one", {{src, 0, 64}}, {}}, {"two", {{src, 64, 64}}, {}},
+                                 {"three", {{src, 128, 64}}, {}}});
+    CHECK(wait(owner, put) == std::vector<Status>({Status::success, Status::success, Status::success})); owner.release(put);
+    auto reader_cfg = config("padding-reader"); reader_cfg.staging_slot_bytes = 4096;
+    reader_cfg.remote_batch_limit = 8; reader_cfg.peers[cfg.name] = owner.endpoint();
+    Agent reader(reader_cfg);
+    auto dst = reader.register_memory(reinterpret_cast<uintptr_t>(destination.data()), destination.size());
+    eventually([&] { return reader.batch_exists({"one", "two"}, {cfg.name, cfg.name}) == std::vector<bool>({true, true}); });
+    auto get = reader.batch_load({{"one", {{dst, 0, 64}}, cfg.name}, {"two", {{dst, 64, 64}}, cfg.name},
+                                 {"three", {{dst, 128, 64}}, cfg.name}});
+    CHECK(wait(reader, get) == std::vector<Status>({Status::success, Status::success, Status::success})); reader.release(get);
+    CHECK(destination == source);
+    CHECK(reader.stats()["remote_group_fallbacks"] == 1);
+    CHECK(owner.stats()["posix_read_bytes"] == 12288 && owner.stats()["ucx_write_bytes"] == 192);
+    reader.deregister_memory(dst); owner.deregister_memory(src); reader.close(); owner.close();
 }
 void caller_hint_roundtrip_and_restart() {
     File file;
@@ -175,7 +298,9 @@ void metadata_discovery_roundtrip() {
 int main() {
     try {
         caller_hint_roundtrip_and_restart(); metadata_discovery_roundtrip();
-        std::cout << "remote tests passed (2 real Agent TCP suites)\n";
+        grouped_loads_preserve_layout_and_statuses();
+        grouped_padding_falls_back_to_individual_loads();
+        std::cout << "remote tests passed (4 real Agent TCP suites, including grouped scatter/status/alias/error loads)\n";
         return 0;
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

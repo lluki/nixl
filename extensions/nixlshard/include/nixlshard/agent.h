@@ -16,6 +16,9 @@ struct AgentConfig {
     std::size_t workers = 2;
     std::size_t staging_slots = 8;
     std::size_t staging_slot_bytes = 32 * 1024 * 1024;
+    // Consecutive same-owner loads may share one owned staging slot/RPC.
+    // Both endpoints must support load_batch; one retains the original path.
+    std::size_t remote_batch_limit = 1;
     unsigned timeout_ms = 5000;
     bool direct_io = false;
 };

@@ -72,6 +72,17 @@ WRITE into requester-owned registered staging. The requester copies into caller
 segments only after confirmed completion. Control TCP carries metadata and
 descriptors, never payload bytes.
 
+`remote_batch_limit` defaults to 1. With both endpoints upgraded, set it to 8
+to group consecutive same-owner loads that fit one `staging_slot_bytes` slot.
+The owner pins each value, submits batched POSIX reads and one scatter/gather
+UCX WRITE; caller copies remain ordered and cancellation-gated. Missing keys
+and invalid lengths retain individual statuses. A smaller owner slot or excess
+allocation padding falls back to individual loads. An uncertain grouped RPC
+quarantines the entire requester-owned slot until the existing cleanup fence
+confirms quiescence. The pool remains bounded by `staging_slots` times
+`staging_slot_bytes`; this option neither registers caller memory for UCX nor
+changes caller-buffer lifetimes. For 16 MiB KV pages, a 128 MiB slot fits eight.
+
 This prototype explicitly selects the POSIX Linux AIO queue. Other POSIX queue
 implementations need separate error/quiescence validation before being enabled.
 

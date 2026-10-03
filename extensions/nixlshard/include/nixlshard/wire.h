@@ -59,6 +59,7 @@ private:
 };
 enum Op : std::uint8_t {
     hello = 1, exists = 2, load = 3, cleanup = 4,
-    register_owner = 5, announce = 6, lookup = 7, directory = 8
+    register_owner = 5, announce = 6, lookup = 7, directory = 8,
+    load_batch = 9
 };
 } // namespace nixlshard::wire

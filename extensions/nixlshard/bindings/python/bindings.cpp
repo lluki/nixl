@@ -32,6 +32,7 @@ AgentConfig config(const py::dict &source) {
     option(source, "workers", result.workers);
     option(source, "staging_slots", result.staging_slots);
     option(source, "staging_slot_bytes", result.staging_slot_bytes);
+    option(source, "remote_batch_limit", result.remote_batch_limit);
     option(source, "timeout_ms", result.timeout_ms);
     option(source, "direct_io", result.direct_io);
     if (source.contains("metadata_endpoint") && !source["metadata_endpoint"].is_none())

@@ -126,6 +126,8 @@ struct Agent::Impl {
             config.staging_slot_bytes > std::numeric_limits<std::size_t>::max() / config.staging_slots ||
             !config.timeout_ms || config.peers.size() > peer_limit || config.disks.size() > 128)
             throw std::invalid_argument("invalid agent configuration or resource limits");
+        if (!config.remote_batch_limit || config.remote_batch_limit > batch_limit)
+            throw std::invalid_argument("invalid remote batch limit");
         native = std::make_unique<nixlAgent>(identity, native_config());
         // Linux AIO has tested error/cancellation draining in the selected NIXL base.
         // Other POSIX queue implementations are not enabled by this prototype.
@@ -453,6 +455,124 @@ struct Agent::Impl {
             return control_timeout || Clock::now() >= deadline ? Status::timeout : Status::io_error;
         }
     }
+    std::vector<Status> remote_load_group(const std::vector<Object> &objects,
+                                        std::size_t first, std::size_t n, std::size_t slot,
+                                        const std::string &owner, Clock::time_point deadline,
+                                        bool &quarantined) {
+        std::vector<Status> results(n, Status::not_ready);
+        auto peer = get_peer(owner);
+        auto refresh_group = [&] {
+            for (std::size_t i = 0; i < n; ++i) refresh_hint(objects[first + i]);
+        };
+        if (!peer) { refresh_group(); return results; }
+        std::unique_lock peer_lock(peer->mutex, std::try_to_lock);
+        if (!peer_lock.owns_lock()) return results;
+        if (!peer->channel || !peer->channel->usable()) { refresh_group(); return results; }
+        if (Clock::now() >= deadline) return std::vector<Status>(n, Status::timeout);
+        auto request = identity + ":" + std::to_string(next_request.fetch_add(1));
+        auto target_identity = peer->identity;
+        wire::Writer w;
+        w.u8(wire::load_batch); w.str(request); w.str(target_identity);
+        w.str(identity); w.str(scratch_metadata);
+        w.u64(reinterpret_cast<std::uintptr_t>(address(slot))); w.u32(n);
+        const auto remaining = std::max<std::int64_t>(1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count());
+        w.u32(static_cast<unsigned>(remaining));
+        for (std::size_t i = 0; i < n; ++i) {
+            w.str(objects[first + i].key); w.u64(object_bytes(objects[first + i]));
+        }
+        auto start = Clock::now();
+        bool control_timeout = false;
+        try {
+            std::string response;
+            try { response = peer->channel->call(w.data, static_cast<unsigned>(remaining)); }
+            catch (const wire::Timeout &) { control_timeout = true; throw; }
+            wire::Reader r(response); auto status = read_status(r);
+            if (status != Status::success) std::fill(results.begin(), results.end(), status);
+            else {
+                if (r.u32() != n) throw std::invalid_argument("invalid remote batch response");
+                for (auto &result : results) result = read_status(r);
+            }
+            r.finish();
+            enqueue_cleanup(owner, target_identity, request);
+            elapsed("remote_control_ns", start); count("remote_load_batch_requests");
+            for (std::size_t i = 0; i < n; ++i) {
+                if (results[i] == Status::success) count("remote_read_bytes", object_bytes(objects[first + i]));
+                else refresh_hint(objects[first + i]);
+            }
+            return results;
+        } catch (...) {
+            peer->channel.reset();
+            {
+                std::lock_guard lock(pool_mutex);
+                quarantines.push_back({slot, owner, target_identity, request});
+            }
+            quarantined = true; count("quarantined_slots"); maintenance_wake.notify_one();
+            for (std::size_t i = 0; i < n; ++i) refresh_hint(objects[first + i]);
+            elapsed("remote_control_ns", start);
+            return std::vector<Status>(n, control_timeout || Clock::now() >= deadline ?
+                                      Status::timeout : Status::io_error);
+        }
+    }
+    // Group only consecutive same-owner remote objects. Copies remain ordered,
+    // including aliased destinations, and use the original batch cancellation gate.
+    std::size_t process_remote_group(Batch &batch, std::size_t first, std::size_t &serial_until) {
+        if (batch.store || config.remote_batch_limit == 1) return 0;
+        std::string owner;
+        std::size_t bytes = 0, n = 0;
+        for (std::size_t i = first; i < batch.objects.size() && n < config.remote_batch_limit; ++i) {
+            const auto &object = batch.objects[i];
+            bool local = false;
+            for (auto &disk : disks) local |= disk->exists(object.key);
+            if (local) break;
+            auto hint = owner_hint(object);
+            if (hint.empty() || hint == config.name || (n && hint != owner)) break;
+            const auto length = object_bytes(object);
+            if (length > config.staging_slot_bytes - bytes) break;
+            owner = std::move(hint); bytes += length; ++n;
+        }
+        if (n < 2) return 0;
+        std::vector<Status> results(n, Status::busy);
+        bool canceled;
+        { std::lock_guard lock(batch.mutex); canceled = batch.canceled; }
+        if (canceled || Clock::now() >= batch.deadline) std::fill(results.begin(), results.end(), Status::timeout);
+        else if (auto slot = acquire_slot()) {
+            bool quarantined = false;
+            Finally release_slot{[this, slot, &quarantined] { if (!quarantined) free_slot(*slot); }};
+            try {
+                results = remote_load_group(batch.objects, first, n, *slot, owner, batch.deadline, quarantined);
+                // The peer may have a smaller slot or larger allocation padding.
+                // A known quiescent no-space reply permits the original path to
+                // serve the objects individually without exposing grouped bytes.
+                if (std::find(results.begin(), results.end(), Status::no_space) != results.end()) {
+                    serial_until = first + n; count("remote_group_fallbacks"); return 0;
+                }
+            } catch (...) { std::fill(results.begin(), results.end(), Status::io_error); }
+            std::size_t offset = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                std::lock_guard lock(batch.mutex);
+                if (batch.canceled || Clock::now() >= batch.deadline) results[i] = Status::timeout;
+                if (results[i] == Status::success) {
+                    try { copy(batch.objects[first + i], static_cast<char *>(address(*slot)) + offset, false); }
+                    catch (...) { results[i] = Status::io_error; }
+                }
+                // Publish under the copy gate, so a later page's timeout cannot
+                // relabel an already copied page as failed.
+                if (!batch.reported[first + i]) {
+                    batch.results[first + i] = results[i]; batch.reported[first + i] = true;
+                }
+                offset += object_bytes(batch.objects[first + i]);
+            }
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            { std::lock_guard lock(batch.mutex);
+              if (!batch.reported[first + i]) {
+                  batch.results[first + i] = results[i]; batch.reported[first + i] = true;
+              } }
+            count(status_name(results[i]));
+        }
+        return n;
+    }
     Status load_object(const Object &object, std::size_t slot, Clock::time_point deadline,
                        bool &quarantined) {
         Allocation allocation;
@@ -474,7 +594,10 @@ struct Agent::Impl {
                 if (queue.empty()) return;
                 batch = queue.front(); queue.pop_front();
             }
+            std::size_t serial_until = 0;
             for (std::size_t i = 0; i < batch->objects.size(); ++i) {
+                if (i >= serial_until)
+                    if (auto n = process_remote_group(*batch, i, serial_until)) { i += n - 1; continue; }
                 Status result = Status::io_error;
                 bool canceled;
                 { std::lock_guard lock(batch->mutex); canceled = batch->canceled; }
@@ -498,6 +621,130 @@ struct Agent::Impl {
             { std::lock_guard lock(batch->mutex); batch->finished = true; }
             batch->done.notify_all();
         }
+    }
+    std::string serve_load_group(wire::Reader &r) {
+        auto id = r.str(4096), expected = r.str(2048);
+        auto requester = r.str(2048), metadata = r.str(4 * 1024 * 1024);
+        auto target = r.u64(); auto n = r.u32(); auto budget_ms = r.u32();
+        if (!n || n > batch_limit || !budget_ms || id.empty() || requester.empty())
+            return status_reply(Status::invalid_input);
+        const auto deadline = Clock::now() + std::chrono::milliseconds(std::min(config.timeout_ms, budget_ms));
+        struct Page {
+            std::string key;
+            std::size_t bytes = 0, target_offset = 0, offset = 0, disk = 0;
+            Allocation allocation;
+            Status status = Status::not_found;
+            bool pinned = false;
+        };
+        std::vector<Page> pages(n);
+        std::size_t logical_bytes = 0;
+        for (auto &page : pages) {
+            page.key = r.str(key_limit); auto bytes = r.u64();
+            if (page.key.empty() || !bytes)
+                return status_reply(Status::invalid_input);
+            if (bytes > config.staging_slot_bytes - logical_bytes) return status_reply(Status::no_space);
+            page.bytes = static_cast<std::size_t>(bytes); page.target_offset = logical_bytes;
+            logical_bytes += page.bytes;
+        }
+        r.finish();
+        if (target > std::numeric_limits<std::uintptr_t>::max() - logical_bytes)
+            return status_reply(Status::invalid_input);
+        if (expected != identity || stopping.load()) return status_reply(Status::not_ready);
+        {
+            std::lock_guard lock(incoming_mutex);
+            auto existing = incoming.find(id);
+            if (existing != incoming.end())
+                return status_reply(existing->second.canceled ? Status::canceled : Status::busy);
+            if (incoming.size() >= config.max_inflight * batch_limit) return status_reply(Status::busy);
+            incoming.emplace(id, Incoming{true, false});
+        }
+        Finally complete{[this, &id] {
+            std::lock_guard lock(incoming_mutex); incoming.at(id).active = false;
+        }};
+        auto slot = acquire_slot();
+        if (!slot) return status_reply(Status::busy);
+        Finally release_slot{[this, &slot] { free_slot(*slot); }};
+        Finally unpin{[this, &pages] {
+            for (auto &page : pages) if (page.pinned) disks[page.disk]->unpin(page.allocation.id);
+        }};
+        auto reply = [&] {
+            wire::Writer w; w.u8(static_cast<unsigned>(Status::success)); w.u32(n);
+            for (auto &page : pages) w.u8(static_cast<unsigned>(page.status));
+            return w.data;
+        };
+        std::size_t padded_bytes = 0;
+        bool needs_fallback = false;
+        for (auto &page : pages) {
+            auto [disk, status] = pin(page.key, page.allocation);
+            page.disk = disk; page.status = status;
+            if (status != Status::success) continue;
+            page.pinned = true;
+            if (page.bytes != page.allocation.bytes) { page.status = Status::invalid_input; continue; }
+            const auto unit = disks[disk]->unit_bytes();
+            auto offset = (padded_bytes + 4095) / 4096 * 4096;
+            if (offset > config.staging_slot_bytes ||
+                page.allocation.slots.size() > (config.staging_slot_bytes - offset) / unit) {
+                needs_fallback = true; continue;
+            }
+            page.offset = offset; padded_bytes = offset + page.allocation.slots.size() * unit;
+        }
+        if (needs_fallback) {
+            for (auto &page : pages) if (page.status == Status::success) page.status = Status::no_space;
+            return reply();
+        }
+        const bool has_payload = std::any_of(pages.begin(), pages.end(),
+            [](const Page &page) { return page.status == Status::success; });
+        if (!has_payload) return reply();
+        if (!import_metadata(requester, metadata)) {
+            for (auto &page : pages) if (page.status == Status::success) page.status = Status::not_ready;
+            return reply();
+        }
+        nixl_xfer_dlist_t memory(DRAM_SEG), file(FILE_SEG);
+        Status io = Status::success;
+        auto read_start = Clock::now();
+        for (auto &page : pages) {
+            if (page.status != Status::success) continue;
+            auto &disk = *disks[page.disk]; auto unit = disk.unit_bytes();
+            for (std::size_t cursor = 0; cursor < page.allocation.slots.size();) {
+                auto end = cursor + 1;
+                while (end < page.allocation.slots.size() &&
+                       page.allocation.slots[end] == page.allocation.slots[end - 1] + 1) ++end;
+                const auto length = (end - cursor) * unit;
+                memory.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(*slot)) + page.offset + cursor * unit, length, 0));
+                file.addDesc(nixlBasicDesc(disk.slot_offset(page.allocation.slots[cursor]), length, payload_fds[page.disk]));
+                cursor = end;
+                if (memory.descCount() == 128) {
+                    io = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
+                    memory.clear(); file.clear();
+                    if (io != Status::success) break;
+                }
+            }
+            if (io != Status::success) break;
+        }
+        if (io == Status::success && memory.descCount())
+            io = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
+        elapsed("posix_read_ns", read_start);
+        if (io != Status::success) {
+            for (auto &page : pages) if (page.status == Status::success) page.status = io;
+            return reply();
+        }
+        nixl_xfer_dlist_t local(DRAM_SEG), remote(DRAM_SEG);
+        std::size_t read_bytes = 0, write_bytes = 0;
+        for (auto &page : pages) if (page.status == Status::success) {
+            read_bytes += page.allocation.slots.size() * disks[page.disk]->unit_bytes();
+            write_bytes += page.bytes;
+            local.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(*slot)) + page.offset, page.bytes, 0));
+            remote.addDesc(nixlBasicDesc(target + page.target_offset, page.bytes, 0));
+        }
+        count("posix_read_bytes", read_bytes); count("remote_served_batch_requests");
+        if (local.descCount()) {
+            auto write_start = Clock::now();
+            io = transfer(NIXL_WRITE, local, remote, requester, ucx_options, deadline);
+            elapsed("ucx_write_ns", write_start);
+            if (io == Status::success) count("ucx_write_bytes", write_bytes);
+            else for (auto &page : pages) if (page.status == Status::success) page.status = io;
+        }
+        return reply();
     }
     std::string serve(std::string_view request) {
         try {
@@ -536,6 +783,7 @@ struct Agent::Impl {
                 } else w.u8(false);
                 return w.data;
             }
+            if (operation == wire::load_batch) return serve_load_group(r);
             if (operation != wire::load) return status_reply(Status::invalid_input);
             auto id = r.str(4096), expected = r.str(2048), key = r.str(key_limit);
             auto bytes = r.u64(), target = r.u64();

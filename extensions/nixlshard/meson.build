@@ -45,8 +45,14 @@ if get_option('build_tests')
     join_paths(get_option('prefix'), get_option('libdir'), 'plugins'))
   nixlshard_test_env.set('UCX_TLS', 'tcp,self,cuda_copy')
   foreach name : ['storage', 'agent', 'metadata', 'remote', 'timeout', 'admission']
+    extra_test_deps = []
+    extra_test_links = []
+    if name == 'remote'
+      extra_test_deps = [dl_dep]
+      extra_test_links = ['-Wl,--export-dynamic']
+    endif
     exe = executable('nixlshard-' + name + '-test', 'tests/' + name + '_test.cpp',
-      dependencies: nixlshard_dep)
+      dependencies: [nixlshard_dep] + extra_test_deps, link_args: extra_test_links)
     test('nixlshard-' + name, exe, suite: 'nixlshard',
       env: nixlshard_test_env, timeout: 120)
   endforeach
