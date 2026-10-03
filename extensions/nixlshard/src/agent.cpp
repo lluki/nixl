@@ -23,6 +23,9 @@
 namespace nixlshard {
 namespace {
 using Clock = std::chrono::steady_clock;
+std::uint64_t clock_ns(Clock::time_point time) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+}
 constexpr std::size_t batch_limit = 128, key_limit = 65536, peer_limit = 128;
 struct Finally {
     std::function<void()> fn;
@@ -75,6 +78,8 @@ struct Agent::Impl {
         std::vector<bool> reported;
         bool store = false, finished = false, canceled = false;
         Clock::time_point deadline;
+        Clock::time_point submitted;
+        std::vector<TraceEvent> trace;
         std::mutex mutex;
         std::condition_variable done;
     };
@@ -225,7 +230,9 @@ struct Agent::Impl {
         auto batch = std::make_shared<Batch>(); batch->objects = objects; batch->store = store;
         batch->results.assign(objects.size(), Status::not_ready);
         batch->reported.assign(objects.size(), false);
-        batch->deadline = Clock::now() + std::chrono::milliseconds(config.timeout_ms);
+        batch->submitted = Clock::now();
+        if (config.enable_trace && !store) batch->trace.reserve(1 + 3 * objects.size());
+        batch->deadline = batch->submitted + std::chrono::milliseconds(config.timeout_ms);
         std::lock_guard lock(mutex);
         if (stopping.load()) throw std::runtime_error("agent closing");
         if (batches.size() >= config.max_inflight) throw std::runtime_error("maximum in-flight handles reached");
@@ -256,8 +263,19 @@ struct Agent::Impl {
     std::size_t object_bytes(const Object &object) const {
         std::size_t bytes = 0; for (auto &s : object.segments) bytes += s.length; return bytes;
     }
+    // The worker is the sole writer; readers use the existing batch gate.
+    // Capacity is reserved before admission so diagnostics never grow unbounded.
+    void add_trace_locked(Batch &batch, TraceEvent event) {
+        if (config.enable_trace && batch.trace.size() < 1 + 3 * batch.objects.size())
+            batch.trace.push_back(std::move(event));
+    }
+    void add_trace(Batch &batch, TraceEvent event) {
+        if (!config.enable_trace) return;
+        std::lock_guard lock(batch.mutex); add_trace_locked(batch, std::move(event));
+    }
     // Caller registrations remain pinned by the live batch until release().
-    void copy(const Object &object, void *buffer, bool into_staging) {
+    void copy(const Object &object, void *buffer, bool into_staging,
+              Batch *batch = nullptr, std::size_t index = 0) {
         auto start = Clock::now();
         std::vector<std::uintptr_t> addresses;
         {
@@ -271,7 +289,12 @@ struct Agent::Impl {
             else std::memcpy(reinterpret_cast<void *>(addresses[i]), cursor, bytes);
             cursor += bytes;
         }
+        const auto end = Clock::now();
         count("staging_copy_bytes", object_bytes(object)); elapsed("staging_copy_ns", start);
+        // copy() is called while the cancellation/publication gate is held.
+        if (batch && config.enable_trace)
+            add_trace_locked(*batch, {"staging_copy", "", clock_ns(start), clock_ns(end),
+                                     object_bytes(object), index, 1});
     }
     Status transfer(nixl_xfer_op_t op, const nixl_xfer_dlist_t &local,
                     const nixl_xfer_dlist_t &remote, const std::string &owner,
@@ -458,7 +481,7 @@ struct Agent::Impl {
     std::vector<Status> remote_load_group(const std::vector<Object> &objects,
                                         std::size_t first, std::size_t n, std::size_t slot,
                                         const std::string &owner, Clock::time_point deadline,
-                                        bool &quarantined) {
+                                        bool &quarantined, Batch &batch) {
         std::vector<Status> results(n, Status::not_ready);
         auto peer = get_peer(owner);
         auto refresh_group = [&] {
@@ -472,7 +495,8 @@ struct Agent::Impl {
         auto request = identity + ":" + std::to_string(next_request.fetch_add(1));
         auto target_identity = peer->identity;
         wire::Writer w;
-        w.u8(wire::load_batch); w.str(request); w.str(target_identity);
+        w.u8(config.enable_trace ? wire::load_batch_trace : wire::load_batch);
+        w.str(request); w.str(target_identity);
         w.str(identity); w.str(scratch_metadata);
         w.u64(reinterpret_cast<std::uintptr_t>(address(slot))); w.u32(n);
         const auto remaining = std::max<std::int64_t>(1,
@@ -483,15 +507,28 @@ struct Agent::Impl {
         }
         auto start = Clock::now();
         bool control_timeout = false;
+        TraceEvent event;
+        if (config.enable_trace)
+            event = {"remote_rpc", request, clock_ns(start), 0, 0, first, n};
         try {
             std::string response;
             try { response = peer->channel->call(w.data, static_cast<unsigned>(remaining)); }
             catch (const wire::Timeout &) { control_timeout = true; throw; }
+            if (config.enable_trace) event.end_ns = clock_ns(Clock::now());
             wire::Reader r(response); auto status = read_status(r);
             if (status != Status::success) std::fill(results.begin(), results.end(), status);
             else {
                 if (r.u32() != n) throw std::invalid_argument("invalid remote batch response");
                 for (auto &result : results) result = read_status(r);
+                if (config.enable_trace) {
+                    event.owner_timing_flags = r.u8();
+                    event.owner_posix_ns = r.u64(); event.owner_ucx_ns = r.u64();
+                    event.owner_read_bytes = r.u64();
+                    if ((event.owner_timing_flags & ~3) ||
+                        event.owner_posix_ns > event.end_ns - event.start_ns ||
+                        event.owner_ucx_ns > event.end_ns - event.start_ns - event.owner_posix_ns)
+                        throw std::invalid_argument("invalid owner timing response");
+                }
             }
             r.finish();
             enqueue_cleanup(owner, target_identity, request);
@@ -499,7 +536,10 @@ struct Agent::Impl {
             for (std::size_t i = 0; i < n; ++i) {
                 if (results[i] == Status::success) count("remote_read_bytes", object_bytes(objects[first + i]));
                 else refresh_hint(objects[first + i]);
+                if (config.enable_trace && results[i] == Status::success)
+                    event.bytes += object_bytes(objects[first + i]);
             }
+            if (config.enable_trace) add_trace(batch, std::move(event));
             return results;
         } catch (...) {
             peer->channel.reset();
@@ -510,6 +550,10 @@ struct Agent::Impl {
             quarantined = true; count("quarantined_slots"); maintenance_wake.notify_one();
             for (std::size_t i = 0; i < n; ++i) refresh_hint(objects[first + i]);
             elapsed("remote_control_ns", start);
+            if (config.enable_trace) {
+                event.end_ns = clock_ns(Clock::now()); event.owner_timing_flags = 0;
+                add_trace(batch, std::move(event));
+            }
             return std::vector<Status>(n, control_timeout || Clock::now() >= deadline ?
                                       Status::timeout : Status::io_error);
         }
@@ -517,7 +561,7 @@ struct Agent::Impl {
     // Group only consecutive same-owner remote objects. Copies remain ordered,
     // including aliased destinations, and use the original batch cancellation gate.
     std::size_t process_remote_group(Batch &batch, std::size_t first, std::size_t &serial_until) {
-        if (batch.store || config.remote_batch_limit == 1) return 0;
+        if (batch.store || (config.remote_batch_limit == 1 && !config.enable_trace)) return 0;
         std::string owner;
         std::size_t bytes = 0, n = 0;
         for (std::size_t i = first; i < batch.objects.size() && n < config.remote_batch_limit; ++i) {
@@ -531,7 +575,7 @@ struct Agent::Impl {
             if (length > config.staging_slot_bytes - bytes) break;
             owner = std::move(hint); bytes += length; ++n;
         }
-        if (n < 2) return 0;
+        if (!n || (n < 2 && !config.enable_trace)) return 0;
         std::vector<Status> results(n, Status::busy);
         bool canceled;
         { std::lock_guard lock(batch.mutex); canceled = batch.canceled; }
@@ -540,7 +584,7 @@ struct Agent::Impl {
             bool quarantined = false;
             Finally release_slot{[this, slot, &quarantined] { if (!quarantined) free_slot(*slot); }};
             try {
-                results = remote_load_group(batch.objects, first, n, *slot, owner, batch.deadline, quarantined);
+                results = remote_load_group(batch.objects, first, n, *slot, owner, batch.deadline, quarantined, batch);
                 // The peer may have a smaller slot or larger allocation padding.
                 // A known quiescent no-space reply permits the original path to
                 // serve the objects individually without exposing grouped bytes.
@@ -553,7 +597,7 @@ struct Agent::Impl {
                 std::lock_guard lock(batch.mutex);
                 if (batch.canceled || Clock::now() >= batch.deadline) results[i] = Status::timeout;
                 if (results[i] == Status::success) {
-                    try { copy(batch.objects[first + i], static_cast<char *>(address(*slot)) + offset, false); }
+                    try { copy(batch.objects[first + i], static_cast<char *>(address(*slot)) + offset, false, &batch, first + i); }
                     catch (...) { results[i] = Status::io_error; }
                 }
                 // Publish under the copy gate, so a later page's timeout cannot
@@ -574,13 +618,20 @@ struct Agent::Impl {
         return n;
     }
     Status load_object(const Object &object, std::size_t slot, Clock::time_point deadline,
-                       bool &quarantined) {
+                       bool &quarantined, Batch &batch, std::size_t index) {
         Allocation allocation;
         auto [id, status] = pin(object.key, allocation);
         if (status == Status::success) {
             Finally unpin{[this, id, &allocation] { disks[id]->unpin(allocation.id); }};
             if (allocation.bytes != object_bytes(object)) return Status::invalid_input;
-            return disk_io(id, allocation, slot, false, deadline);
+            const auto start = Clock::now();
+            const auto result = disk_io(id, allocation, slot, false, deadline);
+            const auto end = Clock::now();
+            if (config.enable_trace)
+                add_trace(batch, {"local_posix", "", clock_ns(start), clock_ns(end),
+                                 result == Status::success ? allocation.slots.size() * disks[id]->unit_bytes() : 0,
+                                 index, 1});
+            return result;
         }
         if (status != Status::not_found) return status;
         return remote_load(object, slot, deadline, quarantined);
@@ -594,6 +645,9 @@ struct Agent::Impl {
                 if (queue.empty()) return;
                 batch = queue.front(); queue.pop_front();
             }
+            if (config.enable_trace && !batch->store)
+                add_trace(*batch, {"queue", "", clock_ns(batch->submitted), clock_ns(Clock::now()),
+                                   0, 0, batch->objects.size()});
             std::size_t serial_until = 0;
             for (std::size_t i = 0; i < batch->objects.size(); ++i) {
                 if (i >= serial_until)
@@ -607,11 +661,11 @@ struct Agent::Impl {
                     Finally release_slot{[this, slot, &quarantined] { if (!quarantined) free_slot(*slot); }};
                     try {
                         result = batch->store ? store_object(batch->objects[i], *slot, batch->deadline, *batch) :
-                                 load_object(batch->objects[i], *slot, batch->deadline, quarantined);
+                                 load_object(batch->objects[i], *slot, batch->deadline, quarantined, *batch, i);
                         std::lock_guard lock(batch->mutex);
                         if (batch->canceled || Clock::now() >= batch->deadline) result = Status::timeout;
                         if (!batch->store && result == Status::success)
-                            copy(batch->objects[i], address(*slot), false);
+                            copy(batch->objects[i], address(*slot), false, batch.get(), i);
                     } catch (...) { result = Status::io_error; }
                 } else result = Status::busy;
                 { std::lock_guard lock(batch->mutex);
@@ -622,7 +676,7 @@ struct Agent::Impl {
             batch->done.notify_all();
         }
     }
-    std::string serve_load_group(wire::Reader &r) {
+    std::string serve_load_group(wire::Reader &r, bool trace = false) {
         auto id = r.str(4096), expected = r.str(2048);
         auto requester = r.str(2048), metadata = r.str(4 * 1024 * 1024);
         auto target = r.u64(); auto n = r.u32(); auto budget_ms = r.u32();
@@ -667,9 +721,14 @@ struct Agent::Impl {
         Finally unpin{[this, &pages] {
             for (auto &page : pages) if (page.pinned) disks[page.disk]->unpin(page.allocation.id);
         }};
+        std::uint8_t timing_flags = 0;
+        std::uint64_t read_ns = 0, ucx_ns = 0, physical_read_bytes = 0;
         auto reply = [&] {
             wire::Writer w; w.u8(static_cast<unsigned>(Status::success)); w.u32(n);
             for (auto &page : pages) w.u8(static_cast<unsigned>(page.status));
+            if (trace) {
+                w.u8(timing_flags); w.u64(read_ns); w.u64(ucx_ns); w.u64(physical_read_bytes);
+            }
             return w.data;
         };
         std::size_t padded_bytes = 0;
@@ -723,6 +782,9 @@ struct Agent::Impl {
         }
         if (io == Status::success && memory.descCount())
             io = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
+        if (trace && io == Status::success) {
+            timing_flags |= 1; read_ns = clock_ns(Clock::now()) - clock_ns(read_start);
+        }
         elapsed("posix_read_ns", read_start);
         if (io != Status::success) {
             for (auto &page : pages) if (page.status == Status::success) page.status = io;
@@ -737,9 +799,13 @@ struct Agent::Impl {
             remote.addDesc(nixlBasicDesc(target + page.target_offset, page.bytes, 0));
         }
         count("posix_read_bytes", read_bytes); count("remote_served_batch_requests");
+        if (trace) physical_read_bytes = read_bytes;
         if (local.descCount()) {
             auto write_start = Clock::now();
             io = transfer(NIXL_WRITE, local, remote, requester, ucx_options, deadline);
+            if (trace && io == Status::success) {
+                timing_flags |= 2; ucx_ns = clock_ns(Clock::now()) - clock_ns(write_start);
+            }
             elapsed("ucx_write_ns", write_start);
             if (io == Status::success) count("ucx_write_bytes", write_bytes);
             else for (auto &page : pages) if (page.status == Status::success) page.status = io;
@@ -784,6 +850,7 @@ struct Agent::Impl {
                 return w.data;
             }
             if (operation == wire::load_batch) return serve_load_group(r);
+            if (operation == wire::load_batch_trace) return serve_load_group(r, true);
             if (operation != wire::load) return status_reply(Status::invalid_input);
             auto id = r.str(4096), expected = r.str(2048), key = r.str(key_limit);
             auto bytes = r.u64(), target = r.u64();
@@ -1075,6 +1142,14 @@ std::optional<std::vector<Status>> Agent::poll(std::uint64_t handle) const {
         return batch->results;
     }
     return {};
+}
+std::vector<TraceEvent> Agent::trace(std::uint64_t handle) const {
+    std::shared_ptr<Impl::Batch> batch;
+    { std::lock_guard lock(impl_->mutex); auto it = impl_->batches.find(handle);
+      if (it == impl_->batches.end()) throw std::invalid_argument("unknown transfer handle");
+      batch = it->second; }
+    std::lock_guard lock(batch->mutex);
+    return batch->trace;
 }
 void Agent::release(std::uint64_t handle) {
     std::shared_ptr<Impl::Batch> batch;

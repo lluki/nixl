@@ -65,6 +65,21 @@ waits for worker quiescence before dropping caller references. Unreleased termin
 handles consume the admission budget. Invalid arguments and exhausted live-handle
 budget raise exceptions; individual cache/resource/I/O failures return statuses.
 
+For request-specific diagnostics, set `enable_trace=True` and fetch
+`agent.trace(handle)` after successful polling and before `release(handle)`.
+The bounded list belongs to that handle; releasing it also releases its trace.
+Events contain `stage`, requester `start_ns`/`end_ns` in Linux CLOCK_MONOTONIC,
+`bytes`, object ordinals and the remote control `request_id`. Admission/queue,
+local POSIX reads, remote RPCs and staging copies are separate intervals.
+Remote RPC events additionally carry measured `owner_posix_ns`, `owner_ucx_ns`
+and physical `owner_read_bytes`. Missing/failed owner measurements omit these
+Python fields rather than claiming zero cost. Owner read and UCX durations are
+sequential children of the RPC: replace the enclosing RPC with its read,
+network and control residual when constructing a stack; never add all four.
+Tracing requires matching instrumented endpoints and uses the measured group
+envelope even for a single remote object. It is off by default and introduces
+small diagnostic overhead; it preserves owned staging and timeout quarantine.
+
 ## Remote loads and metadata
 
 An owner uses NIXL POSIX to read its disk into owned DRAM, then initiates NIXL UCX

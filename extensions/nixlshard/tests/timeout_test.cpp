@@ -37,7 +37,7 @@ Status wait(Agent &agent, std::uint64_t handle, std::size_t count = 1) {
     CHECK(std::all_of(result->begin(), result->end(), [&](Status s) { return s == result->at(0); }));
     return result->at(0);
 }
-void delayed_load_fenced_and_quarantine_retained(bool grouped = false) {
+void delayed_load_fenced_and_quarantine_retained(bool grouped = false, bool tracing = false) {
     File file;
     AgentConfig cfg; cfg.name = "timeout-owner"; cfg.staging_slots = 2;
     cfg.staging_slot_bytes = grouped ? 8192 : 4096; cfg.timeout_ms = 2000;
@@ -57,7 +57,7 @@ void delayed_load_fenced_and_quarantine_retained(bool grouped = false) {
             wire::Writer reply; reply.u8(static_cast<unsigned>(Status::success)); reply.u8(false);
             return reply.data;
         }
-        const bool delayed = (op == wire::load || op == wire::load_batch) && delay_load.load();
+        const bool delayed = (op == wire::load || op == wire::load_batch || op == wire::load_batch_trace) && delay_load.load();
         if (delayed) eventually([&] { return fence_created.load(); });
         wire::Connection upstream(endpoint, 1000);
         auto result = upstream.call(message, 1000);
@@ -75,6 +75,7 @@ void delayed_load_fenced_and_quarantine_retained(bool grouped = false) {
     AgentConfig reader_cfg; reader_cfg.name = "timeout-reader"; reader_cfg.staging_slots = 1;
     reader_cfg.staging_slot_bytes = grouped ? 8192 : 4096; reader_cfg.timeout_ms = 500;
     reader_cfg.remote_batch_limit = grouped ? 2 : 1;
+    reader_cfg.enable_trace = tracing;
     reader_cfg.peers["timeout-owner"] = proxy.endpoint();
     Agent reader(reader_cfg);
     auto dst = reader.register_memory(reinterpret_cast<std::uintptr_t>(destination.data()), destination.size());
@@ -120,6 +121,7 @@ void delayed_load_fenced_and_quarantine_retained(bool grouped = false) {
 int main() {
     try { delayed_load_fenced_and_quarantine_retained();
           delayed_load_fenced_and_quarantine_retained(true);
+          delayed_load_fenced_and_quarantine_retained(true, true);
           std::cout << "timeout, quarantine, delayed-load fencing and reuse passed\n"; return 0; }
     catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -33,6 +33,7 @@ AgentConfig config(const py::dict &source) {
     option(source, "staging_slots", result.staging_slots);
     option(source, "staging_slot_bytes", result.staging_slot_bytes);
     option(source, "remote_batch_limit", result.remote_batch_limit);
+    option(source, "enable_trace", result.enable_trace);
     option(source, "timeout_ms", result.timeout_ms);
     option(source, "direct_io", result.direct_io);
     if (source.contains("metadata_endpoint") && !source["metadata_endpoint"].is_none())
@@ -107,6 +108,25 @@ PYBIND11_MODULE(_bindings, module) {
             py::list result;
             for (auto status : *statuses) result.append(status_name(status));
             return std::move(result);
+        }, py::arg("handle"))
+        .def("trace", [](const Agent &agent, std::uint64_t handle) {
+            std::vector<TraceEvent> events;
+            { py::gil_scoped_release unlocked; events = agent.trace(handle); }
+            py::list result;
+            for (const auto &event : events) {
+                py::dict row;
+                row["stage"] = event.stage; row["request_id"] = event.request_id;
+                row["start_ns"] = event.start_ns; row["end_ns"] = event.end_ns;
+                row["bytes"] = event.bytes; row["first_object"] = event.first_object;
+                row["object_count"] = event.object_count;
+                if (event.owner_timing_flags & 1) {
+                    row["owner_posix_ns"] = event.owner_posix_ns;
+                    row["owner_read_bytes"] = event.owner_read_bytes;
+                }
+                if (event.owner_timing_flags & 2) row["owner_ucx_ns"] = event.owner_ucx_ns;
+                result.append(row);
+            }
+            return result;
         }, py::arg("handle"))
         .def("release", &Agent::release, py::arg("handle"),
              py::call_guard<py::gil_scoped_release>())

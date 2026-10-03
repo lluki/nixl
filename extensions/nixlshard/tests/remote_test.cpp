@@ -79,7 +79,7 @@ std::string peer_identity(const Endpoint &endpoint) {
     auto incarnation = reader.str(); reader.str(); reader.finish();
     return incarnation;
 }
-void grouped_loads_preserve_layout_and_statuses() {
+void grouped_loads_preserve_layout_and_statuses(bool tracing = false) {
     File file;
     auto owner_cfg = config("group-owner"); owner_cfg.staging_slot_bytes = 32768;
     owner_cfg.disks = {{file.path, 16384 + 128 * 4096, 4096, 16384, true}};
@@ -91,10 +91,12 @@ void grouped_loads_preserve_layout_and_statuses() {
     CHECK(wait(owner, put) == std::vector<Status>({Status::success, Status::success})); owner.release(put);
     auto reader_cfg = config("group-reader"); reader_cfg.staging_slot_bytes = 32768;
     reader_cfg.remote_batch_limit = 8; reader_cfg.peers[owner_cfg.name] = owner.endpoint();
+    reader_cfg.enable_trace = tracing;
     Agent reader(reader_cfg);
     auto dst = reader.register_memory(reinterpret_cast<uintptr_t>(destination.data()), destination.size());
     eventually([&] { return reader.batch_exists({"one", "two"}, {owner_cfg.name, owner_cfg.name}) == std::vector<bool>({true, true}); });
     destination.fill(201);
+    const auto before_get = Clock::now();
     auto get = reader.batch_load({
         {"one", {{dst, 13, 17}, {dst, 100, 47}}, owner_cfg.name},
         {"missing", {{dst, 200, 32}}, owner_cfg.name},
@@ -102,7 +104,32 @@ void grouped_loads_preserve_layout_and_statuses() {
         {"one", {{dst, 4000, 64}}, owner_cfg.name},
         {"one", {{dst, 4200, 63}}, owner_cfg.name}});
     CHECK(wait(reader, get) == std::vector<Status>({Status::success, Status::not_found,
-          Status::success, Status::success, Status::invalid_input})); reader.release(get);
+          Status::success, Status::success, Status::invalid_input}));
+    auto events = reader.trace(get);
+    CHECK(events.size() == (tracing ? 5 : 0));
+    if (tracing) {
+        auto ns = [](Clock::time_point t) { return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count()); };
+        CHECK(events.front().stage == "queue" && events.front().start_ns >= ns(before_get));
+        const auto &rpc = events.at(1);
+        CHECK(rpc.stage == "remote_rpc" && !rpc.request_id.empty());
+        CHECK(rpc.owner_timing_flags == 3 && rpc.bytes == 3128 && rpc.owner_read_bytes == 12288);
+        CHECK(rpc.owner_posix_ns > 0 && rpc.owner_ucx_ns > 0);
+        CHECK(rpc.owner_posix_ns + rpc.owner_ucx_ns <= rpc.end_ns - rpc.start_ns);
+        CHECK(events.at(2).first_object == 0 && events.at(3).first_object == 2 && events.at(4).first_object == 3);
+        uint64_t copied = 0;
+        for (size_t i = 0; i < events.size(); ++i) {
+            CHECK(events[i].end_ns >= events[i].start_ns);
+            CHECK(events[i].end_ns <= ns(Clock::now()));
+            if (i) CHECK(events[i].start_ns >= events[i - 1].end_ns);
+            if (events[i].stage == "staging_copy") copied += events[i].bytes;
+        }
+        CHECK(copied == 3128 && events.size() <= 1 + 3 * 5);
+    }
+    reader.release(get);
+    bool expired_trace = false;
+    try { reader.trace(get); } catch (const std::invalid_argument &) { expired_trace = true; }
+    CHECK(expired_trace);
     auto expected = std::array<uint8_t, 8192>{}; expected.fill(201);
     std::copy_n(source.begin(), 17, expected.begin() + 13);
     std::copy_n(source.begin() + 17, 47, expected.begin() + 100);
@@ -114,7 +141,13 @@ void grouped_loads_preserve_layout_and_statuses() {
     destination.fill(201); fail_group_read.store(true);
     get = reader.batch_load({{"one", {{dst, 0, 64}}, owner_cfg.name},
                              {"two", {{dst, 512, 3000}}, owner_cfg.name}});
-    auto failed = wait(reader, get); fail_group_read.store(false); reader.release(get);
+    auto failed = wait(reader, get); fail_group_read.store(false);
+    if (tracing) {
+        events = reader.trace(get);
+        CHECK(events.size() == 2 && events.back().stage == "remote_rpc");
+        CHECK(events.back().bytes == 0 && events.back().owner_timing_flags == 0);
+    }
+    reader.release(get);
     CHECK(failed == std::vector<Status>({Status::io_error, Status::io_error}));
     CHECK(injected_read_errors.load() > 0);
     CHECK(std::all_of(destination.begin(), destination.end(), [](uint8_t x) { return x == 201; }));
@@ -154,9 +187,10 @@ void grouped_loads_preserve_layout_and_statuses() {
     std::copy_n(source.begin(), 64, expected.begin());
     std::copy_n(source.begin() + 4096, 3000, expected.begin() + 32);
     CHECK(destination == expected);
-    // The one-object tail retains the original wire path.
+    // The normal one-object tail retains the old wire path; tracing uses its
+    // measured group envelope so owner durations are available for tails too.
     CHECK(load(reader, {"one", {{dst, 5000, 64}}, owner_cfg.name}) == Status::success);
-    CHECK(reader.stats()["remote_load_batch_requests"] == 3);
+    CHECK(reader.stats()["remote_load_batch_requests"] == (tracing ? 4 : 3));
     reader.deregister_memory(dst); owner.deregister_memory(src);
     reader.close(); owner.close();
 }
@@ -299,8 +333,9 @@ int main() {
     try {
         caller_hint_roundtrip_and_restart(); metadata_discovery_roundtrip();
         grouped_loads_preserve_layout_and_statuses();
+        grouped_loads_preserve_layout_and_statuses(true);
         grouped_padding_falls_back_to_individual_loads();
-        std::cout << "remote tests passed (4 real Agent TCP suites, including grouped scatter/status/alias/error loads)\n";
+        std::cout << "remote tests passed (5 real Agent TCP suites, including traced and untraced grouped loads)\n";
         return 0;
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

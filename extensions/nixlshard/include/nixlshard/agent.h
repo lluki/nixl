@@ -21,6 +21,16 @@ struct AgentConfig {
     std::size_t remote_batch_limit = 1;
     unsigned timeout_ms = 5000;
     bool direct_io = false;
+    // Bounded request-specific diagnostics; off on the normal execution path.
+    bool enable_trace = false;
+};
+struct TraceEvent {
+    std::string stage, request_id;
+    std::uint64_t start_ns = 0, end_ns = 0, bytes = 0;
+    std::size_t first_object = 0, object_count = 0;
+    // Owner durations are sequential children of remote_rpc, never extra time.
+    std::uint8_t owner_timing_flags = 0;
+    std::uint64_t owner_posix_ns = 0, owner_ucx_ns = 0, owner_read_bytes = 0;
 };
 class Agent {
 public:
@@ -32,6 +42,7 @@ public:
     std::uint64_t batch_store(const std::vector<Object> &);
     std::uint64_t batch_load(const std::vector<Object> &);
     std::optional<std::vector<Status>> poll(std::uint64_t handle) const;
+    std::vector<TraceEvent> trace(std::uint64_t handle) const;
     void release(std::uint64_t handle);
     std::vector<bool> batch_exists(const std::vector<std::string> &keys,
                                   const std::vector<std::string> &hints = {});
