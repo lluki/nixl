@@ -63,7 +63,18 @@ its raw response and fails the run; it is never silently renamed.
 
 `summary.json` contains p50/p95 by context/cache source and the raw TTFT
 samples; `samples.jsonl` and per-sample directories retain warmups and failures.
-Percentiles use linear interpolation. Prometheus snapshots/deltas record the
+Percentiles use linear interpolation.
+
+For ephemeral cluster pods, add `--gcs-prefix gs://dynamo-gcp-dev-02-nixl-object-perf-526392861238/runs/nixlshard-v2/UNIQUE-RUN`.
+With `google-cloud-storage` installed and ADC credentials supplied by the runtime,
+the harness uploads an initial provenance archive, one ZIP for each completed
+sample (including failed cache checks), and a final summary archive. Each archive
+is immutable (`if_generation_match=0`); a reused prefix fails rather than replacing
+another run. Archives include raw SSE events and metrics, with hashes recorded in
+`gcs-archives.json`. Uploads happen outside timed generation and failures fail the
+run. In-flight samples can still be lost if the pod disappears before completion.
+
+Prometheus snapshots/deltas record the
 available framework cache and staging histograms. The generic collector does
 **not** expose adapter `native_*` component counters over HTTP; these are
 explicitly marked unavailable unless a separately supplied diagnostic path

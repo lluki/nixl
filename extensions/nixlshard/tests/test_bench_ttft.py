@@ -1,6 +1,7 @@
 """Streaming timing and cache-provenance tests, independent of GPU packages."""
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import unittest
+import zipfile
 from unittest import mock
 
 path = Path(__file__).parents[1] / "tools" / "bench-ttft.py"
@@ -33,6 +35,66 @@ def encoded_frames(events):
 
 
 class Tests(unittest.TestCase):
+    def test_incremental_archives_preserve_complete_samples_and_fail_on_upload_error(
+        self,
+    ):
+        uploads = []
+
+        def blob(name):
+            return SimpleNamespace(
+                name=name,
+                upload_from_string=lambda body, **kwargs: uploads.append(
+                    (name, body, kwargs)
+                ),
+            )
+
+        bucket = SimpleNamespace(name="test-bucket", blob=blob)
+        storage = SimpleNamespace(
+            Client=lambda: SimpleNamespace(bucket=lambda name: bucket)
+        )
+        modules = {
+            "google": SimpleNamespace(cloud=SimpleNamespace(storage=storage)),
+            "google.cloud": SimpleNamespace(storage=storage),
+            "google.cloud.storage": storage,
+        }
+        with (
+            tempfile.TemporaryDirectory() as root,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            artifact = Path(root) / "run"
+            sample = artifact / "0001-512-ssd"
+            sample.mkdir(parents=True)
+            (sample / "sample.json").write_text('{"passed": true}')
+            (sample / "measured.json").write_text('{"output_ids": [1, 2]}')
+            (sample / "before-metrics.txt").write_text("storage_hits 448\n")
+            archives = bench.GcsArchives("gs://test-bucket/runs/unique", artifact)
+            archives.archive(sample, sample.name + ".zip")
+            name, body, options = uploads[0]
+            self.assertEqual(name, "runs/unique/run/0001-512-ssd.zip")
+            self.assertEqual(options["if_generation_match"], 0)
+            with zipfile.ZipFile(io.BytesIO(body)) as saved:
+                self.assertEqual(
+                    set(saved.namelist()),
+                    {"sample.json", "measured.json", "before-metrics.txt"},
+                )
+                self.assertEqual(
+                    json.loads(saved.read("measured.json"))["output_ids"], [1, 2]
+                )
+            self.assertEqual(
+                json.loads((artifact / "gcs-archives.json").read_text())[0]["bytes"],
+                len(body),
+            )
+
+            def fail(*_, **__):
+                raise OSError("upload failed")
+
+            bucket.blob = lambda name: SimpleNamespace(
+                name=name, upload_from_string=fail
+            )
+            with self.assertRaisesRegex(OSError, "upload failed"):
+                archives.archive(sample, "failed.zip")
+            self.assertEqual(len(archives.uploads), 1)
+
     def test_first_nonempty_token_ignores_metadata_and_final_completion(self):
         response = bench.collect_stream(
             encoded_frames(

@@ -14,6 +14,7 @@ Cache-level TTFT differences do not measure attributable NIXLShard overhead.
 import argparse
 import hashlib
 import http.client
+import io
 import json
 import math
 from pathlib import Path
@@ -22,6 +23,54 @@ import sys
 import time
 import urllib.parse
 import uuid
+import zipfile
+
+
+class GcsArchives:
+    """One immutable archive per completed sample, outside measured generation."""
+
+    def __init__(self, prefix, artifact_dir):
+        parsed = urllib.parse.urlsplit(prefix)
+        if (
+            parsed.scheme != "gs"
+            or not parsed.netloc
+            or not parsed.path.strip("/")
+            or parsed.query
+            or parsed.fragment
+            or ".." in parsed.path.split("/")
+        ):
+            raise ValueError("GCS prefix must be gs://bucket/unique-run-prefix")
+        from google.cloud import storage
+
+        self.bucket = storage.Client().bucket(parsed.netloc)
+        self.prefix = parsed.path.strip("/") + "/" + artifact_dir.name
+        self.artifact_dir = artifact_dir
+        self.uploads = []
+
+    def archive(self, directory, name, recursive=True):
+        stream = io.BytesIO()
+        paths = directory.rglob("*") if recursive else directory.iterdir()
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(paths):
+                if path.is_file():
+                    archive.writestr(
+                        str(path.relative_to(directory)), path.read_bytes()
+                    )
+        body = stream.getvalue()
+        blob = self.bucket.blob(self.prefix + "/" + name)
+        blob.upload_from_string(
+            body, content_type="application/zip", if_generation_match=0
+        )
+        self.uploads.append(
+            {
+                "uri": "gs://" + self.bucket.name + "/" + blob.name,
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "bytes": len(body),
+            }
+        )
+        (self.artifact_dir / "gcs-archives.json").write_text(
+            json.dumps(self.uploads, indent=2) + "\n"
+        )
 
 
 class Client:
@@ -231,10 +280,13 @@ def percentile(values, percent):
 
 
 class Experiment:
-    def __init__(self, args, client, tokenizer, artifact_dir, incremental):
+    def __init__(
+        self, args, client, tokenizer, artifact_dir, incremental, archives=None
+    ):
         self.args, self.client, self.tokenizer = args, client, tokenizer
         self.artifact_dir, self.incremental = artifact_dir, incremental
         self.sequence, self.samples = 0, []
+        self.archives = archives
 
     def prompt(self, length):
         # The nonce appears before the first complete cache page: no shared page keys.
@@ -424,6 +476,8 @@ class Experiment:
             (directory / "sample.json").write_text(json.dumps(record, indent=2) + "\n")
             with (self.artifact_dir / "samples.jsonl").open("a") as output:
                 output.write(json.dumps(record) + "\n")
+            if self.archives is not None:
+                self.archives.archive(directory, directory.name + ".zip")
 
     def summary(self):
         groups = {}
@@ -480,6 +534,10 @@ def main():
         "--native-stats-url",
         help="optional HTTP path providing native counter snapshots",
     )
+    parser.add_argument(
+        "--gcs-prefix",
+        help="gs://bucket/unique-run-prefix for incremental immutable sample archives (ADC credentials)",
+    )
     args = parser.parse_args()
     if (
         args.repeats < 1
@@ -506,7 +564,10 @@ def main():
         )
     client = Client(args.base_url, args.request_timeout)
     experiment, passed, error = None, False, None
+    archives = None
     try:
+        if args.gcs_prefix:
+            archives = GcsArchives(args.gcs_prefix, args.artifact_dir)
         info = client.request("/server_info")
         (args.artifact_dir / "server-info.json").write_text(
             json.dumps(info, indent=2) + "\n"
@@ -563,6 +624,7 @@ def main():
             "incremental_streaming_output": incremental,
             "measurement": "request submission to first received nonempty output-token SSE event",
             "one_generation_outstanding": True,
+            "incremental_gcs_archives": args.gcs_prefix,
             "native_component_counters": (
                 "optional diagnostic endpoint snapshots"
                 if args.native_stats_url
@@ -578,7 +640,11 @@ def main():
         (args.artifact_dir / "runtime.json").write_text(
             json.dumps(runtime, indent=2) + "\n"
         )
-        experiment = Experiment(args, client, tokenizer, args.artifact_dir, incremental)
+        if archives is not None:
+            archives.archive(args.artifact_dir, "initial.zip", recursive=False)
+        experiment = Experiment(
+            args, client, tokenizer, args.artifact_dir, incremental, archives
+        )
         for context in args.contexts:
             for repeat in range(args.warmups + args.repeats):
                 warmup = repeat < args.warmups
@@ -612,6 +678,17 @@ def main():
         (args.artifact_dir / "summary.json").write_text(
             json.dumps(summary, indent=2) + "\n"
         )
+        if archives is not None:
+            try:
+                archives.archive(args.artifact_dir, "summary.zip", recursive=False)
+            except Exception as caught:
+                summary.update(passed=False, archive_error=repr(caught))
+                (args.artifact_dir / "summary.json").write_text(
+                    json.dumps(summary, indent=2) + "\n"
+                )
+                if error is None:
+                    raise
+                print("Final GCS archive also failed: " + repr(caught), file=sys.stderr)
         print(json.dumps(summary))
 
 
