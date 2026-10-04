@@ -70,13 +70,22 @@ struct Agent::Impl {
     std::string scratch_metadata;
     std::mutex native_md_mutex;
     std::set<std::string> imported_names;
+    std::map<std::string, std::string> imported_metadata;
+    std::map<std::string, std::shared_ptr<std::mutex>> memory_gates;
+    std::string caller_metadata;
 
-    struct Registration { std::uintptr_t address; std::size_t bytes; std::size_t refs = 0; };
-    struct Batch {
+    struct Registration {
+        std::uintptr_t address;
+        std::size_t bytes;
+        std::size_t refs = 0;
+        std::unique_ptr<nixl_reg_dlist_t> native_desc;
+    };
+    struct Batch : std::enable_shared_from_this<Batch> {
         std::vector<Object> objects;
         std::vector<Status> results;
         std::vector<bool> reported;
         bool store = false, finished = false, canceled = false;
+        std::size_t pending_direct = 0;
         Clock::time_point deadline;
         Clock::time_point submitted;
         std::vector<TraceEvent> trace;
@@ -115,6 +124,11 @@ struct Agent::Impl {
     std::vector<std::size_t> free_slots;
     struct Quarantine { std::size_t slot; std::string owner, identity, request; };
     std::vector<Quarantine> quarantines;
+    struct DirectQuarantine {
+        std::shared_ptr<Batch> batch;
+        std::string owner, identity, request;
+    };
+    std::vector<DirectQuarantine> direct_quarantines;
     struct Cleanup { std::string owner, identity, request; };
     std::deque<Cleanup> cleanup_queue;
     struct Incoming { bool active = false, canceled = false; };
@@ -152,6 +166,7 @@ struct Agent::Impl {
         auto md_options = ucx_options; md_options.includeConnInfo = true;
         require_nixl(native->getLocalPartialMD(dram_registration, scratch_metadata, &md_options),
                      "staging metadata");
+        caller_metadata = scratch_metadata;
         for (std::size_t i = 0; i < config.staging_slots; ++i) free_slots.push_back(i);
         for (const auto &dc : config.disks) {
             if (!dc.unit_bytes || dc.unit_bytes > config.staging_slot_bytes || config.staging_slot_bytes % dc.unit_bytes ||
@@ -187,6 +202,9 @@ struct Agent::Impl {
     ~Impl() {
         // close() has established quiescence before freeing registered storage.
         if (native) {
+            for (auto &[token, registration] : registrations)
+                if (registration.native_desc)
+                    native->deregisterMem(*registration.native_desc, &dram_options);
             for (auto &r : disk_registrations) native->deregisterMem(r, &posix_options);
             native->deregisterMem(dram_registration, &dram_options);
             native.reset();
@@ -215,15 +233,52 @@ struct Agent::Impl {
         std::lock_guard lock(peers_mutex);
         auto it = peers.find(owner); return it == peers.end() ? nullptr : it->second;
     }
-    bool import_metadata(const std::string &expected, const std::string &metadata) {
+    std::shared_ptr<std::mutex> memory_gate(const std::string &expected) {
         std::lock_guard lock(native_md_mutex);
-        if (imported_names.count(expected)) return true;
+        auto it = memory_gates.find(expected);
+        if (it != memory_gates.end()) return it->second;
+        if (memory_gates.size() >= peer_limit) return {};
+        return memory_gates.emplace(expected, std::make_shared<std::mutex>()).first->second;
+    }
+    // The caller holds this peer's memory gate through every owner UCX write.
+    // Region/RKEY updates therefore cannot invalidate a live transfer. Metadata
+    // includes the complete registered view, so deregistration/re-registration
+    // at the same address is safe once the old handles have been released.
+    bool import_metadata_locked(const std::string &expected, const std::string &metadata) {
+        std::lock_guard lock(native_md_mutex);
+        auto cached = imported_metadata.find(expected);
+        if (cached != imported_metadata.end() && cached->second == metadata) return true;
+        if (cached != imported_metadata.end()) {
+            if (native->invalidateRemoteMD(expected) != NIXL_SUCCESS) return false;
+            imported_metadata.erase(cached); imported_names.erase(expected);
+        }
         if (imported_names.size() >= peer_limit) return false;
         std::string extracted;
         if (native->loadRemoteMD(metadata, extracted) != NIXL_SUCCESS) return false;
         if (extracted != expected) { native->invalidateRemoteMD(extracted); return false; }
         imported_names.insert(expected);
+        imported_metadata.emplace(expected, metadata);
         return true;
+    }
+    bool import_metadata(const std::string &expected, const std::string &metadata) {
+        auto gate = memory_gate(expected);
+        if (!gate) return false;
+        std::lock_guard lock(*gate);
+        return import_metadata_locked(expected, metadata);
+    }
+    // Called with the registration/admission mutex held. The snapshot is small:
+    // whole framework pools, never one registration or RKEY per cache page.
+    std::string export_caller_metadata(std::uint64_t omit = 0) {
+        nixl_reg_dlist_t regions(DRAM_SEG);
+        for (const auto &desc : dram_registration) regions.addDesc(desc);
+        for (const auto &[token, registration] : registrations)
+            if (token != omit && registration.native_desc)
+                for (const auto &desc : *registration.native_desc) regions.addDesc(desc);
+        auto options = ucx_options; options.includeConnInfo = true;
+        std::string result;
+        require_nixl(native->getLocalPartialMD(regions, result, &options), "caller DRAM metadata");
+        if (result.size() > 4 * 1024 * 1024) throw std::runtime_error("caller metadata limit reached");
+        return result;
     }
     std::uint64_t submit(const std::vector<Object> &objects, bool store) {
         if (objects.empty() || objects.size() > batch_limit) throw std::invalid_argument("invalid batch size");
@@ -249,6 +304,33 @@ struct Agent::Impl {
                     throw std::invalid_argument("invalid registered segment");
                 total += segment.length;
             }
+            if (config.direct_receive && !store && object.segments.size() > 256)
+                throw std::invalid_argument("direct receive segment limit reached");
+        }
+        if (config.direct_receive) {
+            using Range = std::pair<std::uintptr_t, std::uintptr_t>;
+            auto ranges = [&](const std::vector<Object> &items) {
+                std::vector<Range> result;
+                for (const auto &object : items) for (const auto &segment : object.segments) {
+                    const auto address = registrations.at(segment.registration).address + segment.offset;
+                    result.emplace_back(address, address + segment.length);
+                }
+                std::sort(result.begin(), result.end()); return result;
+            };
+            const auto target = ranges(objects);
+            if (!store) for (std::size_t i = 1; i < target.size(); ++i)
+                if (target[i].first < target[i - 1].second)
+                    throw std::invalid_argument("direct receive destinations overlap");
+            for (const auto &[handle, live] : batches) {
+                if (store && live->store) continue;
+                const auto other = ranges(live->objects);
+                std::size_t a = 0, b = 0;
+                while (a < target.size() && b < other.size()) {
+                    if (target[a].second <= other[b].first) ++a;
+                    else if (other[b].second <= target[a].first) ++b;
+                    else throw std::runtime_error("caller region belongs to an unreleased direct transfer");
+                }
+            }
         }
         auto handle = next_handle++;
         if (!handle) throw std::overflow_error("handle sequence exhausted");
@@ -262,6 +344,13 @@ struct Agent::Impl {
     }
     std::size_t object_bytes(const Object &object) const {
         std::size_t bytes = 0; for (auto &s : object.segments) bytes += s.length; return bytes;
+    }
+    std::vector<std::pair<std::uintptr_t, std::size_t>> destinations(const Object &object) {
+        std::lock_guard lock(mutex);
+        std::vector<std::pair<std::uintptr_t, std::size_t>> result;
+        for (const auto &segment : object.segments)
+            result.emplace_back(registrations.at(segment.registration).address + segment.offset, segment.length);
+        return result;
     }
     // The worker is the sole writer; readers use the existing batch gate.
     // Capacity is reserved before admission so diagnostics never grow unbounded.
@@ -341,6 +430,52 @@ struct Agent::Impl {
         elapsed(write ? "posix_write_ns" : "posix_read_ns", start);
         if (result == Status::success) count(write ? "posix_write_bytes" : "posix_read_bytes",
                                           allocation.slots.size() * unit);
+        return result;
+    }
+    bool direct_local_eligible(std::size_t disk_id, const Allocation &allocation,
+                               const std::vector<std::pair<std::uintptr_t, std::size_t>> &targets) const {
+        const auto unit = disks[disk_id]->unit_bytes();
+        if (allocation.slots.size() * unit != allocation.bytes) return false;
+        for (const auto &[target, length] : targets)
+            if (target % 4096 || length % 4096) return false;
+        return true;
+    }
+    Status disk_read_direct(std::size_t disk_id, const Allocation &allocation,
+                            const std::vector<std::pair<std::uintptr_t, std::size_t>> &targets,
+                            Clock::time_point deadline) {
+        const auto start = Clock::now();
+        auto &disk = *disks[disk_id]; const auto unit = disk.unit_bytes();
+        nixl_xfer_dlist_t memory(DRAM_SEG), file(FILE_SEG);
+        std::size_t segment = 0, within = 0;
+        Status result = Status::success;
+        for (std::size_t cursor = 0; cursor < allocation.slots.size();) {
+            auto end = cursor + 1;
+            while (end < allocation.slots.size() && allocation.slots[end] == allocation.slots[end - 1] + 1) ++end;
+            const auto run_bytes = (end - cursor) * unit;
+            for (std::size_t run_offset = 0; run_offset < run_bytes;) {
+                const auto length = std::min(run_bytes - run_offset, targets.at(segment).second - within);
+                memory.addDesc(nixlBasicDesc(targets[segment].first + within, length, 0));
+                file.addDesc(nixlBasicDesc(disk.slot_offset(allocation.slots[cursor]) + run_offset, length, payload_fds[disk_id]));
+                run_offset += length; within += length;
+                if (within == targets[segment].second) { ++segment; within = 0; }
+                if (memory.descCount() == 128) {
+                    result = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
+                    memory.clear(); file.clear();
+                    if (result != Status::success) break;
+                }
+            }
+            if (result != Status::success) break;
+            cursor = end;
+        }
+        if (result == Status::success && memory.descCount())
+            result = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
+        elapsed("posix_read_ns", start);
+        if (result == Status::success) {
+            count("posix_read_bytes", allocation.bytes);
+            count("direct_local_read_bytes", allocation.bytes);
+            count("direct_receive_bytes", allocation.bytes);
+            count("direct_receive_segments", targets.size());
+        }
         return result;
     }
     std::pair<std::size_t, Status> pin(const std::string &key, Allocation &allocation) {
@@ -495,21 +630,32 @@ struct Agent::Impl {
         auto request = identity + ":" + std::to_string(next_request.fetch_add(1));
         auto target_identity = peer->identity;
         wire::Writer w;
-        w.u8(config.enable_trace ? wire::load_batch_trace : wire::load_batch);
+        w.u8(config.direct_receive ?
+             (config.enable_trace ? wire::load_scatter_trace : wire::load_scatter) :
+             (config.enable_trace ? wire::load_batch_trace : wire::load_batch));
         w.str(request); w.str(target_identity);
-        w.str(identity); w.str(scratch_metadata);
-        w.u64(reinterpret_cast<std::uintptr_t>(address(slot))); w.u32(n);
+        w.str(identity);
+        if (config.direct_receive) {
+            std::lock_guard lock(mutex); w.str(caller_metadata);
+        } else w.str(scratch_metadata);
+        w.u64(config.direct_receive ? 0 : reinterpret_cast<std::uintptr_t>(address(slot))); w.u32(n);
         const auto remaining = std::max<std::int64_t>(1,
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count());
         w.u32(static_cast<unsigned>(remaining));
         for (std::size_t i = 0; i < n; ++i) {
             w.str(objects[first + i].key); w.u64(object_bytes(objects[first + i]));
+            if (config.direct_receive) {
+                const auto ranges = destinations(objects[first + i]);
+                w.u32(ranges.size());
+                for (const auto &[target, length] : ranges) { w.u64(target); w.u64(length); }
+            }
         }
         auto start = Clock::now();
         bool control_timeout = false;
         TraceEvent event;
         if (config.enable_trace)
             event = {"remote_rpc", request, clock_ns(start), 0, 0, first, n};
+        event.direct_receive = config.direct_receive;
         try {
             std::string response;
             try { response = peer->channel->call(w.data, static_cast<unsigned>(remaining)); }
@@ -534,7 +680,14 @@ struct Agent::Impl {
             enqueue_cleanup(owner, target_identity, request);
             elapsed("remote_control_ns", start); count("remote_load_batch_requests");
             for (std::size_t i = 0; i < n; ++i) {
-                if (results[i] == Status::success) count("remote_read_bytes", object_bytes(objects[first + i]));
+                if (results[i] == Status::success) {
+                    count("remote_read_bytes", object_bytes(objects[first + i]));
+                    if (config.direct_receive) {
+                        count("direct_receive_bytes", object_bytes(objects[first + i]));
+                        count("direct_receive_segments", objects[first + i].segments.size());
+                        event.destination_segments += objects[first + i].segments.size();
+                    }
+                }
                 else refresh_hint(objects[first + i]);
                 if (config.enable_trace && results[i] == Status::success)
                     event.bytes += object_bytes(objects[first + i]);
@@ -543,11 +696,18 @@ struct Agent::Impl {
             return results;
         } catch (...) {
             peer->channel.reset();
-            {
+            if (config.direct_receive) {
+                { std::lock_guard lock(batch.mutex); ++batch.pending_direct; batch.canceled = true; }
+                std::lock_guard lock(pool_mutex);
+                direct_quarantines.push_back({batch.shared_from_this(), owner, target_identity, request});
+                count("direct_quarantined_batches");
+            } else {
                 std::lock_guard lock(pool_mutex);
                 quarantines.push_back({slot, owner, target_identity, request});
             }
-            quarantined = true; count("quarantined_slots"); maintenance_wake.notify_one();
+            quarantined = true;
+            if (!config.direct_receive) count("quarantined_slots");
+            maintenance_wake.notify_one();
             for (std::size_t i = 0; i < n; ++i) refresh_hint(objects[first + i]);
             elapsed("remote_control_ns", start);
             if (config.enable_trace) {
@@ -561,7 +721,7 @@ struct Agent::Impl {
     // Group only consecutive same-owner remote objects. Copies remain ordered,
     // including aliased destinations, and use the original batch cancellation gate.
     std::size_t process_remote_group(Batch &batch, std::size_t first, std::size_t &serial_until) {
-        if (batch.store || (config.remote_batch_limit == 1 && !config.enable_trace)) return 0;
+        if (batch.store || (config.remote_batch_limit == 1 && !config.enable_trace && !config.direct_receive)) return 0;
         std::string owner;
         std::size_t bytes = 0, n = 0;
         for (std::size_t i = first; i < batch.objects.size() && n < config.remote_batch_limit; ++i) {
@@ -575,14 +735,14 @@ struct Agent::Impl {
             if (length > config.staging_slot_bytes - bytes) break;
             owner = std::move(hint); bytes += length; ++n;
         }
-        if (!n || (n < 2 && !config.enable_trace)) return 0;
+        if (!n || (n < 2 && !config.enable_trace && !config.direct_receive)) return 0;
         std::vector<Status> results(n, Status::busy);
         bool canceled;
         { std::lock_guard lock(batch.mutex); canceled = batch.canceled; }
         if (canceled || Clock::now() >= batch.deadline) std::fill(results.begin(), results.end(), Status::timeout);
-        else if (auto slot = acquire_slot()) {
+        else if (auto slot = config.direct_receive ? std::optional<std::size_t>(0) : acquire_slot()) {
             bool quarantined = false;
-            Finally release_slot{[this, slot, &quarantined] { if (!quarantined) free_slot(*slot); }};
+            Finally release_slot{[this, slot, &quarantined] { if (!config.direct_receive && !quarantined) free_slot(*slot); }};
             try {
                 results = remote_load_group(batch.objects, first, n, *slot, owner, batch.deadline, quarantined, batch);
                 // The peer may have a smaller slot or larger allocation padding.
@@ -596,7 +756,7 @@ struct Agent::Impl {
             for (std::size_t i = 0; i < n; ++i) {
                 std::lock_guard lock(batch.mutex);
                 if (batch.canceled || Clock::now() >= batch.deadline) results[i] = Status::timeout;
-                if (results[i] == Status::success) {
+                if (results[i] == Status::success && !config.direct_receive) {
                     try { copy(batch.objects[first + i], static_cast<char *>(address(*slot)) + offset, false, &batch, first + i); }
                     catch (...) { results[i] = Status::io_error; }
                 }
@@ -618,22 +778,38 @@ struct Agent::Impl {
         return n;
     }
     Status load_object(const Object &object, std::size_t slot, Clock::time_point deadline,
-                       bool &quarantined, Batch &batch, std::size_t index) {
+                       bool &quarantined, Batch &batch, std::size_t index, bool &direct_done) {
         Allocation allocation;
         auto [id, status] = pin(object.key, allocation);
         if (status == Status::success) {
             Finally unpin{[this, id, &allocation] { disks[id]->unpin(allocation.id); }};
             if (allocation.bytes != object_bytes(object)) return Status::invalid_input;
+            std::vector<std::pair<std::uintptr_t, std::size_t>> targets;
+            if (config.direct_receive) {
+                targets = destinations(object);
+                direct_done = direct_local_eligible(id, allocation, targets);
+                if (!direct_done) count("local_direct_fallbacks");
+            }
             const auto start = Clock::now();
-            const auto result = disk_io(id, allocation, slot, false, deadline);
+            const auto result = direct_done ? disk_read_direct(id, allocation, targets, deadline) :
+                                             disk_io(id, allocation, slot, false, deadline);
             const auto end = Clock::now();
-            if (config.enable_trace)
-                add_trace(batch, {"local_posix", "", clock_ns(start), clock_ns(end),
-                                 result == Status::success ? allocation.slots.size() * disks[id]->unit_bytes() : 0,
-                                 index, 1});
+            if (config.enable_trace) {
+                TraceEvent event{"local_posix", "", clock_ns(start), clock_ns(end),
+                                 result == Status::success ? allocation.slots.size() * disks[id]->unit_bytes() : 0, index, 1};
+                event.direct_receive = direct_done; event.destination_segments = direct_done ? targets.size() : 0;
+                add_trace(batch, std::move(event));
+            }
             return result;
         }
         if (status != Status::not_found) return status;
+        if (config.direct_receive) {
+            direct_done = true;
+            const auto owner = owner_hint(object);
+            if (owner.empty()) return config.metadata_endpoint ? Status::not_ready : Status::not_found;
+            if (owner == config.name) return Status::not_found;
+            return remote_load_group(batch.objects, index, 1, slot, owner, deadline, quarantined, batch).at(0);
+        }
         return remote_load(object, slot, deadline, quarantined);
     }
     void worker() {
@@ -658,13 +834,14 @@ struct Agent::Impl {
                 if (canceled || Clock::now() >= batch->deadline) result = Status::timeout;
                 else if (auto slot = acquire_slot()) {
                     bool quarantined = false;
-                    Finally release_slot{[this, slot, &quarantined] { if (!quarantined) free_slot(*slot); }};
+                    Finally release_slot{[this, slot, &quarantined] { if (!quarantined || config.direct_receive) free_slot(*slot); }};
                     try {
+                        bool direct_done = false;
                         result = batch->store ? store_object(batch->objects[i], *slot, batch->deadline, *batch) :
-                                 load_object(batch->objects[i], *slot, batch->deadline, quarantined, *batch, i);
+                                 load_object(batch->objects[i], *slot, batch->deadline, quarantined, *batch, i, direct_done);
                         std::lock_guard lock(batch->mutex);
                         if (batch->canceled || Clock::now() >= batch->deadline) result = Status::timeout;
-                        if (!batch->store && result == Status::success)
+                        if (!batch->store && !direct_done && result == Status::success)
                             copy(batch->objects[i], address(*slot), false, batch.get(), i);
                     } catch (...) { result = Status::io_error; }
                 } else result = Status::busy;
@@ -676,7 +853,7 @@ struct Agent::Impl {
             batch->done.notify_all();
         }
     }
-    std::string serve_load_group(wire::Reader &r, bool trace = false) {
+    std::string serve_load_group(wire::Reader &r, bool trace = false, bool scatter = false) {
         auto id = r.str(4096), expected = r.str(2048);
         auto requester = r.str(2048), metadata = r.str(4 * 1024 * 1024);
         auto target = r.u64(); auto n = r.u32(); auto budget_ms = r.u32();
@@ -687,6 +864,7 @@ struct Agent::Impl {
             std::string key;
             std::size_t bytes = 0, target_offset = 0, offset = 0, disk = 0;
             Allocation allocation;
+            std::vector<std::pair<std::uintptr_t, std::size_t>> targets;
             Status status = Status::not_found;
             bool pinned = false;
         };
@@ -699,8 +877,29 @@ struct Agent::Impl {
             if (bytes > config.staging_slot_bytes - logical_bytes) return status_reply(Status::no_space);
             page.bytes = static_cast<std::size_t>(bytes); page.target_offset = logical_bytes;
             logical_bytes += page.bytes;
+            if (scatter) {
+                const auto count = r.u32();
+                if (!count || count > 256) return status_reply(Status::invalid_input);
+                std::size_t sum = 0;
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto address = r.u64(), length = r.u64();
+                    if (!address || !length || length > page.bytes - sum ||
+                        address > std::numeric_limits<std::uintptr_t>::max() - length)
+                        return status_reply(Status::invalid_input);
+                    page.targets.emplace_back(address, length); sum += length;
+                }
+                if (sum != page.bytes) return status_reply(Status::invalid_input);
+            }
         }
         r.finish();
+        if (scatter) {
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
+            for (const auto &page : pages) for (const auto &[address, length] : page.targets)
+                ranges.emplace_back(address, address + length);
+            std::sort(ranges.begin(), ranges.end());
+            for (std::size_t i = 1; i < ranges.size(); ++i)
+                if (ranges[i].first < ranges[i - 1].second) return status_reply(Status::invalid_input);
+        }
         if (target > std::numeric_limits<std::uintptr_t>::max() - logical_bytes)
             return status_reply(Status::invalid_input);
         if (expected != identity || stopping.load()) return status_reply(Status::not_ready);
@@ -754,10 +953,17 @@ struct Agent::Impl {
         const bool has_payload = std::any_of(pages.begin(), pages.end(),
             [](const Page &page) { return page.status == Status::success; });
         if (!has_payload) return reply();
-        if (!import_metadata(requester, metadata)) {
+        auto gate = memory_gate(requester);
+        if (!gate) {
             for (auto &page : pages) if (page.status == Status::success) page.status = Status::not_ready;
             return reply();
         }
+        std::unique_lock memory_lock(*gate);
+        if (!import_metadata_locked(requester, metadata)) {
+            for (auto &page : pages) if (page.status == Status::success) page.status = Status::not_ready;
+            return reply();
+        }
+        memory_lock.unlock();
         nixl_xfer_dlist_t memory(DRAM_SEG), file(FILE_SEG);
         Status io = Status::success;
         auto read_start = Clock::now();
@@ -795,12 +1001,25 @@ struct Agent::Impl {
         for (auto &page : pages) if (page.status == Status::success) {
             read_bytes += page.allocation.slots.size() * disks[page.disk]->unit_bytes();
             write_bytes += page.bytes;
-            local.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(*slot)) + page.offset, page.bytes, 0));
-            remote.addDesc(nixlBasicDesc(target + page.target_offset, page.bytes, 0));
+            if (scatter) {
+                std::size_t offset = 0;
+                for (const auto &[destination, length] : page.targets) {
+                    local.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(*slot)) + page.offset + offset, length, 0));
+                    remote.addDesc(nixlBasicDesc(destination, length, 0)); offset += length;
+                }
+            } else {
+                local.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(*slot)) + page.offset, page.bytes, 0));
+                remote.addDesc(nixlBasicDesc(target + page.target_offset, page.bytes, 0));
+            }
         }
         count("posix_read_bytes", read_bytes); count("remote_served_batch_requests");
         if (trace) physical_read_bytes = read_bytes;
         if (local.descCount()) {
+            memory_lock.lock();
+            if (!import_metadata_locked(requester, metadata)) {
+                for (auto &page : pages) if (page.status == Status::success) page.status = Status::not_ready;
+                return reply();
+            }
             auto write_start = Clock::now();
             io = transfer(NIXL_WRITE, local, remote, requester, ucx_options, deadline);
             if (trace && io == Status::success) {
@@ -851,6 +1070,8 @@ struct Agent::Impl {
             }
             if (operation == wire::load_batch) return serve_load_group(r);
             if (operation == wire::load_batch_trace) return serve_load_group(r, true);
+            if (operation == wire::load_scatter) return serve_load_group(r, false, true);
+            if (operation == wire::load_scatter_trace) return serve_load_group(r, true, true);
             if (operation != wire::load) return status_reply(Status::invalid_input);
             auto id = r.str(4096), expected = r.str(2048), key = r.str(key_limit);
             auto bytes = r.u64(), target = r.u64();
@@ -878,13 +1099,19 @@ struct Agent::Impl {
             if (status != Status::success) return status_reply(status);
             Finally unpin{[this, disk_id, &allocation] { disks[disk_id]->unpin(allocation.id); }};
             if (allocation.bytes != bytes) return status_reply(Status::invalid_input);
-            if (!import_metadata(requester, metadata)) return status_reply(Status::not_ready);
+            auto gate = memory_gate(requester);
+            if (!gate) return status_reply(Status::not_ready);
+            std::unique_lock memory_lock(*gate);
+            if (!import_metadata_locked(requester, metadata)) return status_reply(Status::not_ready);
+            memory_lock.unlock();
             auto deadline = Clock::now() + std::chrono::milliseconds(config.timeout_ms);
             status = disk_io(disk_id, allocation, *slot, false, deadline);
             if (status != Status::success) return status_reply(status);
             nixl_xfer_dlist_t local(DRAM_SEG), remote(DRAM_SEG);
             local.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(*slot)), bytes, 0));
             remote.addDesc(nixlBasicDesc(target, bytes, 0));
+            memory_lock.lock();
+            if (!import_metadata_locked(requester, metadata)) return status_reply(Status::not_ready);
             auto start = Clock::now();
             status = transfer(NIXL_WRITE, local, remote, requester, ucx_options, deadline);
             elapsed("ucx_write_ns", start);
@@ -930,21 +1157,30 @@ struct Agent::Impl {
     }
     void reclaim_quarantines() {
         std::vector<Quarantine> pending;
+        std::vector<DirectQuarantine> direct;
         std::deque<Cleanup> cleanups;
         {
             std::lock_guard lock(pool_mutex);
-            pending.swap(quarantines); cleanups.swap(cleanup_queue);
+            pending.swap(quarantines); direct.swap(direct_quarantines); cleanups.swap(cleanup_queue);
         }
         std::vector<Quarantine> retained;
         for (auto &q : pending) {
             if (cleanup({q.owner, q.identity, q.request})) { free_slot(q.slot); count("quarantines_released"); }
             else retained.push_back(q);
         }
+        std::vector<DirectQuarantine> retained_direct;
+        for (auto &q : direct) {
+            if (cleanup({q.owner, q.identity, q.request})) {
+                { std::lock_guard lock(q.batch->mutex); --q.batch->pending_direct; }
+                q.batch->done.notify_all(); count("direct_quarantines_released");
+            } else retained_direct.push_back(std::move(q));
+        }
         std::deque<Cleanup> retry;
         for (auto &q : cleanups) { if (!cleanup(q)) retry.push_back(q); }
         {
             std::lock_guard lock(pool_mutex);
             quarantines.insert(quarantines.end(), retained.begin(), retained.end());
+            for (auto &q : retained_direct) direct_quarantines.push_back(std::move(q));
             while (!retry.empty() && cleanup_queue.size() < config.max_inflight * batch_limit) {
                 cleanup_queue.push_back(std::move(retry.front())); retry.pop_front();
             }
@@ -1091,7 +1327,8 @@ struct Agent::Impl {
         reclaim_quarantines();
         {
             std::lock_guard lock(pool_mutex);
-            if (!quarantines.empty()) throw std::runtime_error("remote I/O not quiescent; native staging retained");
+            if (!quarantines.empty() || !direct_quarantines.empty())
+                throw std::runtime_error("remote I/O not quiescent; registered destinations retained");
         }
         for (auto &disk : disks) if (disk->checkpoint() != Status::success) count("checkpoint_errors");
         closed.store(true);
@@ -1114,15 +1351,38 @@ std::uint64_t Agent::register_memory(std::uintptr_t address, std::size_t bytes) 
     std::lock_guard lock(impl_->mutex);
     if (impl_->stopping.load()) throw std::runtime_error("agent closing");
     if (impl_->registrations.size() >= 65536) throw std::runtime_error("registration limit reached");
+    if (impl_->config.direct_receive) for (const auto &[existing, registration] : impl_->registrations)
+        if (address < registration.address + registration.bytes && registration.address < address + bytes)
+            throw std::invalid_argument("native DRAM registrations overlap");
     auto token = impl_->next_token++;
     if (!token) throw std::overflow_error("registration sequence exhausted");
-    impl_->registrations.emplace(token, Impl::Registration{address, bytes, 0}); return token;
+    std::unique_ptr<nixl_reg_dlist_t> descriptor;
+    if (impl_->config.direct_receive) {
+        descriptor = std::make_unique<nixl_reg_dlist_t>(DRAM_SEG);
+        descriptor->addDesc(nixlBlobDesc(address, bytes, 0, ""));
+        require_nixl(impl_->native->registerMem(*descriptor, &impl_->dram_options), "caller DRAM registration");
+    }
+    impl_->registrations.emplace(token, Impl::Registration{address, bytes, 0, std::move(descriptor)});
+    if (impl_->config.direct_receive) {
+        try { impl_->caller_metadata = impl_->export_caller_metadata(); }
+        catch (...) {
+            auto &registration = impl_->registrations.at(token);
+            impl_->native->deregisterMem(*registration.native_desc, &impl_->dram_options);
+            impl_->registrations.erase(token); throw;
+        }
+    }
+    return token;
 }
 void Agent::deregister_memory(std::uint64_t token) {
     std::lock_guard lock(impl_->mutex);
     auto it = impl_->registrations.find(token);
     if (it == impl_->registrations.end()) throw std::invalid_argument("unknown registration");
     if (it->second.refs) throw std::runtime_error("registration belongs to unreleased transfers");
+    if (it->second.native_desc) {
+        auto metadata = impl_->export_caller_metadata(token);
+        require_nixl(impl_->native->deregisterMem(*it->second.native_desc, &impl_->dram_options), "caller DRAM deregistration");
+        impl_->caller_metadata = std::move(metadata);
+    }
     impl_->registrations.erase(it);
 }
 std::uint64_t Agent::batch_store(const std::vector<Object> &objects) { return impl_->submit(objects, true); }
@@ -1151,12 +1411,24 @@ std::vector<TraceEvent> Agent::trace(std::uint64_t handle) const {
     std::lock_guard lock(batch->mutex);
     return batch->trace;
 }
+bool Agent::is_quiescent(std::uint64_t handle) const {
+    std::shared_ptr<Impl::Batch> batch;
+    { std::lock_guard lock(impl_->mutex); auto it = impl_->batches.find(handle);
+      if (it == impl_->batches.end()) throw std::invalid_argument("unknown transfer handle");
+      batch = it->second; }
+    std::lock_guard lock(batch->mutex);
+    return batch->finished && !batch->pending_direct;
+}
 void Agent::release(std::uint64_t handle) {
     std::shared_ptr<Impl::Batch> batch;
     { std::lock_guard lock(impl_->mutex); auto it = impl_->batches.find(handle);
       if (it == impl_->batches.end()) throw std::invalid_argument("unknown transfer handle");
       batch = it->second; }
-    { std::unique_lock lock(batch->mutex); batch->done.wait(lock, [&batch] { return batch->finished; }); }
+    { std::unique_lock lock(batch->mutex);
+      if (impl_->config.direct_receive && (!batch->finished || batch->pending_direct))
+          throw std::runtime_error("direct receive not quiescent; handle and caller regions retained");
+      batch->done.wait(lock, [&batch] { return batch->finished; });
+      if (batch->pending_direct) throw std::runtime_error("direct receive not quiescent; handle and caller regions retained"); }
     std::lock_guard lock(impl_->mutex);
     if (!impl_->batches.erase(handle)) throw std::invalid_argument("transfer already released");
     for (const auto &o : batch->objects) for (const auto &s : o.segments)
@@ -1178,7 +1450,8 @@ std::map<std::string, std::uint64_t> Agent::stats() const {
     std::map<std::string, std::uint64_t> result;
     { std::lock_guard lock(p->stats_mutex); result = p->counters; }
     { std::lock_guard lock(p->pool_mutex); result["staging_free_slots"] = p->free_slots.size();
-      result["staging_quarantined_slots"] = p->quarantines.size(); }
+      result["staging_quarantined_slots"] = p->quarantines.size();
+      result["direct_quarantined_handles"] = p->direct_quarantines.size(); }
     return result;
 }
 void Agent::close() { impl_->close(); }

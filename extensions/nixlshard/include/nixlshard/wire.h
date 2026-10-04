@@ -60,6 +60,7 @@ private:
 enum Op : std::uint8_t {
     hello = 1, exists = 2, load = 3, cleanup = 4,
     register_owner = 5, announce = 6, lookup = 7, directory = 8,
-    load_batch = 9, load_batch_trace = 10
+    load_batch = 9, load_batch_trace = 10,
+    load_scatter = 11, load_scatter_trace = 12
 };
 } // namespace nixlshard::wire

@@ -34,6 +34,7 @@ AgentConfig config(const py::dict &source) {
     option(source, "staging_slot_bytes", result.staging_slot_bytes);
     option(source, "remote_batch_limit", result.remote_batch_limit);
     option(source, "enable_trace", result.enable_trace);
+    option(source, "direct_receive", result.direct_receive);
     option(source, "timeout_ms", result.timeout_ms);
     option(source, "direct_io", result.direct_io);
     if (source.contains("metadata_endpoint") && !source["metadata_endpoint"].is_none())
@@ -81,7 +82,9 @@ std::vector<Object> objects(const py::iterable &source) {
 PYBIND11_MODULE(_bindings, module) {
     module.doc() = "Native asynchronous NIXLShard cache interface";
     module.attr("build_git") = NIXLSHARD_BUILD_GIT;
+    module.attr("direct_receive_supported") = true;
     py::class_<Agent>(module, "Agent")
+        .def_property_readonly_static("direct_receive_supported", [](py::object) { return true; })
         .def(py::init([](const py::dict &value) {
             auto parsed = config(value);
             py::gil_scoped_release unlocked;
@@ -124,10 +127,16 @@ PYBIND11_MODULE(_bindings, module) {
                     row["owner_read_bytes"] = event.owner_read_bytes;
                 }
                 if (event.owner_timing_flags & 2) row["owner_ucx_ns"] = event.owner_ucx_ns;
+                if (event.direct_receive) {
+                    row["direct_receive"] = true;
+                    row["destination_segments"] = event.destination_segments;
+                }
                 result.append(row);
             }
             return result;
         }, py::arg("handle"))
+        .def("is_quiescent", &Agent::is_quiescent, py::arg("handle"),
+             py::call_guard<py::gil_scoped_release>())
         .def("release", &Agent::release, py::arg("handle"),
              py::call_guard<py::gil_scoped_release>())
         .def("batch_exists", [](Agent &agent, const std::vector<std::string> &keys,

@@ -2,11 +2,14 @@
 
 Registered addresses must reference CPU memory kept alive by the caller until
 all transfers using the registration have finished and their handles are
-released. Completion is a list of per-object status names; ``poll`` returns
+released. With ``direct_receive=True``, even failed buffers may have changed:
+keep them unavailable until ``is_quiescent(handle)`` and ``release(handle)``
+succeed. A logical timeout is not proof that a remote write has drained.
+Completion is a list of per-object status names; ``poll`` returns
 ``None`` while a request is pending. Explicitly close agents before interpreter
 shutdown, or use them as context managers.
 """
-from ._bindings import Agent, MetadataServer, build_git
+from ._bindings import Agent, MetadataServer, build_git, direct_receive_supported
 
 __build_marker__ = build_git
-__all__ = ["Agent", "MetadataServer", "build_git", "__build_marker__"]
+__all__ = ["Agent", "MetadataServer", "build_git", "__build_marker__", "direct_receive_supported"]

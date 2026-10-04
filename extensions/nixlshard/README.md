@@ -53,15 +53,32 @@ stored length; mismatched destination length fails. Segments concatenate in call
 order. Keep registered memory valid until every referencing handle is released.
 Raw-address registration does not retain a Python buffer object: the caller must
 keep that object alive through release. The token prevents deregistration while
-handles reference it. This first implementation copies caller segments through
-an aligned owned staging pool registered with NIXL once.
-Store packing and successful load copies are gated against cancellation, so
-neither begins after polling has reported a terminal timeout.
+handles reference it. By default, loads copy caller segments through an aligned
+owned staging pool registered with NIXL once. Store packing and staged load copies
+are gated against cancellation.
+
+Set `direct_receive=True` to register caller DRAM with POSIX and UCX. Remote
+loads then write directly into the supplied scatter segments; the SSD owner
+still stages the read in its own DRAM. Aligned local loads also read directly:
+logical length must equal the allocation's physical length and all destination
+addresses and lengths must be 4 KiB aligned. Other local loads use the counted
+staging fallback, without writing allocation padding outside the requested spans.
+
+Direct destinations require exclusive ownership through handle release.
+Overlapping destinations, including those owned by another live handle, are
+rejected. After a timeout the destination may still change; never publish or
+reuse failed pages. `is_quiescent(handle)` becomes true only after the worker
+finishes and every uncertain remote write has been fenced by its original owner
+incarnation. Direct-mode `release(handle)` rejects while that proof is missing,
+retaining the handle and registrations. A cache allocator must lease these pages,
+defer frees and prohibit pool resets until release succeeds. Losing contact with
+the original owner may retain the pages indefinitely within the admission bound.
 
 Submission returns a handle without connecting peers or waiting for payload I/O.
 `poll()` returns `None` while pending, then a stable per-object status list.
-Logical deadlines can become visible before underlying I/O drains. `release()`
-waits for worker quiescence before dropping caller references. Unreleased terminal
+Logical deadlines can become visible before underlying I/O drains. In staged
+mode, `release()` waits for worker quiescence before dropping caller references.
+Unreleased terminal
 handles consume the admission budget. Invalid arguments and exhausted live-handle
 budget raise exceptions; individual cache/resource/I/O failures return statuses.
 
@@ -83,9 +100,12 @@ small diagnostic overhead; it preserves owned staging and timeout quarantine.
 ## Remote loads and metadata
 
 An owner uses NIXL POSIX to read its disk into owned DRAM, then initiates NIXL UCX
-WRITE into requester-owned registered staging. The requester copies into caller
-segments only after confirmed completion. Control TCP carries metadata and
-descriptors, never payload bytes.
+WRITE into requester-owned registered staging, or directly into registered caller
+segments when direct receive is enabled. Staged loads copy into caller segments
+after confirmed completion. Control TCP carries metadata and descriptors, never
+payload bytes. Direct receive uses distinct scatter operations; both endpoints
+must be upgraded. Caller registration changes refresh the owner's complete
+remote memory view, serialized against active writes to that requester.
 
 `remote_batch_limit` defaults to 1. With both endpoints upgraded, set it to 8
 to group consecutive same-owner loads that fit one `staging_slot_bytes` slot.
@@ -95,8 +115,11 @@ and invalid lengths retain individual statuses. A smaller owner slot or excess
 allocation padding falls back to individual loads. An uncertain grouped RPC
 quarantines the entire requester-owned slot until the existing cleanup fence
 confirms quiescence. The pool remains bounded by `staging_slots` times
-`staging_slot_bytes`; this option neither registers caller memory for UCX nor
-changes caller-buffer lifetimes. For 16 MiB KV pages, a 128 MiB slot fits eight.
+`staging_slot_bytes` in staged mode. Grouping alone does not enable direct receive.
+With direct receive, the owner retains that staging bound, while requester
+destinations are protected by live handles and allocator leases. For 16 MiB KV
+pages, a 128 MiB owner slot fits eight; page-first K/V layout uses two 8 MiB
+destination segments per page.
 
 This prototype explicitly selects the POSIX Linux AIO queue. Other POSIX queue
 implementations need separate error/quiescence validation before being enabled.

@@ -23,6 +23,9 @@ struct AgentConfig {
     bool direct_io = false;
     // Bounded request-specific diagnostics; off on the normal execution path.
     bool enable_trace = false;
+    // Register caller DRAM and read directly into it. Caller destinations must
+    // remain unavailable for reuse until is_quiescent() and release() succeed.
+    bool direct_receive = false;
 };
 struct TraceEvent {
     std::string stage, request_id;
@@ -31,6 +34,8 @@ struct TraceEvent {
     // Owner durations are sequential children of remote_rpc, never extra time.
     std::uint8_t owner_timing_flags = 0;
     std::uint64_t owner_posix_ns = 0, owner_ucx_ns = 0, owner_read_bytes = 0;
+    bool direct_receive = false;
+    std::size_t destination_segments = 0;
 };
 class Agent {
 public:
@@ -43,6 +48,7 @@ public:
     std::uint64_t batch_load(const std::vector<Object> &);
     std::optional<std::vector<Status>> poll(std::uint64_t handle) const;
     std::vector<TraceEvent> trace(std::uint64_t handle) const;
+    bool is_quiescent(std::uint64_t handle) const;
     void release(std::uint64_t handle);
     std::vector<bool> batch_exists(const std::vector<std::string> &keys,
                                   const std::vector<std::string> &hints = {});

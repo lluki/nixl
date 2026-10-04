@@ -44,7 +44,7 @@ if get_option('build_tests')
   nixlshard_test_env.set('NIXL_PLUGIN_DIR',
     join_paths(get_option('prefix'), get_option('libdir'), 'plugins'))
   nixlshard_test_env.set('UCX_TLS', 'tcp,self,cuda_copy')
-  foreach name : ['storage', 'agent', 'metadata', 'remote', 'timeout', 'admission']
+  foreach name : ['storage', 'agent', 'metadata', 'remote', 'timeout', 'admission', 'direct_receive']
     extra_test_deps = []
     extra_test_links = []
     if name == 'remote'
