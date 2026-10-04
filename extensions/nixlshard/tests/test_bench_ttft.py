@@ -681,6 +681,33 @@ class Tests(unittest.TestCase):
         lagged['sglang:nixlshard_events_total{event="direct_receive_segments"}'] = 2
         self.assertFalse(bench.remote_counter_proof(lagged, owner, 4096, True, 2)["exact"])
 
+    def test_local_direct_proof_counts_explicit_fallbacks_without_zero_copy_claim(self):
+        def counters(direct_bytes=128, segments=4, fallback=0, copy_bytes=0):
+            values = dict(posix_read=128, staging_copy=copy_bytes, remote_read=0, ucx_write=0,
+                          direct_receive=direct_bytes, direct_local_read=direct_bytes)
+            result = {f'sglang:nixlshard_component_bytes_total{{component="{name}"}}': value
+                      for name, value in values.items()}
+            result.update({f'sglang:nixlshard_events_total{{event="{name}"}}': value
+                           for name, value in dict(direct_receive_segments=segments,
+                                                  local_direct_fallbacks=fallback).items()})
+            return result
+        direct = bench.local_counter_proof(counters(), 128, 64, True)
+        self.assertTrue(direct["exact"])
+        self.assertTrue(direct["zero_copy_verified"])
+        mixed = bench.local_counter_proof(counters(64, 2, 1, 64), 128, 64, True)
+        self.assertTrue(mixed["exact"])
+        self.assertEqual((mixed["direct_pages"], mixed["fallback_pages"]), (1, 1))
+        self.assertFalse(mixed["zero_copy_verified"])
+        all_fallback = bench.local_counter_proof(counters(0, 0, 2, 128), 128, 64, True)
+        self.assertTrue(all_fallback["exact"])
+        self.assertFalse(all_fallback["zero_copy_verified"])
+        # A staged runtime with no direct-mode fallback counters cannot silently
+        # qualify; partial exports also remain incomplete until counts agree.
+        self.assertFalse(bench.local_counter_proof(counters(0, 0, 0, 128), 128, 64, True)["exact"])
+        self.assertFalse(bench.local_counter_proof(counters(128, 2), 128, 64, True)["exact"])
+        with self.assertRaisesRegex(AssertionError, "unexpected staging"):
+            bench.local_counter_proof(counters(copy_bytes=64), 128, 64, True)
+
     def test_percentiles_and_available_counter_deltas(self):
         self.assertEqual(bench.percentile([30, 10, 20], 50), 20)
         self.assertEqual(bench.percentile([30, 10, 20], 95), 29)

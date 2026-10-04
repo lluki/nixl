@@ -210,6 +210,44 @@ class TraceTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "exact successful remote"):
                 capture(copied)
 
+    def test_local_direct_and_mixed_trace_paths_require_positive_counter_agreement(self):
+        result, records = fixture()
+        args = SimpleNamespace(page_size=64, kv_bytes_per_page=64, direct_receive=True)
+        result.update(output_ids=[7], meta_info={"cached_tokens": 128,
+                      "cached_tokens_details": {"storage": 128, "storage_backend": "HiCacheNixlShard"}})
+        records[-1]["events"] = [
+            dict(stage="local_posix", start_ns=250, end_ns=350, bytes=64,
+                 first_object=0, object_count=1, request_id="", direct_receive=True, destination_segments=2),
+            dict(stage="local_posix", start_ns=350, end_ns=450, bytes=64,
+                 first_object=1, object_count=1, request_id="", direct_receive=False),
+            dict(stage="staging_copy", start_ns=450, end_ns=500, bytes=64,
+                 first_object=1, object_count=1, request_id="")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args.request_trace_dir = root
+            experiment = bench.Experiment(args, None, None, root, False)
+            def capture(items, direct_bytes, fallbacks):
+                (root / "request-timeline-1.jsonl").write_text("".join(json.dumps(r) + "\n" for r in items))
+                record = dict(local_proof=dict(exact=True, expected_bytes=128, direct_receive=True,
+                                              observed_bytes={"direct_local_read": direct_bytes},
+                                              fallback_pages=fallbacks))
+                experiment.capture_trace(root, result, record, "ssd", 192, 0, False)
+                return record["critical_path"]
+            mixed = capture(records, 64, 1)
+            self.assertEqual(mixed["receiver_mode"], "direct")
+            self.assertEqual(mixed["receive_path"]["fallback_bytes"], 64)
+            self.assertFalse(mixed["receive_path"]["zero_copy_verified"])
+            direct = copy.deepcopy(records)
+            direct[-1]["events"].pop()
+            direct[-1]["events"][1].update(direct_receive=True, destination_segments=2)
+            verified = capture(direct, 128, 0)
+            self.assertTrue(verified["receive_path"]["zero_copy_verified"])
+            self.assertEqual(verified["source_proof"]["observed_bytes"]["direct_local_read"], 128)
+            with self.assertRaisesRegex(AssertionError, "positive native byte proof"):
+                capture(direct, 64, 0)
+            with self.assertRaisesRegex(AssertionError, "fallback count"):
+                capture(mixed["trace_events"], 64, 0)
+
     def test_local_and_hot_tier_native_proofs_distinguish_read_from_background_write(
         self,
     ):

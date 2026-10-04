@@ -24,7 +24,8 @@ def read_request(directory, rid):
     return records
 
 
-def normalize(result, records, scenario, context, repeat, warmup, verified=True):
+def normalize(result, records, scenario, context, repeat, warmup, verified=True,
+              receiver_mode="staged"):
     """Partition actual pre-token wall time, never sum overlapping stage timers.
 
     Owner durations compose an entire requester RPC; their absolute positions
@@ -32,6 +33,8 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True)
     Native work overlapping first-forward stays in the forward envelope with
     its raw trace preserved, and prevents owner composition of that overlap.
     """
+    if receiver_mode not in ("direct", "staged"):
+        raise ValueError("explicit receiver mode must be direct or staged")
     rid = result["request_id"]
     start, token = result["request_start_ns"], result["first_token_ns"]
     if result.get("clock") != "CLOCK_MONOTONIC" or not start < token:
@@ -159,6 +162,8 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True)
                         bytes=event["bytes"],
                         duration_ns=b - a,
                         pattern_id="descriptor_count_1",
+                        direct_receive=event.get("direct_receive", False),
+                        destination_segments=event.get("destination_segments", 0),
                         evidence=[ref],
                     )
                 )
@@ -259,6 +264,7 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True)
         raise AssertionError("exclusive critical partition does not equal TTFT")
     return dict(
         request_id=rid,
+        receiver_mode=receiver_mode,
         tier=TIER_NAMES[scenario],
         context_tokens=context,
         repeat=repeat,

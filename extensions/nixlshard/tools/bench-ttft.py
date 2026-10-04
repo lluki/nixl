@@ -414,6 +414,41 @@ def remote_counter_proof(requester, owner, expected_bytes, direct_receive=False,
             "scope": "cumulative native bytes through full generation/export settling; not a first-token timing window"}
 
 
+def local_counter_proof(delta, expected_bytes, page_bytes, direct_receive=False):
+    components = {name: native_bytes(delta, name) for name in
+                  ("posix_read", "staging_copy", "remote_read", "ucx_write")}
+    if components["remote_read"] or components["ucx_write"] or components["posix_read"] > expected_bytes:
+        raise AssertionError("unexpected native read path or payload size: " + repr(components))
+    exact = components["posix_read"] == expected_bytes and components["staging_copy"] >= expected_bytes
+    proof = dict(exact=exact, expected_bytes=expected_bytes, observed_bytes=components,
+                 direct_receive=direct_receive, zero_copy_verified=False,
+                 scope="full generation/export window; staging combines reads/background stores; exact get path comes from per-request trace")
+    if not direct_receive:
+        return proof
+    components.update({name: native_bytes(delta, name) for name in ("direct_receive", "direct_local_read")})
+    segments = native_events(delta, "direct_receive_segments")
+    fallback_pages = native_events(delta, "local_direct_fallbacks")
+    pages = expected_bytes // page_bytes
+    direct_bytes = components["direct_local_read"]
+    direct_pages = direct_bytes // page_bytes
+    if (any(components[name] < 0 or components[name] > expected_bytes
+            for name in ("direct_receive", "direct_local_read"))
+            or not 0 <= segments <= 2 * pages or not 0 <= fallback_pages <= pages):
+        raise AssertionError("incorrect/extra direct local payload evidence")
+    fallback_bytes = expected_bytes - direct_bytes
+    exact = (components["posix_read"] == expected_bytes
+             and components["direct_receive"] == direct_bytes
+             and direct_bytes % page_bytes == 0 and direct_pages + fallback_pages == pages
+             and segments == 2 * direct_pages
+             and components["staging_copy"] >= fallback_bytes)
+    if expected_bytes and direct_pages == pages and not fallback_pages and components["staging_copy"]:
+        raise AssertionError("direct local read includes unexpected staging copies")
+    proof.update(exact=exact, direct_pages=direct_pages, fallback_pages=fallback_pages,
+                 observed_events=dict(direct_receive_segments=segments, local_direct_fallbacks=fallback_pages),
+                 zero_copy_verified=bool(expected_bytes and exact and not fallback_pages))
+    return proof
+
+
 def percentile(values, percent):
     """Linear interpolation on sorted samples; raw samples remain authoritative."""
     ordered = sorted(values)
@@ -536,19 +571,21 @@ class Experiment:
         spec.loader.exec_module(helper)
         records = helper.read_request(trace_dir, result["request_id"])
         (directory / (field.replace("_", "-") + "-raw.json")).write_text(json.dumps(records, indent=2) + "\n")
-        trace = helper.normalize(result, records, scenario, context, repeat, warmup)
+        direct = getattr(self.args, "direct_receive", False)
+        trace = helper.normalize(result, records, scenario, context, repeat, warmup,
+                                 receiver_mode="direct" if direct else "staged")
         trace["cache"] = cache_details(result)
         trace["artifact"] = directory.name
         trace["output_sha256"] = hashlib.sha256(json.dumps(result["output_ids"]).encode()).hexdigest()
         proof = record.get("remote_proof") if scenario == "remote" else record.get("local_proof")
         if proof:
             trace["source_proof"] = {key: proof[key] for key in
-                ("exact", "expected_bytes", "observed", "observed_bytes", "scope") if key in proof}
+                ("exact", "expected_bytes", "observed", "observed_bytes", "observed_events", "scope",
+                 "direct_receive", "expected_destination_segments", "direct_pages", "fallback_pages", "zero_copy_verified") if key in proof}
         expected_bytes = ((context - 1) // self.args.page_size) * self.args.kv_bytes_per_page
         events = trace["native_events"]
         def total(stage):
             return sum(e.get("bytes", 0) for e in events if e["stage"] == stage)
-        direct = getattr(self.args, "direct_receive", False)
         if scenario == "remote":
             copies = 0 if direct else expected_bytes
             if total("remote_rpc") != expected_bytes or total("staging_copy") != copies or total("local_posix"):
@@ -565,8 +602,24 @@ class Experiment:
                    for e in events):
                 raise AssertionError("successful remote payload missing owner timing")
         elif scenario == "ssd":
-            if total("local_posix") != expected_bytes or total("staging_copy") != expected_bytes or total("remote_rpc"):
+            local = [e for e in events if e["stage"] == "local_posix" and e.get("bytes", 0)]
+            direct_bytes = sum(e["bytes"] for e in local if e.get("direct_receive", False))
+            fallback_bytes = expected_bytes - direct_bytes if direct else expected_bytes
+            if total("local_posix") != expected_bytes or total("staging_copy") != fallback_bytes or total("remote_rpc"):
                 raise AssertionError("request trace does not cover exact local SSD payload/copy bytes")
+            if not direct and direct_bytes:
+                raise AssertionError("local trace receive mode differs from explicit experiment mode")
+            for event in local:
+                if event.get("direct_receive") and event.get("destination_segments") != 2 * event["object_count"]:
+                    raise AssertionError("direct local trace does not cover both K/V destinations per page")
+            if direct:
+                if not proof or proof["observed_bytes"]["direct_local_read"] != direct_bytes:
+                    raise AssertionError("local direct trace disagrees with positive native byte proof")
+                if proof["fallback_pages"] != sum(e["object_count"] for e in local if not e.get("direct_receive", False)):
+                    raise AssertionError("local fallback trace disagrees with native fallback count")
+                trace["receive_path"] = dict(requested_direct=True, direct_bytes=direct_bytes,
+                                             fallback_bytes=fallback_bytes,
+                                             zero_copy_verified=direct_bytes == expected_bytes)
         elif any(total(stage) for stage in ("local_posix", "remote_rpc", "staging_copy")):
             raise AssertionError("non-SSD tier performed traced native payload work")
         path = directory / (field.replace("_", "-") + ".json")
@@ -579,14 +632,10 @@ class Experiment:
         while True:
             after = self.snapshot(directory, "payload-after" if not poll else f"payload-after-{poll:03d}")
             delta = metric_deltas(before["metrics"], after["metrics"])
-            components = {name: native_bytes(delta, name) for name in
-                          ("posix_read", "staging_copy", "remote_read", "ucx_write")}
-            if components["remote_read"] or components["ucx_write"] or components["posix_read"] > expected:
-                raise AssertionError("unexpected native read path or payload size: " + repr(components))
-            if components["posix_read"] == expected and components["staging_copy"] >= expected:
-                return dict(exact=True, expected_bytes=expected, observed_bytes=components,
-                            after=after, metric_deltas=delta,
-                            scope="full generation/export window; staging counter combines reads and background stores; exact get-copy coverage comes from per-request trace")
+            proof = local_counter_proof(delta, expected, self.args.kv_bytes_per_page,
+                                        getattr(self.args, "direct_receive", False))
+            if proof["exact"]:
+                return dict(proof, after=after, metric_deltas=delta)
             if time.monotonic() >= deadline:
                 raise TimeoutError("local native counters did not reach exact expected read payload")
             time.sleep(0.05)
@@ -633,6 +682,7 @@ class Experiment:
             "warmup": warmup,
             "artifact": directory.name,
             "passed": False,
+            "receiver_mode": "direct" if getattr(self.args, "direct_receive", False) else "staged",
         }
         try:
             if scenario == "cold":
@@ -791,7 +841,8 @@ class RemoteExperiment(Experiment):
         expected_bytes = expected_tokens // self.args.page_size * self.args.kv_bytes_per_page
         record = {"scenario": "remote", "context_tokens": context,
                   "repeat": repetition, "warmup": warmup, "artifact": directory.name,
-                  "passed": False, "discovery_preflight": []}
+                  "passed": False, "discovery_preflight": [],
+                  "receiver_mode": "direct" if getattr(self.args, "direct_receive", False) else "staged"}
         try:
             self.journal(directory, "cold_control_started")
             self.flush()
@@ -965,7 +1016,7 @@ def main():
         help="gs://bucket/unique-run-prefix for incremental immutable sample archives (ADC credentials)",
     )
     parser.add_argument("--direct-receive", action="store_true",
-                        help="require explicit native direct-receive bytes/segments and zero receiver copies (remote only)")
+                        help="prove direct receive; remote requires zero copy, local counts any safe staging fallbacks")
     parser.add_argument("--verify-native-payload", action="store_true",
                         help="require exact per-tier native read/copy bytes (fixed native Prometheus metrics)")
     parser.add_argument("--request-trace-dir", type=Path,
@@ -1007,8 +1058,8 @@ def main():
         parser.error(
             "host scenario requires known GPU capacity and pressure exceeding it"
         )
-    if args.direct_receive and (args.scenarios != ["remote"] or not args.request_trace_dir):
-        parser.error("direct receive proof requires --scenarios remote and --request-trace-dir")
+    if args.direct_receive and (not {"ssd", "remote"}.intersection(args.scenarios) or not args.request_trace_dir):
+        parser.error("direct receive proof requires an SSD/remote scenario and --request-trace-dir")
     args.artifact_dir.mkdir(parents=True, exist_ok=False)
     provenance = redact_credentials(json.loads(args.provenance_json.read_text()))
     if provenance.get("model_revision") != args.model_revision:
@@ -1193,7 +1244,8 @@ def main():
                 dict(schema_version=1, clock="CLOCK_MONOTONIC",
                      study_id=args.artifact_dir.name, contexts=args.contexts,
                      samples=trace_samples, baselines=[],
-                     serving_boot_id=args.request_trace_boot_id), indent=2) + "\n")
+                     serving_boot_id=args.request_trace_boot_id,
+                     receiver_mode="direct" if args.direct_receive else "staged"), indent=2) + "\n")
         (args.artifact_dir / "summary.json").write_text(
             json.dumps(summary, indent=2) + "\n"
         )

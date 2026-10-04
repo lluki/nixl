@@ -128,13 +128,21 @@ owner SSD staging remains part of this route.
 
 Compare staged and direct runs on the same requester GPU/owner host, with the
 same new native/serving sources, model, layout, group/slot geometry and upload
-flags. For page64/BF16 Qwen, final K/V rows split each logical16MiB page into
-two8MiB targets. Normalized UCX service windows use
+flags. For page64/BF16 Qwen, final K/V rows split each logical 16 MiB page into
+two 8 MiB targets. Normalized UCX service windows use
 `scatter_segment_count_14`/`16`/`2` for direct seven/eight/one-page groups.
-Their 8MiB scatter geometry differs from staged dense112/128MiB target writes;
+Their 8 MiB scatter geometry differs from staged dense 112/128 MiB target writes;
 record matching RC component references without calling either rate TTFT
-overhead. This primary proof mode currently requires the exclusive remote
-profile; local native direct/fallback validation remains separate.
+overhead. The remote profile remains exclusive. A four-tier local profile can
+also pass `--direct-receive`: eligible local SSD reads require positive exact
+`direct_local_read_bytes`/`direct_receive_bytes`, two destination segments per
+page and zero copies. A mixed or fully staged local fallback is retained as a
+verified cache hit only when native `local_direct_fallbacks` and per-request
+trace flags/copy bytes agree; it records `zero_copy_verified: false`.
+Normalized `source_proof` preserves those counters and counts, while
+`receive_path` identifies direct/fallback bytes. Explicit `receiver_mode`
+appears on normalized samples and their containing diagnostic artifact;
+keep this distinction when comparing staged and direct curves.
 
 Each remote sample preserves `before`/`after` and `owner_before`/`owner_after`
 raw metrics, timer/byte/event deltas, discovery attempts, and SSE results.

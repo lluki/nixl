@@ -19,11 +19,14 @@ def main():
     p.add_argument("--admin-key-file", type=Path, required=True)
     p.add_argument("--gcs-prefix", required=True)
     p.add_argument("--contexts", type=int, nargs="+", default=[512,1024,2048,4096,8192])
+    p.add_argument("--direct-receive", action="store_true")
     args=p.parse_args()
     root=args.root.resolve()
     control=root/"epoch-supervisor"
     control.mkdir(exist_ok=False)
     config=json.loads(args.config.read_text())
+    if config["agent"].get("direct_receive", False) is not args.direct_receive:
+        raise ValueError("explicit direct-receive mode must match native config")
     key=args.admin_key_file.read_text().strip()
     if not key: raise ValueError("empty admin key file")
     mock=args.mock_file.resolve()
@@ -86,6 +89,8 @@ def main():
        "--verify-native-payload","--kv-bytes-per-page","16777216",
        "--request-trace-dir",str(root/"request-timeline"),"--request-trace-boot-id",
        Path("/proc/sys/kernel/random/boot_id").read_text().strip()]
+    if args.direct_receive:
+        command_template.append("--direct-receive")
     (control/"command-template.json").write_text(json.dumps(command_template,indent=2)+"\n")
     journal("supervisor_started",contexts=args.contexts)
     try:
