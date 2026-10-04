@@ -371,7 +371,17 @@ def native_bytes(snapshot, component):
     return sum(series)
 
 
-def remote_counter_proof(requester, owner, expected_bytes):
+def native_events(snapshot, event):
+    series = [value for key, value in snapshot.items()
+              if key.startswith("sglang:nixlshard_events_total{")
+              and f'event="{event}"' in key]
+    if not series:
+        raise ValueError(f"native event counter missing for {event}")
+    return sum(series)
+
+
+def remote_counter_proof(requester, owner, expected_bytes, direct_receive=False,
+                         expected_segments=None):
     observed = {
         "requester_remote_read_bytes": native_bytes(requester, "remote_read"),
         "requester_staging_copy_bytes": native_bytes(requester, "staging_copy"),
@@ -383,13 +393,23 @@ def remote_counter_proof(requester, owner, expected_bytes):
         "owner_posix_write_bytes": native_bytes(owner, "posix_write"),
         "owner_staging_copy_bytes": native_bytes(owner, "staging_copy"),
     }
+    if direct_receive:
+        if not isinstance(expected_segments, int) or expected_segments <= 0:
+            raise ValueError("direct receive proof requires expected destination segments")
+        observed["requester_direct_receive_bytes"] = native_bytes(requester, "direct_receive")
+        observed["requester_direct_receive_segments"] = native_events(requester, "direct_receive_segments")
     expected = {key: (0 if key in ("requester_posix_read_bytes", "requester_ucx_write_bytes",
                                  "requester_posix_write_bytes", "owner_posix_write_bytes",
                                  "owner_staging_copy_bytes")
                       else expected_bytes) for key in observed}
+    if direct_receive:
+        expected["requester_staging_copy_bytes"] = 0
+        expected["requester_direct_receive_segments"] = expected_segments
     if any(value < 0 or value > expected[key] for key, value in observed.items()):
         raise AssertionError(f"remote counter window has incorrect/extra payload I/O: {observed}")
     return {"expected_bytes": expected_bytes, "observed": observed,
+            "direct_receive": direct_receive,
+            "expected_destination_segments": expected_segments if direct_receive else None,
             "exact": observed == expected,
             "scope": "cumulative native bytes through full generation/export settling; not a first-token timing window"}
 
@@ -528,9 +548,18 @@ class Experiment:
         events = trace["native_events"]
         def total(stage):
             return sum(e.get("bytes", 0) for e in events if e["stage"] == stage)
+        direct = getattr(self.args, "direct_receive", False)
         if scenario == "remote":
-            if total("remote_rpc") != expected_bytes or total("staging_copy") != expected_bytes or total("local_posix"):
+            copies = 0 if direct else expected_bytes
+            if total("remote_rpc") != expected_bytes or total("staging_copy") != copies or total("local_posix"):
                 raise AssertionError("request trace does not cover exact successful remote payload/copy bytes")
+            for event in events:
+                if event["stage"] != "remote_rpc" or not event.get("bytes", 0):
+                    continue
+                if event.get("direct_receive", False) is not direct:
+                    raise AssertionError("remote trace receive mode differs from explicit experiment mode")
+                if direct and event.get("destination_segments") != 2 * event["object_count"]:
+                    raise AssertionError("direct remote trace does not cover both K/V destinations per page")
             if any(e["stage"] == "remote_rpc" and e.get("bytes", 0) and
                    ("owner_posix_ns" not in e or "owner_ucx_ns" not in e)
                    for e in events):
@@ -734,7 +763,10 @@ class RemoteExperiment(Experiment):
             owner_after = self.snapshot(directory, "owner-" + label, self.owner_client)
             requester_delta = metric_deltas(requester_before["metrics"], requester_after["metrics"])
             owner_delta = metric_deltas(owner_before["metrics"], owner_after["metrics"])
-            proof = remote_counter_proof(requester_delta, owner_delta, expected_bytes)
+            direct = getattr(self.args, "direct_receive", False)
+            expected_segments = 2 * (expected_bytes // self.args.kv_bytes_per_page)
+            proof = remote_counter_proof(requester_delta, owner_delta, expected_bytes,
+                                         direct, expected_segments if direct else None)
             self.journal(directory, "remote_counter_observation", role=role,
                          observation=poll, proof=proof)
             if proof["exact"]:
@@ -932,6 +964,8 @@ def main():
         "--gcs-prefix",
         help="gs://bucket/unique-run-prefix for incremental immutable sample archives (ADC credentials)",
     )
+    parser.add_argument("--direct-receive", action="store_true",
+                        help="require explicit native direct-receive bytes/segments and zero receiver copies (remote only)")
     parser.add_argument("--verify-native-payload", action="store_true",
                         help="require exact per-tier native read/copy bytes (fixed native Prometheus metrics)")
     parser.add_argument("--request-trace-dir", type=Path,
@@ -973,6 +1007,8 @@ def main():
         parser.error(
             "host scenario requires known GPU capacity and pressure exceeding it"
         )
+    if args.direct_receive and (args.scenarios != ["remote"] or not args.request_trace_dir):
+        parser.error("direct receive proof requires --scenarios remote and --request-trace-dir")
     args.artifact_dir.mkdir(parents=True, exist_ok=False)
     provenance = redact_credentials(json.loads(args.provenance_json.read_text()))
     if provenance.get("model_revision") != args.model_revision:

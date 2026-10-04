@@ -178,6 +178,38 @@ class TraceTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "exact successful remote"):
                 experiment.capture_trace(root, result, {}, "remote", 128, 0, False)
 
+    def test_direct_trace_requires_explicit_mode_both_destinations_and_no_copy(self):
+        result, records = fixture()
+        args = SimpleNamespace(page_size=64, kv_bytes_per_page=64, direct_receive=True)
+        result.update(output_ids=[7], meta_info={"cached_tokens": 64,
+                      "cached_tokens_details": {"storage": 64, "storage_backend": "HiCacheNixlShard"}})
+        records[-1]["events"].pop()  # Direct NIC writes replace requester memcpy.
+        records[-1]["events"][1].update(direct_receive=True, destination_segments=2)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args.request_trace_dir = root
+            experiment = bench.Experiment(args, None, None, root, False)
+            def capture(items):
+                (root / "request-timeline-1.jsonl").write_text("".join(json.dumps(r) + "\n" for r in items))
+                record = {}
+                experiment.capture_trace(root, result, record, "remote", 128, 0, False)
+                return record["critical_path"]
+            sample = capture(records)
+            ucx = next(s for s in sample["service_windows"] if s["stage"] == "ucx")
+            self.assertEqual(ucx["pattern_id"], "scatter_segment_count_2")
+            self.assertTrue(ucx["direct_receive"])
+            self.assertFalse(any(b["category"] == "staging_copy" for b in sample["critical_blocks"]))
+            for fields, message in (({"direct_receive": False}, "receive mode"),
+                                    ({"destination_segments": 1}, "both K/V")):
+                bad = copy.deepcopy(records)
+                bad[-1]["events"][1].update(fields)
+                with self.assertRaisesRegex(AssertionError, message):
+                    capture(bad)
+            copied = copy.deepcopy(records)
+            copied[-1]["events"].append(fixture()[1][-1]["events"][-1])
+            with self.assertRaisesRegex(AssertionError, "exact successful remote"):
+                capture(copied)
+
     def test_local_and_hot_tier_native_proofs_distinguish_read_from_background_write(
         self,
     ):

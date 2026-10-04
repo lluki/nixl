@@ -143,7 +143,11 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True)
                             stage="ucx",
                             bytes=event["bytes"],
                             duration_ns=ucx,
-                            pattern_id="descriptor_count_" + str(event["object_count"]),
+                            pattern_id=("scatter_segment_count_" + str(event["destination_segments"])
+                                        if event.get("direct_receive")
+                                        else "descriptor_count_" + str(event["object_count"])),
+                            direct_receive=event.get("direct_receive", False),
+                            destination_segments=event.get("destination_segments", 0),
                             evidence=[ref],
                         ),
                     ]
@@ -190,6 +194,8 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True)
                         owner_ucx_ns=event["owner_ucx_ns"],
                         bytes=event["bytes"],
                         composition_only=True,
+                        direct_receive=event.get("direct_receive", False),
+                        destination_segments=event.get("destination_segments", 0),
                     )
                 else:
                     fields["scope"] = (

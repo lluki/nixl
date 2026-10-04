@@ -115,6 +115,27 @@ up; it never sends owner generations during the measurement/counter window.
 If an idle owner cannot expose current counters, the proof fails rather than
 accepting stale zeros. No server diagnostics route is added by this harness.
 
+For native/serving builds supporting direct reception, add
+`"direct_receive": true` to the requester's `agent` configuration and
+`--direct-receive --request-trace-dir /scratch/REQUESTER/request-timeline` to
+the harness (with the existing requester boot-ID clock check). This explicit
+mode requires exact positive `direct_receive_bytes` and two destination
+segments per page, while requester staging-copy bytes must be zero. Every
+successful traced RPC must identify direct reception and its destination
+segment count. Missing copy events alone never prove zero-copy. Owner POSIX
+read/UCX write and requester remote-read bytes retain the same exact proofs;
+owner SSD staging remains part of this route.
+
+Compare staged and direct runs on the same requester GPU/owner host, with the
+same new native/serving sources, model, layout, group/slot geometry and upload
+flags. For page64/BF16 Qwen, final K/V rows split each logical16MiB page into
+two8MiB targets. Normalized UCX service windows use
+`scatter_segment_count_14`/`16`/`2` for direct seven/eight/one-page groups.
+Their 8MiB scatter geometry differs from staged dense112/128MiB target writes;
+record matching RC component references without calling either rate TTFT
+overhead. This primary proof mode currently requires the exclusive remote
+profile; local native direct/fallback validation remains separate.
+
 Each remote sample preserves `before`/`after` and `owner_before`/`owner_after`
 raw metrics, timer/byte/event deltas, discovery attempts, and SSE results.
 `cold_control_ttft_ms`, `cold_control_cache`, and `cold_control_metric_deltas`
@@ -145,7 +166,7 @@ provides a backend-owned native counter exporter. Add top-level
 
 The fixed `sglang:nixlshard_component_seconds_total`,
 `sglang:nixlshard_component_bytes_total`, and `sglang:nixlshard_events_total`
-families expose seven known native timer components in seconds, five byte
+families expose known native timer components in seconds, payload/direct byte
 components, and fixed status/resource events. They exclude current slot gauges
 and arbitrary Agent fields. Timers aggregate concurrent workers/background
 work and overlap, including owner I/O inside remote control latency. Exported

@@ -657,6 +657,30 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "incorrect/extra payload"):
             bench.remote_counter_proof(requester, owner, 4096)
 
+    def test_direct_remote_proof_requires_positive_scatter_evidence_and_zero_copy(self):
+        def counters(**values):
+            return {f'sglang:nixlshard_component_bytes_total{{component="{name}"}}': values.get(name, 0)
+                    for name in ("staging_copy", "posix_read", "posix_write", "remote_read", "ucx_write", "direct_receive")}
+        owner = counters(posix_read=4096, ucx_write=4096)
+        requester = counters(remote_read=4096, direct_receive=4096)
+        with self.assertRaisesRegex(ValueError, "event counter missing"):
+            bench.remote_counter_proof(requester, owner, 4096, True, 2)
+        requester['sglang:nixlshard_events_total{event="direct_receive_segments"}'] = 2
+        proof = bench.remote_counter_proof(requester, owner, 4096, True, 2)
+        self.assertTrue(proof["exact"])
+        self.assertTrue(proof["direct_receive"])
+        self.assertEqual(proof["expected_destination_segments"], 2)
+        for field, value in (("staging_copy", 4096), ("direct_receive", 8192)):
+            corrupted = dict(requester)
+            corrupted[f'sglang:nixlshard_component_bytes_total{{component="{field}"}}'] = value
+            with self.assertRaisesRegex(AssertionError, "incorrect/extra payload"):
+                bench.remote_counter_proof(corrupted, owner, 4096, True, 2)
+        # Missing direct bytes cannot be inferred from zero copy. Counter export
+        # lag stays explicitly incomplete rather than creating a false proof.
+        lagged = counters(remote_read=4096)
+        lagged['sglang:nixlshard_events_total{event="direct_receive_segments"}'] = 2
+        self.assertFalse(bench.remote_counter_proof(lagged, owner, 4096, True, 2)["exact"])
+
     def test_percentiles_and_available_counter_deltas(self):
         self.assertEqual(bench.percentile([30, 10, 20], 50), 20)
         self.assertEqual(bench.percentile([30, 10, 20], 95), 29)
