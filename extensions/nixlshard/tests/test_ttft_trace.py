@@ -266,6 +266,9 @@ class TraceTests(unittest.TestCase):
                 (root / "request-timeline-1.jsonl").write_text("".join(json.dumps(r) + "\n" for r in items))
                 record = dict(local_proof=dict(exact=True, expected_bytes=128, direct_receive=True,
                                               observed_bytes={"direct_local_read": direct_bytes},
+                                              metadata_io=dict(available=True,
+                                                  observed={"metadata_read_bytes": 8192, "metadata_write_bytes": 4096},
+                                                  scope="full-generation/background counter window, never TTFT"),
                                               fallback_pages=fallbacks))
                 experiment.capture_trace(root, result, record, "ssd", 192, 0, False)
                 return record["critical_path"]
@@ -273,6 +276,9 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(mixed["receiver_mode"], "direct")
             self.assertEqual(mixed["receive_path"]["fallback_bytes"], 64)
             self.assertFalse(mixed["receive_path"]["zero_copy_verified"])
+            self.assertEqual(mixed["source_proof"]["metadata_io"]["observed"],
+                             {"metadata_read_bytes": 8192, "metadata_write_bytes": 4096})
+            self.assertIn("never TTFT", mixed["source_proof"]["metadata_io"]["scope"])
             # G3 owns an aligned bounce/scatter fallback inside the local I/O
             # envelope; its measured child replaces a standalone facade copy.
             g3_fallback = copy.deepcopy(records)

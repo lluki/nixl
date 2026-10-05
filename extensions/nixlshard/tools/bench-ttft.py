@@ -598,7 +598,7 @@ class Experiment:
         if proof:
             trace["source_proof"] = {key: proof[key] for key in
                 ("exact", "expected_bytes", "observed", "observed_bytes", "observed_events", "scope",
-                 "direct_receive", "expected_destination_segments", "direct_pages", "fallback_pages", "zero_copy_verified") if key in proof}
+                 "direct_receive", "expected_destination_segments", "direct_pages", "fallback_pages", "zero_copy_verified", "metadata_io") if key in proof}
         expected_bytes = ((context - 1) // self.args.page_size) * self.args.kv_bytes_per_page
         events = trace["native_events"]
         def total(stage):
