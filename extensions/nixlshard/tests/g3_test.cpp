@@ -186,7 +186,7 @@ void instance_identity_and_direction(Fixture &f) {
 
 void async_registration_admission(Fixture &f) {
  auto cfg=f.config("async-registration.bin",MemoryMode::explicit_registration);
- auto session=G3Session::open(cfg,f.context,2,8).get();
+ auto session=G3Session::open(cfg,f.context,1,8).get();
  Buffer source(8192),target(8192),second(8192);
  std::memset(source.p,0x76,source.bytes);
  auto source_handle=session->register_memory(source.whole()).get();
