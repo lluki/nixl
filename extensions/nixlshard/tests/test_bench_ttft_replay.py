@@ -80,6 +80,17 @@ class ReplayTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pure storage"):
             self.plan()
 
+    def test_explicit_new_base_pin_rejects_changed_bytes_before_import(self):
+        path = self.root / "new-base.py"
+        path.write_text("approved_value = 7\n")
+        expected = replay.file_sha(path)
+        self.assertEqual(replay.load_base(path, expected).approved_value, 7)
+        path.write_text("raise AssertionError('must never execute changed source')\n")
+        with self.assertRaisesRegex(ValueError, "frozen"):
+            replay.load_base(path, expected)
+        with self.assertRaises(ValueError):
+            replay.load_base(path, "not-a-sha256")
+
     def test_changed_base_bytes_rejected_before_import(self):
         path = self.root / "base.py"
         path.write_text("raise RuntimeError('must never run')")

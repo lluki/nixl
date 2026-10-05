@@ -1,5 +1,12 @@
 # Exact-input remote TTFT replay
 
+For a new authoritative-G3 cohort, pass `--base-harness-sha256` with the approved
+SHA256 of that cohort's `bench-ttft.py` source. The default retains the historical
+`fcacef2` harness pin. Each invocation checks source bytes before importing or
+sending HTTP and records the selected SHA separately from native/serving pins.
+Keep the staged reference and direct replay within one matching implementation
+cohort; historical results are not a control for the new SSD record format.
+
 **Agent written**
 
 The ordinary TTFT tool chooses a new UUID prefix for every candidate. Reusing a

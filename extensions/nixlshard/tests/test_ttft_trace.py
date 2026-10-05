@@ -61,6 +61,10 @@ def fixture():
             owner_posix_ns=100,
             owner_ucx_ns=80,
             owner_read_bytes=64,
+            owner_metadata_ns=10,
+            owner_metadata_bytes=4096,
+            owner_staging_copy_ns=0,
+            owner_staging_copy_bytes=0,
         ),
         dict(
             stage="staging_copy",
@@ -120,11 +124,39 @@ class TraceTests(unittest.TestCase):
             sample["service_windows"][0]["pattern_id"], "descriptor_count_1"
         )
 
+    def test_authoritative_record_reads_are_composed_once_and_separate_from_payload(self):
+        result, records = fixture()
+        remote = trace.normalize(result, records, "remote", 128, 0, False)
+        self.assertEqual(remote["storage_contract"], "authoritative_g3_v2")
+        rpc = next(b for b in remote["critical_blocks"] if b["category"] == "remote_rpc")
+        self.assertEqual(rpc["owner_metadata_ns"], 10)
+        self.assertEqual(rpc["owner_metadata_bytes"], 4096)
+        self.assertEqual(sum(b["end_ns"] - b["start_ns"] for b in remote["critical_blocks"]), 900)
+        self.assertEqual(next(s for s in remote["service_windows"] if s["stage"] == "ssd")["bytes"], 64)
+        self.assertEqual(next(s for s in remote["service_windows"] if s["stage"] == "metadata")["bytes"], 4096)
+        records[-1]["events"][1].update(stage="local_posix")
+        local = trace.normalize(result, records, "ssd", 128, 0, False)
+        block = next(b for b in local["critical_blocks"] if b["category"] == "local_ssd")
+        self.assertTrue(block["composition_only"])
+        self.assertEqual(block["owner_posix_ns"], 100)
+        self.assertEqual(block["owner_metadata_ns"], 10)
+        self.assertNotIn("owner_ucx_ns", block)
+        self.assertEqual(next(s for s in local["service_windows"] if s["stage"] == "ssd")["duration_ns"], 100)
+        self.assertEqual(sum(b["end_ns"] - b["start_ns"] for b in local["critical_blocks"]), 900)
+        records[-1]["events"][1]["owner_metadata_ns"] = 151
+        with self.assertRaisesRegex(ValueError, "child durations"):
+            trace.normalize(result, records, "ssd", 128, 0, False)
+
     def test_wrong_clock_anchors_and_missing_or_excess_owner_timing_fail(self):
         for mutation in (
             lambda r, e: r.update(clock="CLOCK_REALTIME"),
             lambda r, e: e.append(copy.deepcopy(e[0])),
             lambda r, e: e[-1]["events"][1].pop("owner_posix_ns"),
+            lambda r, e: e[-1]["events"][1].pop("owner_metadata_ns"),
+            lambda r, e: e[-1]["events"][1].update(owner_metadata_bytes=0),
+            lambda r, e: e[-1]["events"][1].pop("owner_staging_copy_ns"),
+            lambda r, e: e[-1]["events"][1].update(owner_staging_copy_ns=61),
+            lambda r, e: e[-1]["events"][1].update(owner_metadata_ns=90),
             lambda r, e: e[-1]["events"][1].update(owner_ucx_ns=200),
             lambda r, e: e[-1].update(terminal_observed=False),
         ):
@@ -217,8 +249,12 @@ class TraceTests(unittest.TestCase):
                       "cached_tokens_details": {"storage": 128, "storage_backend": "HiCacheNixlShard"}})
         records[-1]["events"] = [
             dict(stage="local_posix", start_ns=250, end_ns=350, bytes=64,
+                 owner_posix_ns=70, owner_metadata_ns=20, owner_metadata_bytes=4096,
+                 owner_read_bytes=64, owner_staging_copy_ns=0, owner_staging_copy_bytes=0,
                  first_object=0, object_count=1, request_id="", direct_receive=True, destination_segments=2),
             dict(stage="local_posix", start_ns=350, end_ns=450, bytes=64,
+                 owner_posix_ns=70, owner_metadata_ns=20, owner_metadata_bytes=4096,
+                 owner_read_bytes=64, owner_staging_copy_ns=0, owner_staging_copy_bytes=0,
                  first_object=1, object_count=1, request_id="", direct_receive=False),
             dict(stage="staging_copy", start_ns=450, end_ns=500, bytes=64,
                  first_object=1, object_count=1, request_id="")]
@@ -237,6 +273,21 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(mixed["receiver_mode"], "direct")
             self.assertEqual(mixed["receive_path"]["fallback_bytes"], 64)
             self.assertFalse(mixed["receive_path"]["zero_copy_verified"])
+            # G3 owns an aligned bounce/scatter fallback inside the local I/O
+            # envelope; its measured child replaces a standalone facade copy.
+            g3_fallback = copy.deepcopy(records)
+            g3_fallback[-1]["events"].pop()
+            g3_fallback[-1]["events"][1].update(
+                owner_staging_copy_ns=10, owner_staging_copy_bytes=64,
+                owner_read_bytes=4096,
+            )
+            nested = capture(g3_fallback, 64, 1)
+            self.assertEqual(nested["receive_path"]["fallback_bytes"], 64)
+            self.assertFalse(nested["receive_path"]["zero_copy_verified"])
+            block = next(b for b in nested["critical_blocks"]
+                         if b["category"] == "local_ssd" and b["start_ns"] == 350)
+            self.assertEqual(block["owner_staging_copy_bytes"], 64)
+            self.assertEqual([s["bytes"] for s in nested["service_windows"] if s["stage"] == "ssd"], [64, 4096])
             direct = copy.deepcopy(records)
             direct[-1]["events"].pop()
             direct[-1]["events"][1].update(direct_receive=True, destination_segments=2)
@@ -247,6 +298,26 @@ class TraceTests(unittest.TestCase):
                 capture(direct, 64, 0)
             with self.assertRaisesRegex(AssertionError, "fallback count"):
                 capture(mixed["trace_events"], 64, 0)
+
+    def test_direct_local_proof_keeps_background_store_copies_and_metadata_separate(self):
+        snapshot = {
+            f'sglang:nixlshard_component_bytes_total{{component="{name}"}}': value
+            for name, value in dict(posix_read=128, staging_copy=64, remote_read=0,
+                                    ucx_write=0, direct_receive=128, direct_local_read=128,
+                                    metadata_read=8192, metadata_write=4096).items()
+        }
+        snapshot.update({
+            f'sglang:nixlshard_events_total{{event="{name}"}}': value
+            for name, value in dict(direct_receive_segments=4, local_direct_fallbacks=0).items()
+        })
+        proof = bench.local_counter_proof(snapshot, 128, 64, True)
+        self.assertTrue(proof["exact"])
+        self.assertEqual(proof["observed_bytes"]["posix_read"], 128)
+        self.assertEqual(proof["metadata_io"]["observed"]["metadata_read_bytes"], 8192)
+        self.assertEqual(proof["observed_bytes"]["staging_copy"], 64)
+        self.assertTrue(proof["metadata_io"]["available"])
+        # The stronger per-request trace regression separately rejects a read
+        # copy while accepting unrelated cumulative write copies here.
 
     def test_local_and_hot_tier_native_proofs_distinguish_read_from_background_write(
         self,

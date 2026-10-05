@@ -76,9 +76,15 @@ def validate_plan(reference, contexts, repeats, warmups, output_tokens):
     return [plan[key] for key in expected_order]
 
 
-def load_base(path):
-    if file_sha(path) != BASE_SHA256:
-        raise ValueError("base harness bytes do not match the frozen fcacef2 tool")
+def checked_base_sha(path, expected_sha):
+    if (len(expected_sha) != 64 or any(c not in "0123456789abcdef" for c in expected_sha)
+            or file_sha(path) != expected_sha):
+        raise ValueError("base harness bytes do not match the explicitly frozen SHA256")
+    return expected_sha
+
+
+def load_base(path, expected_sha=BASE_SHA256):
+    checked_base_sha(path, expected_sha)
     sys.path.insert(0, str(path.resolve().parent))
     spec = importlib.util.spec_from_file_location("nixlshard_frozen_ttft", path)
     module = importlib.util.module_from_spec(spec)
@@ -121,6 +127,8 @@ def install_replay(base, plan, manifest):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-harness", type=Path, required=True)
+    parser.add_argument("--base-harness-sha256", default=BASE_SHA256,
+                        help="exact approved source SHA; defaults to the historical fcacef2 harness")
     parser.add_argument("--reference-artifact-dir", type=Path, required=True)
     parser.add_argument("--validate-only", action="store_true", help="no imports, HTTP or generation")
     parser.add_argument("base_args", nargs=argparse.REMAINDER)
@@ -137,19 +145,21 @@ def main():
     settings, _ = config.parse_known_args(argv)
     if settings.scenarios != ["remote"] or not settings.direct_receive or settings.page_size != 64:
         parser.error("replay requires exclusive direct remote profile with page64")
-    if file_sha(args.base_harness) != BASE_SHA256:
-        parser.error("base harness SHA does not match the frozen fcacef2 tool")
+    try:
+        checked_base_sha(args.base_harness, args.base_harness_sha256)
+    except ValueError as error:
+        parser.error(str(error))
     plan = validate_plan(args.reference_artifact_dir, settings.contexts, settings.repeats,
                          settings.warmups, settings.output_tokens)
     manifest = {"schema_version": 1, "mode": "exact_archived_staged_inputs",
-                "base_harness_sha256": BASE_SHA256, "replay_driver_sha256": file_sha(Path(__file__)),
+                "base_harness_sha256": args.base_harness_sha256, "replay_driver_sha256": file_sha(Path(__file__)),
                 "reference_artifact_dir": str(args.reference_artifact_dir.resolve()),
                 "candidate_count": len(plan), "plan_sha256": digest(plan), "candidates": plan,
                 "scope": "same archived token IDs/sampling parameters and checked output equality; all timing and native/cache validation from byte-pinned base harness"}
     if args.validate_only:
         print(json.dumps({k:v for k,v in manifest.items() if k != "candidates"}, indent=2))
         return
-    base = load_base(args.base_harness)
+    base = load_base(args.base_harness, args.base_harness_sha256)
     install_replay(base, plan, manifest)
     sys.argv = [str(args.base_harness)] + argv
     base.main()

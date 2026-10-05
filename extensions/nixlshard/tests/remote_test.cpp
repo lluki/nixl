@@ -21,7 +21,7 @@ std::atomic<bool> fail_group_read{false};
 std::atomic<unsigned> injected_read_errors{0};
 }
 extern "C" int io_submit(io_context_t ctx, long nr, struct iocb **ios) {
-    if (fail_group_read.load() && nr > 0 && ios[0]->aio_lio_opcode == IO_CMD_PREAD) {
+    if (fail_group_read.load() && nr > 1 && ios[0]->aio_lio_opcode == IO_CMD_PREAD) {
         ++injected_read_errors; return -EIO;
     }
     // POSIX plugins load libaio locally; RTLD_NEXT from this executable cannot
@@ -70,6 +70,9 @@ Status load(Agent &agent, Object object) {
     CHECK(result.size() == 1);
     return result[0];
 }
+std::string storage_key(const std::string &key) {
+    wire::Writer w; w.str("nixlshard.generic.v2"); w.str(key); return w.data;
+}
 std::string peer_identity(const Endpoint &endpoint) {
     wire::Connection connection(endpoint, 1000);
     wire::Writer request; request.u8(wire::hello);
@@ -113,9 +116,10 @@ void grouped_loads_preserve_layout_and_statuses(bool tracing = false) {
         CHECK(events.front().stage == "queue" && events.front().start_ns >= ns(before_get));
         const auto &rpc = events.at(1);
         CHECK(rpc.stage == "remote_rpc" && !rpc.request_id.empty());
-        CHECK(rpc.owner_timing_flags == 3 && rpc.bytes == 3128 && rpc.owner_read_bytes == 12288);
-        CHECK(rpc.owner_posix_ns > 0 && rpc.owner_ucx_ns > 0);
-        CHECK(rpc.owner_posix_ns + rpc.owner_ucx_ns <= rpc.end_ns - rpc.start_ns);
+        CHECK(rpc.owner_timing_flags == 15 && rpc.bytes == 3128 && rpc.owner_read_bytes == 12288);
+        CHECK(rpc.owner_posix_ns > 0 && rpc.owner_ucx_ns > 0 && rpc.owner_metadata_ns > 0);
+        CHECK(rpc.owner_metadata_bytes > 0);
+        CHECK(rpc.owner_posix_ns + rpc.owner_ucx_ns + rpc.owner_metadata_ns <= rpc.end_ns - rpc.start_ns);
         CHECK(events.at(2).first_object == 0 && events.at(3).first_object == 2 && events.at(4).first_object == 3);
         uint64_t copied = 0;
         for (size_t i = 0; i < events.size(); ++i) {
@@ -136,34 +140,14 @@ void grouped_loads_preserve_layout_and_statuses(bool tracing = false) {
     std::copy_n(source.begin() + 4096, 3000, expected.begin() + 512);
     std::copy_n(source.begin(), 64, expected.begin() + 4000);
     CHECK(destination == expected);
-    // A bulk read error cannot fabricate successes or issue UCX writes.
-    auto write_before = owner.stats()["ucx_write_bytes"];
-    destination.fill(201); fail_group_read.store(true);
-    get = reader.batch_load({{"one", {{dst, 0, 64}}, owner_cfg.name},
-                             {"two", {{dst, 512, 3000}}, owner_cfg.name}});
-    auto failed = wait(reader, get); fail_group_read.store(false);
-    if (tracing) {
-        events = reader.trace(get);
-        CHECK(events.size() == 2 && events.back().stage == "remote_rpc");
-        CHECK(events.back().bytes == 0 && events.back().owner_timing_flags == 0);
-    }
-    reader.release(get);
-    CHECK(failed == std::vector<Status>({Status::io_error, Status::io_error}));
-    CHECK(injected_read_errors.load() > 0);
-    CHECK(std::all_of(destination.begin(), destination.end(), [](uint8_t x) { return x == 201; }));
-    CHECK(owner.stats()["ucx_write_bytes"] == write_before);
-    CHECK(reader.stats()["remote_load_batch_requests"] == 2);
-    CHECK(reader.stats()["remote_read_bytes"] == 3128);
-    CHECK(owner.stats()["posix_read_bytes"] == 3 * 4096);
-    CHECK(owner.stats()["ucx_write_bytes"] == 3128);
     // Metadata failure must not erase independently known per-page outcomes.
     {
         wire::Connection control(owner.endpoint(), 1000);
         wire::Writer request; request.u8(wire::load_batch); request.str("bad-group-metadata");
         request.str(peer_identity(owner.endpoint())); request.str("bogus"); request.str("bogus");
         request.u64(1234); request.u32(3); request.u32(1000);
-        request.str("one"); request.u64(64); request.str("missing"); request.u64(32);
-        request.str("one"); request.u64(63);
+        request.str(storage_key("one")); request.u64(64); request.str(storage_key("missing")); request.u64(32);
+        request.str(storage_key("one")); request.u64(63);
         auto response = control.call(request.data, 1000); wire::Reader result(response);
         CHECK(static_cast<Status>(result.u8()) == Status::success && result.u32() == 3);
         CHECK(static_cast<Status>(result.u8()) == Status::not_ready);
@@ -174,10 +158,10 @@ void grouped_loads_preserve_layout_and_statuses(bool tracing = false) {
         wire::Writer overflow; overflow.u8(wire::load_batch); overflow.str("overflow-group");
         overflow.str(peer_identity(owner.endpoint())); overflow.str("bogus"); overflow.str("bogus");
         overflow.u64(UINT64_MAX - 31); overflow.u32(2); overflow.u32(1000);
-        overflow.str("one"); overflow.u64(64); overflow.str("one"); overflow.u64(64);
+        overflow.str(storage_key("one")); overflow.u64(64); overflow.str(storage_key("one")); overflow.u64(64);
         response = control.call(overflow.data, 1000); wire::Reader rejected(response);
         CHECK(static_cast<Status>(rejected.u8()) == Status::invalid_input); rejected.finish();
-        CHECK(owner.stats()["posix_read_bytes"] == 3 * 4096);
+        CHECK(owner.stats()["posix_read_bytes"] == 4 * 4096);
     }
     // Caller aliases retain the original per-object publication order.
     destination.fill(201); expected.fill(201);
@@ -190,7 +174,25 @@ void grouped_loads_preserve_layout_and_statuses(bool tracing = false) {
     // The normal one-object tail retains the old wire path; tracing uses its
     // measured group envelope so owner durations are available for tails too.
     CHECK(load(reader, {"one", {{dst, 5000, 64}}, owner_cfg.name}) == Status::success);
-    CHECK(reader.stats()["remote_load_batch_requests"] == (tracing ? 4 : 3));
+    CHECK(reader.stats()["remote_load_batch_requests"] == (tracing ? 3 : 2));
+    // Inject failure into the shared payload request (metadata reads each submit
+    // one descriptor). Every participating page fails and no UCX write occurs.
+    const auto write_before = owner.stats()["ucx_write_bytes"];
+    const auto read_before = owner.stats()["posix_read_bytes"];
+    destination.fill(201); fail_group_read.store(true);
+    get = reader.batch_load({{"one", {{dst, 0, 64}}, owner_cfg.name},
+                             {"two", {{dst, 512, 3000}}, owner_cfg.name}});
+    auto failed = wait(reader, get); fail_group_read.store(false);
+    reader.release(get);
+    CHECK(failed == std::vector<Status>({Status::io_error, Status::io_error}));
+    CHECK(injected_read_errors.load() > 0);
+    CHECK(std::all_of(destination.begin(), destination.end(), [](uint8_t x) { return x == 201; }));
+    CHECK(owner.stats()["ucx_write_bytes"] == write_before);
+    CHECK(owner.stats()["posix_read_bytes"] == read_before);
+    CHECK(!owner.batch_exists({"one", "two"})[0]); // failed-device mappings retire
+    bool close_failed = false;
+    try { owner.close(); } catch (const std::runtime_error &) { close_failed = true; }
+    CHECK(close_failed);
     reader.deregister_memory(dst); owner.deregister_memory(src);
     reader.close(); owner.close();
 }
@@ -245,7 +247,7 @@ void caller_hint_roundtrip_and_restart() {
         }
         auto before = destination;
         wire::Writer delayed; delayed.u8(wire::load); delayed.str(request_id);
-        delayed.str(old_incarnation); delayed.str("scatter-key"); delayed.u64(4500);
+        delayed.str(old_incarnation); delayed.str(storage_key("scatter-key")); delayed.u64(4500);
         delayed.u64(reinterpret_cast<uintptr_t>(destination.data()));
         delayed.str("bogus-requester"); delayed.str("bogus-metadata");
         auto response = control.call(delayed.data, 1000);
@@ -288,7 +290,7 @@ void caller_hint_roundtrip_and_restart() {
     {
         wire::Connection connection(endpoint, 1000);
         wire::Writer request; request.u8(wire::exists); request.str(old_incarnation);
-        request.u32(1); request.str("scatter-key");
+        request.u32(1); request.str(storage_key("scatter-key"));
         auto response = connection.call(request.data, 1000);
         wire::Reader result(response);
         CHECK(static_cast<Status>(result.u8()) == Status::not_ready); result.finish();

@@ -125,13 +125,19 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True,
                 )
             stage = event["stage"]
             if stage == "remote_rpc" and event.get("bytes", 0):
-                for field in ("owner_posix_ns", "owner_ucx_ns", "owner_read_bytes"):
+                for field in ("owner_posix_ns", "owner_ucx_ns", "owner_read_bytes",
+                              "owner_metadata_ns", "owner_metadata_bytes",
+                              "owner_staging_copy_ns", "owner_staging_copy_bytes"):
                     if field not in event:
                         raise ValueError(
                             "successful remote RPC missing owner timing: " + field
                         )
                 posix, ucx = event["owner_posix_ns"], event["owner_ucx_ns"]
-                if min(posix, ucx) < 0 or posix + ucx > b - a:
+                metadata = event["owner_metadata_ns"]
+                sender_copy = event["owner_staging_copy_ns"]
+                if event["owner_metadata_bytes"] <= 0:
+                    raise ValueError("successful remote RPC lacks a positive SSD record-read witness")
+                if min(posix, ucx, metadata, sender_copy) < 0 or posix + ucx + metadata + sender_copy > b - a:
                     raise ValueError("owner durations exceed enclosing requester RPC")
                 services.extend(
                     [
@@ -153,20 +159,53 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True,
                             destination_segments=event.get("destination_segments", 0),
                             evidence=[ref],
                         ),
+                        dict(
+                            stage="metadata",
+                            bytes=event["owner_metadata_bytes"],
+                            duration_ns=metadata,
+                            pattern_id="authoritative_record_count_" + str(event["object_count"]),
+                            evidence=[ref],
+                            scope="owner SSD allocation-record reads; separate from payload SDK reads",
+                        ),
+                        dict(stage="staging_copy", bytes=event["owner_staging_copy_bytes"],
+                             duration_ns=sender_copy, role="owner",
+                             pattern_id="authoritative_record_count_" + str(event["object_count"]),
+                             evidence=[ref], scope="owner G3 payload gather/scatter; never receiver zero-copy evidence"),
                     ]
                 )
             if stage == "local_posix" and event.get("bytes", 0):
+                for field in ("owner_posix_ns", "owner_read_bytes", "owner_metadata_ns", "owner_metadata_bytes",
+                              "owner_staging_copy_ns", "owner_staging_copy_bytes"):
+                    if field not in event:
+                        raise ValueError("successful local read missing authoritative-G3 timing: " + field)
+                posix, metadata = event["owner_posix_ns"], event["owner_metadata_ns"]
+                local_copy = event["owner_staging_copy_ns"]
+                if event["owner_metadata_bytes"] <= 0:
+                    raise ValueError("successful local read lacks a positive SSD record-read witness")
+                if min(posix, metadata, local_copy) < 0 or posix + metadata + local_copy > b - a:
+                    raise ValueError("local child durations exceed enclosing SSD operation")
                 services.append(
                     dict(
                         stage="ssd",
-                        bytes=event["bytes"],
-                        duration_ns=b - a,
+                        bytes=event["owner_read_bytes"],
+                        duration_ns=posix,
                         pattern_id="descriptor_count_1",
                         direct_receive=event.get("direct_receive", False),
                         destination_segments=event.get("destination_segments", 0),
                         evidence=[ref],
                     )
                 )
+                services.append(dict(
+                    stage="metadata", bytes=event["owner_metadata_bytes"],
+                    duration_ns=metadata,
+                    pattern_id="authoritative_record_count_" + str(event["object_count"]),
+                    evidence=[ref],
+                    scope="local SSD allocation-record reads; separate from payload SDK reads",
+                ))
+                services.append(dict(stage="staging_copy", bytes=event["owner_staging_copy_bytes"],
+                                     duration_ns=local_copy, role="requester",
+                                     pattern_id="authoritative_record_count_" + str(event["object_count"]),
+                                     evidence=[ref], scope="local G3 receiver fallback gather/scatter"))
             if a >= token:
                 continue
             if b > token or (a < finished and b > forward):
@@ -197,6 +236,10 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True,
                     fields.update(
                         owner_posix_ns=event["owner_posix_ns"],
                         owner_ucx_ns=event["owner_ucx_ns"],
+                        owner_metadata_ns=event["owner_metadata_ns"],
+                        owner_metadata_bytes=event["owner_metadata_bytes"],
+                        owner_staging_copy_ns=event["owner_staging_copy_ns"],
+                        owner_staging_copy_bytes=event["owner_staging_copy_bytes"],
                         bytes=event["bytes"],
                         composition_only=True,
                         direct_receive=event.get("direct_receive", False),
@@ -206,6 +249,16 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True,
                     fields["scope"] = (
                         "owner composition unavailable across overlapping forward"
                     )
+            if stage == "local_posix" and event.get("bytes", 0) and b <= forward:
+                fields.update(
+                    owner_posix_ns=event["owner_posix_ns"],
+                    owner_metadata_ns=event["owner_metadata_ns"],
+                    owner_metadata_bytes=event["owner_metadata_bytes"],
+                    owner_staging_copy_ns=event["owner_staging_copy_ns"],
+                    owner_staging_copy_bytes=event["owner_staging_copy_bytes"],
+                    bytes=event["bytes"], composition_only=True,
+                    scope="local SSD total composed of record reads, payload SDK reads and residual; child clocks not positioned",
+                )
             add(
                 a,
                 min(b, token),
@@ -255,15 +308,20 @@ def normalize(result, records, scenario, context, repeat, warmup, verified=True,
             if block["start_ns"] != raw["start_ns"] or block["end_ns"] != raw["end_ns"]:
                 block.pop("composition_only")
                 block.pop("owner_posix_ns")
-                block.pop("owner_ucx_ns")
+                block.pop("owner_ucx_ns", None)
+                block.pop("owner_metadata_ns", None)
+                block.pop("owner_metadata_bytes", None)
+                block.pop("owner_staging_copy_ns", None)
+                block.pop("owner_staging_copy_bytes", None)
                 block["category"] = "other"
                 block["scope"] = (
-                    "partial RPC owner composition remains in raw trace only"
+                    "partial native operation child composition remains in raw trace only"
                 )
     if sum(b["end_ns"] - b["start_ns"] for b in blocks) != token - start:
         raise AssertionError("exclusive critical partition does not equal TTFT")
     return dict(
         request_id=rid,
+        storage_contract="authoritative_g3_v2",
         receiver_mode=receiver_mode,
         tier=TIER_NAMES[scenario],
         context_tokens=context,

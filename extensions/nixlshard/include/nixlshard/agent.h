@@ -1,14 +1,24 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #pragma once
-#include "nixlshard/storage.h"
+#include "nixlshard/g3.h"
 #include <map>
 #include <optional>
 #include <memory>
 
 namespace nixlshard {
+struct G3InstanceConfig {
+    std::string name = "local", namespace_id;
+    int numa_node = 0;
+    std::vector<G3DeviceConfig> devices;
+};
 struct AgentConfig {
     std::string name;
     std::vector<DiskConfig> disks;
+    std::map<std::string, int> disk_numa_nodes;
+    std::string namespace_id, g3_instance = "local";
+    int numa_node = 0; // legacy generic API; framework deployments supply this explicitly
+    MemoryMode registration_mode = MemoryMode::explicit_registration;
+    std::vector<G3InstanceConfig> g3_instances;
     Endpoint listen;
     std::optional<Endpoint> metadata_endpoint;
     std::map<std::string, Endpoint> peers;
@@ -34,6 +44,8 @@ struct TraceEvent {
     // Owner durations are sequential children of remote_rpc, never extra time.
     std::uint8_t owner_timing_flags = 0;
     std::uint64_t owner_posix_ns = 0, owner_ucx_ns = 0, owner_read_bytes = 0;
+    std::uint64_t owner_metadata_ns = 0, owner_metadata_bytes = 0;
+    std::uint64_t owner_staging_copy_ns = 0, owner_staging_copy_bytes = 0;
     bool direct_receive = false;
     std::size_t destination_segments = 0;
 };
@@ -51,11 +63,12 @@ public:
     bool is_quiescent(std::uint64_t handle) const;
     void release(std::uint64_t handle);
     std::vector<bool> batch_exists(const std::vector<std::string> &keys,
-                                  const std::vector<std::string> &hints = {});
+                                  const std::vector<std::string> &hints = {},
+                                  const std::string &g3_instance = "");
     Status checkpoint();
     Endpoint endpoint() const;
     std::map<std::string, std::uint64_t> stats() const;
-    void close();
+    void close(CloseMode mode = CloseMode::clean);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

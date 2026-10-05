@@ -3,7 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <dlfcn.h>
+#include <cerrno>
+#include <libaio.h>
+#include <sys/syscall.h>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -40,18 +42,16 @@ struct File {
     ~File() { ::unlink(path.c_str()); }
 };
 }
-extern "C" int fdatasync(int fd) {
-    using Fn = int (*)(int);
-    static auto actual = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "fdatasync"));
-    if (!actual) std::abort();
-    if (enabled.load()) {
+extern "C" int io_submit(io_context_t ctx, long nr, struct iocb **ios) {
+    if (enabled.load() && nr > 0 && ios[0]->aio_lio_opcode == IO_CMD_PWRITE) {
         struct stat st{};
-        if (!::fstat(fd, &st) && st.st_ino == target_inode && st.st_dev == target_device) {
+        if (!::fstat(ios[0]->aio_fildes, &st) && st.st_ino == target_inode && st.st_dev == target_device) {
             entered.store(true);
             while (!resume.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    return actual(fd);
+    const auto result = ::syscall(SYS_io_submit, ctx, nr, ios);
+    return result < 0 ? -errno : static_cast<int>(result);
 }
 int main() {
     void *source = MAP_FAILED;
@@ -69,12 +69,11 @@ int main() {
         auto token = agent.register_memory(reinterpret_cast<std::uintptr_t>(source), 4096);
         auto first = agent.batch_store({{"old", {{token, 0, 4096}}, {}}});
         CHECK(wait(agent, first) == std::vector<Status>{Status::success}); agent.release(first);
-        eventually([&] { return agent.stats()["metadata_checkpoint_ns"] > 0; });
         CHECK(agent.checkpoint() == Status::success);
         struct stat st{}; CHECK(::stat(file.path.c_str(), &st) == 0);
         target_inode = st.st_ino; target_device = st.st_dev; enabled.store(true);
-        // The only slot is full. Hold eager reclamation's durability barrier until
-        // the submitted store has reported its logical timeout.
+        // Hold actual payload submission after source gathering. A logical timeout
+        // must retain staging and prevent publication until the I/O is quiescent.
         auto second = agent.batch_store({{"new", {{token, 0, 4096}}, {}}});
         eventually([&] { return entered.load(); });
         CHECK(wait(agent, second) == std::vector<Status>{Status::timeout});
@@ -89,7 +88,7 @@ int main() {
         CHECK(::mprotect(source, 4096, PROT_READ | PROT_WRITE) == 0);
         agent.deregister_memory(token); agent.close();
         ::munmap(source, 4096); source = MAP_FAILED;
-        std::cout << "canceled store never reads source after timeout during reclamation\n";
+        std::cout << "canceled store never rereads caller source or publishes after a blocked payload submission\n";
         return 0;
     } catch (const std::exception &error) {
         resume.store(true); enabled.store(false);

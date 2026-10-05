@@ -94,8 +94,9 @@ void scatter_roundtrip(bool trace) {
     if (trace) {
         const auto &rpc = events.back();
         CHECK(rpc.stage == "remote_rpc" && rpc.direct_receive && rpc.destination_segments == 5);
-        CHECK(rpc.bytes == 3128 && rpc.owner_read_bytes == 12288 && rpc.owner_timing_flags == 3);
-        CHECK(rpc.owner_posix_ns > 0 && rpc.owner_ucx_ns > 0);
+        CHECK(rpc.bytes == 3128 && rpc.owner_read_bytes == 12288 && rpc.owner_timing_flags == 15);
+        CHECK(rpc.owner_posix_ns > 0 && rpc.owner_ucx_ns > 0 && rpc.owner_metadata_ns > 0);
+        CHECK(rpc.owner_metadata_bytes > 0);
     }
     // Completion does not release ownership of the caller's registered ranges.
     rejects([&] { reader.deregister_memory(dst); });

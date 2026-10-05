@@ -23,8 +23,11 @@ from nixlshard import Agent
 # reopen with create=False. The client supplies and owns device assignment.
 agent = Agent({
     "name": "worker-0",
+    "namespace_id": "example-schema-v1", "numa_node": 0,
+    "registration_mode": "EXPLICIT",
     "disks": [{"path": "/tmp/new-cache.bin", "capacity_bytes": 64 * 1024 * 1024,
-               "unit_bytes": 4096, "metadata_bytes": 1024 * 1024, "create": True}],
+               "unit_bytes": 4096, "min_object_bytes": 1,
+               "max_object_bytes": 1024 * 1024, "numa_node": 0, "create": True}],
     "staging_slots": 4, "staging_slot_bytes": 1024 * 1024,
 })
 source = ctypes.create_string_buffer(b"immutable value")
@@ -48,6 +51,12 @@ agent.deregister_memory(dst)
 agent.close()
 ```
 
+Keys are nonempty binary values up to the configured width (at most 32 bytes).
+Python accepts bytes, including NUL/non-UTF8 octets, or UTF-8 strings. The complete
+canonical model/layout schema binds a G3 instance and is persisted without hashing
+or truncation. SGLang passes its unchanged 32-byte page digest. Remote/MD routing
+length-frames the full namespace and key; instance names may differ across peers.
+The generic API defaults to the exact namespace `nixlshard.generic.v2`.
 Keys identify immutable, complete values. A successful load returns exactly the
 stored length; mismatched destination length fails. Segments concatenate in caller
 order. Keep registered memory valid until every referencing handle is released.
@@ -57,7 +66,8 @@ handles reference it. By default, loads copy caller segments through an aligned
 owned staging pool registered with NIXL once. Store packing and staged load copies
 are gated against cancellation.
 
-Set `direct_receive=True` to register caller DRAM with POSIX and UCX. Remote
+Whole caller regions are registered with POSIX and UCX once. Set
+`direct_receive=True` to use those regions as receive destinations. Remote
 loads then write directly into the supplied scatter segments; the SSD owner
 still stages the read in its own DRAM. Aligned local loads also read directly:
 logical length must equal the allocation's physical length and all destination
@@ -88,11 +98,13 @@ The bounded list belongs to that handle; releasing it also releases its trace.
 Events contain `stage`, requester `start_ns`/`end_ns` in Linux CLOCK_MONOTONIC,
 `bytes`, object ordinals and the remote control `request_id`. Admission/queue,
 local POSIX reads, remote RPCs and staging copies are separate intervals.
-Remote RPC events additionally carry measured `owner_posix_ns`, `owner_ucx_ns`
-and physical `owner_read_bytes`. Missing/failed owner measurements omit these
-Python fields rather than claiming zero cost. Owner read and UCX durations are
-sequential children of the RPC: replace the enclosing RPC with its read,
-network and control residual when constructing a stack; never add all four.
+Remote RPC events carry payload-only `owner_posix_ns`, `owner_ucx_ns` and physical
+`owner_read_bytes`, plus `owner_metadata_ns`/`owner_metadata_bytes` for SSD record
+I/O and `owner_staging_copy_ns`/`owner_staging_copy_bytes` for sender fallback
+copies. Local POSIX events carry the same metadata/payload/copy children; their
+`bytes` count the logical returned value. Replace the enclosing local/RPC window
+with its children and residual when constructing a stack. Remote owner copies
+are distinct from requester fallback copies; never add parent and child times.
 Tracing requires matching instrumented endpoints and uses the measured group
 envelope even for a single remote object. It is off by default and introduces
 small diagnostic overhead; it preserves owned staging and timeout quarantine.
@@ -129,7 +141,7 @@ Configure `peers={"owner": {"host": "127.0.0.1", "port": 32001}}` and pass
 `metadata_endpoint={"host": "127.0.0.1", "port": 32000}` on both agents.
 `MetadataServer({"host": "127.0.0.1", "port": 32000})` supplies bounded owner
 registration, TTL, incarnation fencing, monotonic announcements and advisory
-lookup. Discovery, connection establishment and checkpoints run in a maintenance
+lookup. Discovery, connection establishment and announcements run in a maintenance
 thread. Initial remote operations can return not_ready until that work completes.
 The owner always verifies keys, including after positive exists/hint lookup.
 
@@ -139,13 +151,38 @@ interface address for this prototype.
 
 ## Persistence and resource limits
 
-Each assigned path has an independent G3 index. A whole object occupies ordered
-fixed-size slots on one path; placements may be scattered. Conservative FIFO
-reclamation skips pinned entries. Double metadata snapshots and durable selectors
-remove retired mappings before slot reuse; checkpoints sync payload before
-publishing insertions. Uncheckpointed insertions may disappear after restart.
-Corrupt committed metadata fails closed. The prototype initializes empty debug
-files and reopens formatted devices; formatting a fresh raw SSD is not yet exposed.
+The distributed Agent delegates placement, allocation, reclamation, payload I/O
+and recovery to an authoritative G3TransferLayer. Each disk has two ownership
+ledgers: fixed aligned metadata records and payload slots. Geometry derives from
+`unit_bytes`, model min/max object bytes, key width and metadata alignment;
+`metadata_bytes` is a deprecated compatibility field. RAM retains key/identity/
+record-location/claims; every read fetches its ordered slots and actual length
+from the SSD under a claim. FIFO policy reclaims complete unclaimed objects.
+
+Recognized CLEAN media restores the exact live set. DIRTY or invalid recovery
+state starts empty, and DIRTY is durably persisted before admission. Evictions
+invalidate records before reuse without a per-victim durability barrier.
+`close("CLEAN")` drains work, finalizes records and persists CLEAN last after
+payload/metadata barriers; failures remain DIRTY and are reported. `checkpoint()`
+flushes DIRTY state and does not enable recovery. `close("DISCARD")` and destruction
+leave DIRTY without erasing payload. Unknown media is never implicitly formatted;
+recognized incompatible media requires explicit `reset=True`.
+
+The client assigns allowed SSD paths and intended NUMA affinity. G3 discovers
+topology only for those paths; debug files require an explicit `numa_node`.
+Writes use healthy assigned devices on that node only. Reads use their recorded
+placement. The façade always supplies intended affinity, including for staging.
+Advanced `g3_instances` configure distinct named namespaces with dedicated disk
+sets; per-object `g3_instance` and `numa` select them. `batch_exists(...,
+g3_instance="local")` is a RAM lookup without a claim or SSD read.
+
+`include/nixlshard/g3.h` also provides the standalone C++ G3Session API: bounded
+asynchronous open/read/write/register/deregister/close completions over the same
+core. EXPLICIT mode rejects unregistered caller spans; AUTOMATIC temporarily
+registers missing spans. General inferred-affinity overloads query buffer NUMA
+placement and reject unknown/mixed placement; they never infer the calling CPU.
+The initial POSIX payload backend supports DRAM, not direct VRAM access. Partial
+startup warns for each excluded disk and succeeds if a usable device remains.
 
 Default unit size is 64 KiB. Direct I/O uses aligned private buffers and units
 divisible by 4096. Maximum object size is the configured staging slot size.
@@ -168,7 +205,7 @@ and lease-based reclamation remain future work.
 Meson tests cover persistence, metadata, wire, local transfer and remote UCX paths.
 The SGLang branch adds a distinct HiCache backend and adapter integration tests.
 Use `stats()` to capture payload bytes and nanoseconds for POSIX, UCX, control,
-staging copies and metadata checkpoints. Timings can overlap across workers and
+staging copies and directional metadata I/O. Timings can overlap across workers and
 are component counters rather than end-to-end TTFT attribution.
 
 The development A100/TCP environment validates behavior. The target

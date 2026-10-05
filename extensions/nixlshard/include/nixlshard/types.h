@@ -33,6 +33,8 @@ struct Object {
     std::string key;
     std::vector<Segment> segments;
     std::string hint;
+    std::string g3_instance;
+    int numa = -1; // façade resolves the configured instance affinity, never the buffer
 };
 struct Endpoint {
     std::string host = "127.0.0.1";

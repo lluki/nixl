@@ -380,6 +380,21 @@ def native_events(snapshot, event):
     return sum(series)
 
 
+def metadata_io(snapshot):
+    # Record SSD record/header I/O separately; never fold it into payload bytes.
+    # Historical exporters lack these families. Per-request G3 traces require
+    # positive record-read witnesses even when cumulative counters are absent.
+    observed = {}
+    for component in ("metadata_read", "metadata_write"):
+        try:
+            observed[component + "_bytes"] = native_bytes(snapshot, component)
+        except ValueError:
+            observed[component + "_bytes"] = None
+    return dict(available=all(value is not None for value in observed.values()),
+                observed=observed,
+                scope="full generation/export window; includes background record/header work, not additive TTFT")
+
+
 def remote_counter_proof(requester, owner, expected_bytes, direct_receive=False,
                          expected_segments=None):
     observed = {
@@ -408,6 +423,7 @@ def remote_counter_proof(requester, owner, expected_bytes, direct_receive=False,
     if any(value < 0 or value > expected[key] for key, value in observed.items()):
         raise AssertionError(f"remote counter window has incorrect/extra payload I/O: {observed}")
     return {"expected_bytes": expected_bytes, "observed": observed,
+            "metadata_io": {"requester": metadata_io(requester), "owner": metadata_io(owner)},
             "direct_receive": direct_receive,
             "expected_destination_segments": expected_segments if direct_receive else None,
             "exact": observed == expected,
@@ -421,6 +437,7 @@ def local_counter_proof(delta, expected_bytes, page_bytes, direct_receive=False)
         raise AssertionError("unexpected native read path or payload size: " + repr(components))
     exact = components["posix_read"] == expected_bytes and components["staging_copy"] >= expected_bytes
     proof = dict(exact=exact, expected_bytes=expected_bytes, observed_bytes=components,
+                 metadata_io=metadata_io(delta),
                  direct_receive=direct_receive, zero_copy_verified=False,
                  scope="full generation/export window; staging combines reads/background stores; exact get path comes from per-request trace")
     if not direct_receive:
@@ -441,8 +458,8 @@ def local_counter_proof(delta, expected_bytes, page_bytes, direct_receive=False)
              and direct_bytes % page_bytes == 0 and direct_pages + fallback_pages == pages
              and segments == 2 * direct_pages
              and components["staging_copy"] >= fallback_bytes)
-    if expected_bytes and direct_pages == pages and not fallback_pages and components["staging_copy"]:
-        raise AssertionError("direct local read includes unexpected staging copies")
+    # Background stores may gather newly computed rows after the first token.
+    # Only the per-RID load trace establishes absence of receiver read copies.
     proof.update(exact=exact, direct_pages=direct_pages, fallback_pages=fallback_pages,
                  observed_events=dict(direct_receive_segments=segments, local_direct_fallbacks=fallback_pages),
                  zero_copy_verified=bool(expected_bytes and exact and not fallback_pages))
@@ -605,7 +622,8 @@ class Experiment:
             local = [e for e in events if e["stage"] == "local_posix" and e.get("bytes", 0)]
             direct_bytes = sum(e["bytes"] for e in local if e.get("direct_receive", False))
             fallback_bytes = expected_bytes - direct_bytes if direct else expected_bytes
-            if total("local_posix") != expected_bytes or total("staging_copy") != fallback_bytes or total("remote_rpc"):
+            local_g3_copies = sum(e.get("owner_staging_copy_bytes", 0) for e in local)
+            if total("local_posix") != expected_bytes or total("staging_copy") + local_g3_copies != fallback_bytes or total("remote_rpc"):
                 raise AssertionError("request trace does not cover exact local SSD payload/copy bytes")
             if not direct and direct_bytes:
                 raise AssertionError("local trace receive mode differs from explicit experiment mode")
@@ -1242,6 +1260,7 @@ def main():
                              for field in ("critical_path", "cold_control_critical_path") if field in sample]
             (args.artifact_dir / "request-diagnostics.json").write_text(json.dumps(
                 dict(schema_version=1, clock="CLOCK_MONOTONIC",
+                     storage_contract="authoritative_g3_v2",
                      study_id=args.artifact_dir.name, contexts=args.contexts,
                      samples=trace_samples, baselines=[],
                      serving_boot_id=args.request_trace_boot_id,

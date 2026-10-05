@@ -9,7 +9,7 @@ Completion is a list of per-object status names; ``poll`` returns
 ``None`` while a request is pending. Explicitly close agents before interpreter
 shutdown, or use them as context managers.
 """
-from ._bindings import Agent, MetadataServer, build_git, direct_receive_supported
+from ._bindings import Agent, MetadataServer, build_git, direct_receive_supported, authoritative_g3_supported
 
 __build_marker__ = build_git
-__all__ = ["Agent", "MetadataServer", "build_git", "__build_marker__", "direct_receive_supported"]
+__all__ = ["Agent", "MetadataServer", "build_git", "__build_marker__", "direct_receive_supported", "authoritative_g3_supported"]

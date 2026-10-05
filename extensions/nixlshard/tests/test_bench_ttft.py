@@ -705,8 +705,11 @@ class Tests(unittest.TestCase):
         # qualify; partial exports also remain incomplete until counts agree.
         self.assertFalse(bench.local_counter_proof(counters(0, 0, 0, 128), 128, 64, True)["exact"])
         self.assertFalse(bench.local_counter_proof(counters(128, 2), 128, 64, True)["exact"])
-        with self.assertRaisesRegex(AssertionError, "unexpected staging"):
-            bench.local_counter_proof(counters(copy_bytes=64), 128, 64, True)
+        # Full-generation write gathers are not receiver copies. The per-RID
+        # load trace, tested separately, must still prove read copies are zero.
+        background = bench.local_counter_proof(counters(copy_bytes=64), 128, 64, True)
+        self.assertTrue(background["exact"])
+        self.assertEqual(background["observed_bytes"]["staging_copy"], 64)
 
     def test_percentiles_and_available_counter_deltas(self):
         self.assertEqual(bench.percentile([30, 10, 20], 50), 20)

@@ -89,7 +89,7 @@ int main() {
             agent.close();
             agent.close();
         }
-        // A checkpointed key remains readable through a freshly instantiated agent.
+        // CLEAN close restores the exact live set; checkpoint alone remains DIRTY.
         cfg.disks[0].create = false;
         destination.fill(0);
         {

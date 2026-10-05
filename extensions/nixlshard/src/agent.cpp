@@ -63,9 +63,16 @@ struct Agent::Impl {
     nixlBackendH *posix = nullptr, *ucx = nullptr;
     nixl_opt_args_t posix_options, ucx_options, dram_options;
     nixl_reg_dlist_t dram_registration{DRAM_SEG};
-    std::vector<nixl_reg_dlist_t> disk_registrations;
-    std::vector<std::unique_ptr<DiskIndex>> disks;
-    std::vector<int> payload_fds;
+    struct Domain {
+        std::string name, namespace_id;
+        int numa = 0;
+        std::unique_ptr<G3TransferLayer> layer;
+        G3MemoryHandle scratch_registration = 0;
+    };
+    std::vector<Domain> domains;
+    // Derived identities serve MD announcements only. G3 remains authoritative.
+    std::mutex directory_mutex;
+    std::map<std::string, AllocationIdentity> directory;
     void *scratch = nullptr;
     std::string scratch_metadata;
     std::mutex native_md_mutex;
@@ -79,6 +86,7 @@ struct Agent::Impl {
         std::size_t bytes;
         std::size_t refs = 0;
         std::unique_ptr<nixl_reg_dlist_t> native_desc;
+        std::vector<std::pair<G3TransferLayer *, G3MemoryHandle>> g3_registrations;
     };
     struct Batch : std::enable_shared_from_this<Batch> {
         std::vector<Object> objects;
@@ -145,7 +153,7 @@ struct Agent::Impl {
             config.staging_slot_bytes > std::numeric_limits<std::size_t>::max() / config.staging_slots ||
             !config.timeout_ms || config.peers.size() > peer_limit || config.disks.size() > 128)
             throw std::invalid_argument("invalid agent configuration or resource limits");
-        if (!config.remote_batch_limit || config.remote_batch_limit > batch_limit)
+        if (!config.remote_batch_limit || config.remote_batch_limit > 8 || config.numa_node < 0)
             throw std::invalid_argument("invalid remote batch limit");
         native = std::make_unique<nixlAgent>(identity, native_config());
         // Linux AIO has tested error/cancellation draining in the selected NIXL base.
@@ -159,8 +167,7 @@ struct Agent::Impl {
         if (::posix_memalign(&scratch, 4096, pool_bytes)) throw std::bad_alloc();
         // Registration/destruction ordering is protected by the constructor guard.
         Finally failed{[this] { if (server) server->close();
-                               native.reset(); std::free(scratch); scratch = nullptr;
-                               for (auto fd : payload_fds) ::close(fd); }};
+                               domains.clear(); native.reset(); std::free(scratch); scratch = nullptr; }};
         dram_registration.addDesc(nixlBlobDesc(reinterpret_cast<std::uintptr_t>(scratch), pool_bytes, 0, ""));
         require_nixl(native->registerMem(dram_registration, &dram_options), "staging registration");
         auto md_options = ucx_options; md_options.includeConnInfo = true;
@@ -168,19 +175,52 @@ struct Agent::Impl {
                      "staging metadata");
         caller_metadata = scratch_metadata;
         for (std::size_t i = 0; i < config.staging_slots; ++i) free_slots.push_back(i);
-        for (const auto &dc : config.disks) {
-            if (!dc.unit_bytes || dc.unit_bytes > config.staging_slot_bytes || config.staging_slot_bytes % dc.unit_bytes ||
-                (config.direct_io && dc.unit_bytes % 4096))
-                throw std::invalid_argument("disk allocation unit incompatible with aligned staging");
-            auto disk = std::make_unique<DiskIndex>(dc);
-            int fd = ::open(dc.path.c_str(), O_RDWR | O_CLOEXEC | (config.direct_io ? O_DIRECT : 0));
-            if (fd < 0) throw std::runtime_error("cannot open disk payload descriptor");
-            payload_fds.push_back(fd);
-            nixl_reg_dlist_t desc(FILE_SEG);
-            desc.addDesc(nixlBlobDesc(0, disk->capacity_bytes(), fd, ""));
-            require_nixl(native->registerMem(desc, &posix_options), "disk registration");
-            disk_registrations.push_back(desc);
-            disks.push_back(std::move(disk));
+        auto instances = config.g3_instances;
+        if (instances.empty()) {
+            G3InstanceConfig instance;
+            instance.name = config.g3_instance; instance.namespace_id = config.namespace_id;
+            instance.numa_node = config.numa_node;
+            for (const auto &disk : config.disks) {
+                auto numa = config.disk_numa_nodes.find(disk.path);
+                instance.devices.push_back({disk, numa == config.disk_numa_nodes.end() ? config.numa_node : numa->second});
+            }
+            instances.push_back(std::move(instance));
+        }
+        if (instances.size() > 128) throw std::invalid_argument("too many G3 instances");
+        std::set<std::string> assigned_paths, names, namespaces;
+        for (auto &instance : instances) {
+            if (instance.namespace_id.empty()) instance.namespace_id = "nixlshard.generic.v2";
+            if (instance.name.empty() || instance.name.size() > 512 || instance.numa_node < 0 ||
+                instance.namespace_id.size() > 2048 || !names.insert(instance.name).second ||
+                !namespaces.insert(instance.namespace_id).second)
+                throw std::invalid_argument("invalid or ambiguous G3 instance namespace");
+            Domain domain; domain.name = instance.name; domain.namespace_id = instance.namespace_id;
+            domain.numa = instance.numa_node;
+            G3Config gc; gc.instance_id = instance.name; gc.memory_mode = config.registration_mode;
+            gc.timeout_ms = config.timeout_ms; gc.max_active = config.max_inflight;
+            gc.staging_bytes = config.staging_slot_bytes;
+            gc.events = [this, ns = instance.namespace_id](const IndexEvent &event) { index_event(ns, event); };
+            for (auto device : instance.devices) {
+                auto &dc = device.disk;
+                if (!assigned_paths.insert(dc.path).second) throw std::invalid_argument("SSD assigned to multiple G3 instances");
+                if (!dc.unit_bytes || dc.unit_bytes > config.staging_slot_bytes ||
+                    config.staging_slot_bytes % dc.unit_bytes || (config.direct_io && dc.unit_bytes % 4096))
+                    throw std::invalid_argument("disk allocation unit incompatible with aligned staging");
+                if (!dc.namespace_id.empty() && dc.namespace_id != domain.namespace_id)
+                    throw std::invalid_argument("disk namespace differs from its G3 instance");
+                dc.namespace_id = domain.namespace_id; dc.direct_io = config.direct_io;
+                if (!dc.min_object_bytes) dc.min_object_bytes = 1;
+                if (!dc.max_object_bytes) dc.max_object_bytes = config.staging_slot_bytes;
+                gc.devices.push_back(std::move(device));
+            }
+            if (!gc.devices.empty()) {
+                domain.layer = std::make_unique<G3TransferLayer>(gc, G3Context{native.get(), identity, posix_options, dram_options});
+                domain.scratch_registration = domain.layer->borrow_registered_memory(
+                    {{reinterpret_cast<std::uintptr_t>(scratch), pool_bytes}});
+                for (const auto &entry : domain.layer->enumerate())
+                    index_event(domain.namespace_id, {IndexEventKind::committed, entry.identity});
+            }
+            domains.push_back(std::move(domain));
         }
         for (const auto &[owner, ep] : config.peers) {
             if (owner.empty() || owner.size() > 1024 || owner == config.name || ep.host.empty() || !ep.port)
@@ -202,15 +242,53 @@ struct Agent::Impl {
     ~Impl() {
         // close() has established quiescence before freeing registered storage.
         if (native) {
+            domains.clear(); // close/deregister file and borrowed-memory views before the SDK
             for (auto &[token, registration] : registrations)
                 if (registration.native_desc)
                     native->deregisterMem(*registration.native_desc, &dram_options);
-            for (auto &r : disk_registrations) native->deregisterMem(r, &posix_options);
             native->deregisterMem(dram_registration, &dram_options);
             native.reset();
         }
-        for (auto fd : payload_fds) ::close(fd);
         std::free(scratch);
+    }
+    Domain &domain(const std::string &name = "") {
+        const auto &selected = name.empty() ? config.g3_instance : name;
+        for (auto &d : domains) if (d.name == selected) return d;
+        throw std::invalid_argument("unknown G3 instance");
+    }
+    Domain *namespace_domain(const std::string &ns) {
+        for (auto &d : domains) if (d.namespace_id == ns) return &d;
+        return nullptr;
+    }
+    static std::string qualified_key(const std::string &ns, const std::string &key) {
+        wire::Writer w; w.str(ns); w.str(key); return w.data;
+    }
+    std::string qualified_key(const Object &object) {
+        return qualified_key(domain(object.g3_instance).namespace_id, object.key);
+    }
+    std::pair<Domain *, std::string> decode_key(const std::string &value) {
+        wire::Reader r(value); auto ns = r.str(2048), key = r.str(32); r.finish();
+        if (key.empty()) throw std::invalid_argument("empty local key");
+        return {namespace_domain(ns), std::move(key)};
+    }
+    void index_event(const std::string &ns, const IndexEvent &event) {
+        std::lock_guard lock(directory_mutex);
+        if (event.kind == IndexEventKind::device_retired) {
+            for (auto it = directory.begin(); it != directory.end();) {
+                wire::Reader r(it->first); const auto entry_ns = r.str(2048);
+                if (entry_ns == ns && it->second.generation == event.identity.generation) it = directory.erase(it);
+                else ++it;
+            }
+            return;
+        }
+        auto key = qualified_key(ns, event.identity.key);
+        if (event.kind == IndexEventKind::committed) directory[key] = event.identity;
+        else {
+            auto it = directory.find(key);
+            if (it != directory.end() && it->second.id == event.identity.id &&
+                it->second.generation == event.identity.generation && it->second.record == event.identity.record)
+                directory.erase(it);
+        }
     }
     void count(const std::string &name, std::uint64_t value = 1) {
         std::lock_guard lock(stats_mutex); counters[name] += value;
@@ -292,9 +370,11 @@ struct Agent::Impl {
         if (stopping.load()) throw std::runtime_error("agent closing");
         if (batches.size() >= config.max_inflight) throw std::runtime_error("maximum in-flight handles reached");
         for (const auto &object : objects) {
-            if (object.key.empty() || object.key.size() > key_limit || object.segments.empty() ||
+            if (object.key.empty() || object.key.size() > 32 || object.segments.empty() ||
                 object.segments.size() > 65536 || object.hint.size() > 1024)
                 throw std::invalid_argument("invalid object");
+            (void) domain(object.g3_instance);
+            if (object.numa < -1) throw std::invalid_argument("invalid intended NUMA node");
             std::size_t total = 0;
             for (const auto &segment : object.segments) {
                 auto r = registrations.find(segment.registration);
@@ -405,162 +485,52 @@ struct Agent::Impl {
         if (timed_out || Clock::now() >= deadline) return Status::timeout;
         return rc == NIXL_SUCCESS ? Status::success : Status::io_error;
     }
-    Status disk_io(std::size_t disk_id, const Allocation &allocation, std::size_t slot,
-                   bool write, Clock::time_point deadline) {
-        auto start = Clock::now();
-        auto &disk = *disks[disk_id];
-        const auto unit = disk.unit_bytes();
-        Status result = Status::success;
-        std::size_t cursor = 0;
-        while (cursor < allocation.slots.size()) {
-            nixl_xfer_dlist_t memory(DRAM_SEG), file(FILE_SEG);
-            std::size_t descriptors = 0;
-            while (cursor < allocation.slots.size() && descriptors++ < 128) {
-                auto end = cursor + 1;
-                while (end < allocation.slots.size() &&
-                       allocation.slots[end] == allocation.slots[end - 1] + 1) ++end;
-                auto length = (end - cursor) * unit;
-                memory.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(slot)) + cursor * unit, length, 0));
-                file.addDesc(nixlBasicDesc(disk.slot_offset(allocation.slots[cursor]), length, payload_fds[disk_id]));
-                cursor = end;
-            }
-            result = transfer(write ? NIXL_WRITE : NIXL_READ, memory, file, identity, posix_options, deadline);
-            if (result != Status::success) break;
-        }
-        elapsed(write ? "posix_write_ns" : "posix_read_ns", start);
-        if (result == Status::success) count(write ? "posix_write_bytes" : "posix_read_bytes",
-                                          allocation.slots.size() * unit);
+    std::vector<G3Buffer> g3_targets(const Object &object) {
+        std::vector<G3Buffer> result;
+        for (const auto &[target, length] : destinations(object)) result.push_back({target, length});
         return result;
     }
-    bool direct_local_eligible(std::size_t disk_id, const Allocation &allocation,
-                               const std::vector<std::pair<std::uintptr_t, std::size_t>> &targets) const {
-        const auto unit = disks[disk_id]->unit_bytes();
-        if (allocation.slots.size() * unit != allocation.bytes) return false;
-        for (const auto &[target, length] : targets)
-            if (target % 4096 || length % 4096) return false;
-        return true;
+    int intended_numa(const Object &object) {
+        return object.numa < 0 ? domain(object.g3_instance).numa : object.numa;
     }
-    Status disk_read_direct(std::size_t disk_id, const Allocation &allocation,
-                            const std::vector<std::pair<std::uintptr_t, std::size_t>> &targets,
-                            Clock::time_point deadline) {
-        const auto start = Clock::now();
-        auto &disk = *disks[disk_id]; const auto unit = disk.unit_bytes();
-        nixl_xfer_dlist_t memory(DRAM_SEG), file(FILE_SEG);
-        std::size_t segment = 0, within = 0;
-        Status result = Status::success;
-        for (std::size_t cursor = 0; cursor < allocation.slots.size();) {
-            auto end = cursor + 1;
-            while (end < allocation.slots.size() && allocation.slots[end] == allocation.slots[end - 1] + 1) ++end;
-            const auto run_bytes = (end - cursor) * unit;
-            for (std::size_t run_offset = 0; run_offset < run_bytes;) {
-                const auto length = std::min(run_bytes - run_offset, targets.at(segment).second - within);
-                memory.addDesc(nixlBasicDesc(targets[segment].first + within, length, 0));
-                file.addDesc(nixlBasicDesc(disk.slot_offset(allocation.slots[cursor]) + run_offset, length, payload_fds[disk_id]));
-                run_offset += length; within += length;
-                if (within == targets[segment].second) { ++segment; within = 0; }
-                if (memory.descCount() == 128) {
-                    result = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
-                    memory.clear(); file.clear();
-                    if (result != Status::success) break;
-                }
-            }
-            if (result != Status::success) break;
-            cursor = end;
-        }
-        if (result == Status::success && memory.descCount())
-            result = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
-        elapsed("posix_read_ns", start);
-        if (result == Status::success) {
-            count("posix_read_bytes", allocation.bytes);
-            count("direct_local_read_bytes", allocation.bytes);
-            count("direct_receive_bytes", allocation.bytes);
-            count("direct_receive_segments", targets.size());
-        }
-        return result;
-    }
-    std::pair<std::size_t, Status> pin(const std::string &key, Allocation &allocation) {
-        Status result = Status::not_found;
-        for (std::size_t i = 0; i < disks.size(); ++i) {
-            auto status = disks[i]->pin(key, allocation);
-            if (status == Status::success) return {i, status};
-            if (status != Status::not_found) result = status;
-        }
-        return {0, result};
+    void g3_metrics(const G3Metrics &metrics, bool write) {
+        count(write ? "posix_write_ns" : "posix_read_ns", metrics.payload_ns);
+        count(write ? "posix_write_bytes" : "posix_read_bytes", metrics.payload_bytes);
+        count("metadata_read_ns", metrics.metadata_read_ns);
+        count("metadata_read_bytes", metrics.metadata_read_bytes);
+        count("metadata_write_ns", metrics.metadata_write_ns);
+        count("metadata_write_bytes", metrics.metadata_write_bytes);
+        count("staging_copy_bytes", metrics.copy_bytes); count("staging_copy_ns", metrics.copy_ns);
     }
     Status store_object(const Object &object, std::size_t slot, Clock::time_point deadline, Batch &batch) {
-        const auto bytes = object_bytes(object);
-        if (disks.empty()) return Status::no_space;
-        auto first = std::hash<std::string>{}(object.key) % disks.size();
-        Status last = Status::no_space;
-        auto expired = [&] {
+        auto &d = domain(object.g3_instance);
+        if (!d.layer) return Status::no_space;
+        {
             std::lock_guard lock(batch.mutex);
-            return batch.canceled || Clock::now() >= deadline;
-        };
-        for (;;) {
-            bool retry_busy = false;
-            for (std::size_t probe = 0; probe < disks.size(); ++probe) {
-                if (expired()) return Status::timeout;
-                auto id = (first + probe) % disks.size();
-                auto &disk = *disks[id];
-                Allocation allocation;
-                auto status = disk.reserve(object.key, bytes, allocation);
-                // Eagerly reclaim one victim at a time; every removal is durable.
-                while (status == Status::no_space) {
-                    if (expired()) return Status::timeout;
-                    auto evicted = disk.evict_one();
-                    if (evicted == Status::busy) {
-                        // Try healthy assigned disks before waiting on a checkpoint,
-                        // competing reclaimer, or temporarily pinned victim.
-                        retry_busy = true; status = Status::busy; break;
-                    }
-                    if (evicted != Status::success) {
-                        status = evicted == Status::not_found ? Status::no_space : evicted;
-                        break;
-                    }
-                    count("evictions");
-                    if (expired()) return Status::timeout;
-                    status = disk.reserve(object.key, bytes, allocation);
-                }
-                if (status != Status::success) {
-                    // Preserve a real disk error if every assigned disk declines.
-                    if (last != Status::io_error) last = status;
-                    continue;
-                }
-                if (allocation.already_present) return Status::success;
-                Finally rollback{[&disk, &allocation] { disk.abort(allocation.id); }};
-                std::memset(address(slot), 0, allocation.slots.size() * disk.unit_bytes());
-                {
-                    std::lock_guard lock(batch.mutex);
-                    if (batch.canceled || Clock::now() >= deadline) return Status::timeout;
-                    copy(object, address(slot), true);
-                }
-                status = disk_io(id, allocation, slot, true, deadline);
-                if (status != Status::success) return status;
-                status = disk.publish(allocation.id);
-                if (status == Status::success) { rollback.fn = {}; count("stores"); }
-                return status;
-            }
-            if (expired()) return Status::timeout;
-            if (!retry_busy) return last;
-            // Only defer after scanning the entire assigned set. Neither waiting
-            // nor another pass extends the original deadline or holds the gate.
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (batch.canceled || Clock::now() >= deadline) return Status::timeout;
+            copy(object, address(slot), true);
         }
+        auto result = d.layer->write(object.key,
+            {{reinterpret_cast<std::uintptr_t>(address(slot)), object_bytes(object)}},
+            intended_numa(object), deadline);
+        g3_metrics(result.metrics, true);
+        if (result.status == Status::success) count("stores");
+        return result.status;
     }
     std::string owner_hint(const Object &object) {
         if (!object.hint.empty()) return object.hint;
         std::lock_guard lock(peers_mutex);
-        auto it = hints.find(object.key);
+        auto it = hints.find(qualified_key(object));
         if (it != hints.end()) return it->second;
-        if (config.metadata_endpoint && lookup_queue.size() < 100000) lookup_queue.insert(object.key);
+        if (config.metadata_endpoint && lookup_queue.size() < 100000) lookup_queue.insert(qualified_key(object));
         maintenance_wake.notify_one();
         return {};
     }
     void refresh_hint(const Object &object) {
         if (!config.metadata_endpoint || !object.hint.empty()) return;
         std::lock_guard lock(peers_mutex);
-        hints.erase(object.key);
-        if (lookup_queue.size() < 100000) lookup_queue.insert(object.key);
+        hints.erase(qualified_key(object));
+        if (lookup_queue.size() < 100000) lookup_queue.insert(qualified_key(object));
         maintenance_wake.notify_one();
     }
     void enqueue_cleanup(const std::string &owner, const std::string &peer_identity,
@@ -584,7 +554,7 @@ struct Agent::Impl {
         auto request = identity + ":" + std::to_string(next_request.fetch_add(1));
         auto target_identity = peer->identity;
         wire::Writer w;
-        w.u8(wire::load); w.str(request); w.str(target_identity); w.str(object.key);
+        w.u8(wire::load); w.str(request); w.str(target_identity); w.str(qualified_key(object));
         w.u64(object_bytes(object)); w.u64(reinterpret_cast<std::uintptr_t>(address(slot)));
         w.str(identity); w.str(scratch_metadata);
         auto start = Clock::now();
@@ -643,7 +613,7 @@ struct Agent::Impl {
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count());
         w.u32(static_cast<unsigned>(remaining));
         for (std::size_t i = 0; i < n; ++i) {
-            w.str(objects[first + i].key); w.u64(object_bytes(objects[first + i]));
+            w.str(qualified_key(objects[first + i])); w.u64(object_bytes(objects[first + i]));
             if (config.direct_receive) {
                 const auto ranges = destinations(objects[first + i]);
                 w.u32(ranges.size());
@@ -670,9 +640,13 @@ struct Agent::Impl {
                     event.owner_timing_flags = r.u8();
                     event.owner_posix_ns = r.u64(); event.owner_ucx_ns = r.u64();
                     event.owner_read_bytes = r.u64();
-                    if ((event.owner_timing_flags & ~3) ||
+                    event.owner_metadata_ns = r.u64(); event.owner_metadata_bytes = r.u64();
+                    event.owner_staging_copy_ns = r.u64(); event.owner_staging_copy_bytes = r.u64();
+                    if ((event.owner_timing_flags & ~15) ||
                         event.owner_posix_ns > event.end_ns - event.start_ns ||
-                        event.owner_ucx_ns > event.end_ns - event.start_ns - event.owner_posix_ns)
+                        event.owner_metadata_ns > event.end_ns - event.start_ns - event.owner_posix_ns ||
+                        event.owner_staging_copy_ns > event.end_ns - event.start_ns - event.owner_posix_ns - event.owner_metadata_ns ||
+                        event.owner_ucx_ns > event.end_ns - event.start_ns - event.owner_posix_ns - event.owner_metadata_ns - event.owner_staging_copy_ns)
                         throw std::invalid_argument("invalid owner timing response");
                 }
             }
@@ -726,9 +700,10 @@ struct Agent::Impl {
         std::size_t bytes = 0, n = 0;
         for (std::size_t i = first; i < batch.objects.size() && n < config.remote_batch_limit; ++i) {
             const auto &object = batch.objects[i];
-            bool local = false;
-            for (auto &disk : disks) local |= disk->exists(object.key);
-            if (local) break;
+            auto &d = domain(object.g3_instance);
+            if (d.layer && d.layer->exists(object.key)) break;
+            if (n && (object.g3_instance != batch.objects[first].g3_instance ||
+                      intended_numa(object) != intended_numa(batch.objects[first]))) break;
             auto hint = owner_hint(object);
             if (hint.empty() || hint == config.name || (n && hint != owner)) break;
             const auto length = object_bytes(object);
@@ -779,28 +754,38 @@ struct Agent::Impl {
     }
     Status load_object(const Object &object, std::size_t slot, Clock::time_point deadline,
                        bool &quarantined, Batch &batch, std::size_t index, bool &direct_done) {
-        Allocation allocation;
-        auto [id, status] = pin(object.key, allocation);
-        if (status == Status::success) {
-            Finally unpin{[this, id, &allocation] { disks[id]->unpin(allocation.id); }};
-            if (allocation.bytes != object_bytes(object)) return Status::invalid_input;
-            std::vector<std::pair<std::uintptr_t, std::size_t>> targets;
-            if (config.direct_receive) {
-                targets = destinations(object);
-                direct_done = direct_local_eligible(id, allocation, targets);
-                if (!direct_done) count("local_direct_fallbacks");
-            }
+        auto &d = domain(object.g3_instance);
+        Status status = Status::not_found;
+        if (d.layer) {
             const auto start = Clock::now();
-            const auto result = direct_done ? disk_read_direct(id, allocation, targets, deadline) :
-                                             disk_io(id, allocation, slot, false, deadline);
-            const auto end = Clock::now();
-            if (config.enable_trace) {
-                TraceEvent event{"local_posix", "", clock_ns(start), clock_ns(end),
-                                 result == Status::success ? allocation.slots.size() * disks[id]->unit_bytes() : 0, index, 1};
-                event.direct_receive = direct_done; event.destination_segments = direct_done ? targets.size() : 0;
-                add_trace(batch, std::move(event));
+            auto buffers = config.direct_receive ? g3_targets(object) :
+                std::vector<G3Buffer>{{reinterpret_cast<std::uintptr_t>(address(slot)), object_bytes(object)}};
+            auto result = d.layer->read(object.key, buffers, intended_numa(object), deadline);
+            status = result.status;
+            g3_metrics(result.metrics, false);
+            if (status == Status::success) {
+                direct_done = config.direct_receive; // G3 also scatters a safe padded fallback
+                if (config.direct_receive && result.direct) {
+                    count("direct_local_read_bytes", result.bytes);
+                    count("direct_receive_bytes", result.bytes);
+                    count("direct_receive_segments", buffers.size());
+                } else if (config.direct_receive) count("local_direct_fallbacks");
+                if (config.enable_trace) {
+                    TraceEvent event{"local_posix", "", clock_ns(start), clock_ns(Clock::now()),
+                                     result.bytes, index, 1};
+                    event.owner_timing_flags = 1 | 4 | 8;
+                    event.owner_posix_ns = result.metrics.payload_ns;
+                    event.owner_read_bytes = result.metrics.payload_bytes;
+                    event.owner_metadata_ns = result.metrics.metadata_ns;
+                    event.owner_metadata_bytes = result.metrics.metadata_bytes;
+                    event.owner_staging_copy_ns = result.metrics.copy_ns;
+                    event.owner_staging_copy_bytes = result.metrics.copy_bytes;
+                    event.direct_receive = config.direct_receive && result.direct;
+                    event.destination_segments = event.direct_receive ? buffers.size() : 0;
+                    add_trace(batch, std::move(event));
+                }
+                return status;
             }
-            return result;
         }
         if (status != Status::not_found) return status;
         if (config.direct_receive) {
@@ -857,21 +842,23 @@ struct Agent::Impl {
         auto id = r.str(4096), expected = r.str(2048);
         auto requester = r.str(2048), metadata = r.str(4 * 1024 * 1024);
         auto target = r.u64(); auto n = r.u32(); auto budget_ms = r.u32();
-        if (!n || n > batch_limit || !budget_ms || id.empty() || requester.empty())
+        if (!n || n > 8 || !budget_ms || id.empty() || requester.empty())
             return status_reply(Status::invalid_input);
         const auto deadline = Clock::now() + std::chrono::milliseconds(std::min(config.timeout_ms, budget_ms));
         struct Page {
             std::string key;
-            std::size_t bytes = 0, target_offset = 0, offset = 0, disk = 0;
-            Allocation allocation;
+            std::size_t bytes = 0, target_offset = 0, offset = 0;
+            Domain *domain = nullptr;
             std::vector<std::pair<std::uintptr_t, std::size_t>> targets;
             Status status = Status::not_found;
-            bool pinned = false;
+
         };
         std::vector<Page> pages(n);
         std::size_t logical_bytes = 0;
         for (auto &page : pages) {
-            page.key = r.str(key_limit); auto bytes = r.u64();
+            auto qualified = r.str(key_limit);
+            auto decoded = decode_key(qualified); page.domain = decoded.first; page.key = std::move(decoded.second);
+            auto bytes = r.u64();
             if (page.key.empty() || !bytes)
                 return status_reply(Status::invalid_input);
             if (bytes > config.staging_slot_bytes - logical_bytes) return status_reply(Status::no_space);
@@ -917,42 +904,48 @@ struct Agent::Impl {
         auto slot = acquire_slot();
         if (!slot) return status_reply(Status::busy);
         Finally release_slot{[this, &slot] { free_slot(*slot); }};
-        Finally unpin{[this, &pages] {
-            for (auto &page : pages) if (page.pinned) disks[page.disk]->unpin(page.allocation.id);
-        }};
+
         std::uint8_t timing_flags = 0;
-        std::uint64_t read_ns = 0, ucx_ns = 0, physical_read_bytes = 0;
+        std::uint64_t read_ns = 0, ucx_ns = 0, physical_read_bytes = 0, metadata_ns = 0, metadata_bytes = 0;
+        std::uint64_t copy_ns = 0, copy_bytes = 0;
         auto reply = [&] {
             wire::Writer w; w.u8(static_cast<unsigned>(Status::success)); w.u32(n);
             for (auto &page : pages) w.u8(static_cast<unsigned>(page.status));
             if (trace) {
                 w.u8(timing_flags); w.u64(read_ns); w.u64(ucx_ns); w.u64(physical_read_bytes);
+                w.u64(metadata_ns); w.u64(metadata_bytes);
+                w.u64(copy_ns); w.u64(copy_bytes);
             }
             return w.data;
         };
-        std::size_t padded_bytes = 0;
-        bool needs_fallback = false;
-        for (auto &page : pages) {
-            auto [disk, status] = pin(page.key, page.allocation);
-            page.disk = disk; page.status = status;
-            if (status != Status::success) continue;
-            page.pinned = true;
-            if (page.bytes != page.allocation.bytes) { page.status = Status::invalid_input; continue; }
-            const auto unit = disks[disk]->unit_bytes();
-            auto offset = (padded_bytes + 4095) / 4096 * 4096;
-            if (offset > config.staging_slot_bytes ||
-                page.allocation.slots.size() > (config.staging_slot_bytes - offset) / unit) {
-                needs_fallback = true; continue;
-            }
-            page.offset = offset; padded_bytes = offset + page.allocation.slots.size() * unit;
+        Domain *selected = nullptr;
+        std::size_t staging_end = 0;
+        std::vector<G3Read> reads;
+        std::vector<std::size_t> read_indices;
+        for (std::size_t i = 0; i < pages.size(); ++i) {
+            auto &page = pages[i];
+            if (!page.domain || !page.domain->layer) continue;
+            if (selected && selected != page.domain) return status_reply(Status::invalid_input);
+            selected = page.domain;
+            const auto offset = (staging_end + 4095) / 4096 * 4096;
+            if (offset > config.staging_slot_bytes || page.bytes > config.staging_slot_bytes - offset)
+                return status_reply(Status::no_space);
+            page.offset = offset; staging_end = offset + page.bytes;
+            reads.push_back({page.key, {{reinterpret_cast<std::uintptr_t>(address(*slot)) + offset, page.bytes}}});
+            read_indices.push_back(i); page.status = Status::success;
         }
-        if (needs_fallback) {
-            for (auto &page : pages) if (page.status == Status::success) page.status = Status::no_space;
-            return reply();
+        if (reads.empty()) return reply();
+        const auto read_result = selected->layer->read_batch(reads, selected->numa, deadline);
+        g3_metrics(read_result.metrics, false);
+        Status io = Status::success;
+        for (std::size_t i = 0; i < read_indices.size(); ++i)
+            pages[read_indices[i]].status = read_result.objects.at(i).status;
+        if (trace) {
+            timing_flags |= 1 | 4 | 8; read_ns = read_result.metrics.payload_ns;
+            physical_read_bytes = read_result.metrics.payload_bytes;
+            metadata_ns = read_result.metrics.metadata_ns; metadata_bytes = read_result.metrics.metadata_bytes;
+            copy_ns = read_result.metrics.copy_ns; copy_bytes = read_result.metrics.copy_bytes;
         }
-        const bool has_payload = std::any_of(pages.begin(), pages.end(),
-            [](const Page &page) { return page.status == Status::success; });
-        if (!has_payload) return reply();
         auto gate = memory_gate(requester);
         if (!gate) {
             for (auto &page : pages) if (page.status == Status::success) page.status = Status::not_ready;
@@ -964,42 +957,9 @@ struct Agent::Impl {
             return reply();
         }
         memory_lock.unlock();
-        nixl_xfer_dlist_t memory(DRAM_SEG), file(FILE_SEG);
-        Status io = Status::success;
-        auto read_start = Clock::now();
-        for (auto &page : pages) {
-            if (page.status != Status::success) continue;
-            auto &disk = *disks[page.disk]; auto unit = disk.unit_bytes();
-            for (std::size_t cursor = 0; cursor < page.allocation.slots.size();) {
-                auto end = cursor + 1;
-                while (end < page.allocation.slots.size() &&
-                       page.allocation.slots[end] == page.allocation.slots[end - 1] + 1) ++end;
-                const auto length = (end - cursor) * unit;
-                memory.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(*slot)) + page.offset + cursor * unit, length, 0));
-                file.addDesc(nixlBasicDesc(disk.slot_offset(page.allocation.slots[cursor]), length, payload_fds[page.disk]));
-                cursor = end;
-                if (memory.descCount() == 128) {
-                    io = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
-                    memory.clear(); file.clear();
-                    if (io != Status::success) break;
-                }
-            }
-            if (io != Status::success) break;
-        }
-        if (io == Status::success && memory.descCount())
-            io = transfer(NIXL_READ, memory, file, identity, posix_options, deadline);
-        if (trace && io == Status::success) {
-            timing_flags |= 1; read_ns = clock_ns(Clock::now()) - clock_ns(read_start);
-        }
-        elapsed("posix_read_ns", read_start);
-        if (io != Status::success) {
-            for (auto &page : pages) if (page.status == Status::success) page.status = io;
-            return reply();
-        }
         nixl_xfer_dlist_t local(DRAM_SEG), remote(DRAM_SEG);
-        std::size_t read_bytes = 0, write_bytes = 0;
+        std::size_t write_bytes = 0;
         for (auto &page : pages) if (page.status == Status::success) {
-            read_bytes += page.allocation.slots.size() * disks[page.disk]->unit_bytes();
             write_bytes += page.bytes;
             if (scatter) {
                 std::size_t offset = 0;
@@ -1012,8 +972,7 @@ struct Agent::Impl {
                 remote.addDesc(nixlBasicDesc(target + page.target_offset, page.bytes, 0));
             }
         }
-        count("posix_read_bytes", read_bytes); count("remote_served_batch_requests");
-        if (trace) physical_read_bytes = read_bytes;
+        count("remote_served_batch_requests");
         if (local.descCount()) {
             memory_lock.lock();
             if (!import_metadata_locked(requester, metadata)) {
@@ -1046,8 +1005,8 @@ struct Agent::Impl {
                 if (expected != identity) return status_reply(Status::not_ready);
                 wire::Writer w; w.u8(static_cast<unsigned>(Status::success)); w.u32(n);
                 for (auto &key : keys) {
-                    bool found = false; for (auto &disk : disks) found |= disk->exists(key);
-                    w.u8(found);
+                    auto [d, local_key] = decode_key(key);
+                    w.u8(d && d->layer && d->layer->exists(local_key));
                 }
                 return w.data;
             }
@@ -1094,18 +1053,18 @@ struct Agent::Impl {
             auto slot = acquire_slot();
             if (!slot) return status_reply(Status::busy);
             Finally release_slot{[this, &slot] { free_slot(*slot); }};
-            Allocation allocation;
-            auto [disk_id, status] = pin(key, allocation);
-            if (status != Status::success) return status_reply(status);
-            Finally unpin{[this, disk_id, &allocation] { disks[disk_id]->unpin(allocation.id); }};
-            if (allocation.bytes != bytes) return status_reply(Status::invalid_input);
+            auto [d, local_key] = decode_key(key);
+            if (!d || !d->layer) return status_reply(Status::not_found);
             auto gate = memory_gate(requester);
             if (!gate) return status_reply(Status::not_ready);
             std::unique_lock memory_lock(*gate);
             if (!import_metadata_locked(requester, metadata)) return status_reply(Status::not_ready);
             memory_lock.unlock();
             auto deadline = Clock::now() + std::chrono::milliseconds(config.timeout_ms);
-            status = disk_io(disk_id, allocation, *slot, false, deadline);
+            auto read = d->layer->read(local_key,
+                {{reinterpret_cast<std::uintptr_t>(address(*slot)), static_cast<std::size_t>(bytes)}}, d->numa, deadline);
+            g3_metrics(read.metrics, false);
+            auto status = read.status;
             if (status != Status::success) return status_reply(status);
             nixl_xfer_dlist_t local(DRAM_SEG), remote(DRAM_SEG);
             local.addDesc(nixlBasicDesc(reinterpret_cast<std::uintptr_t>(address(*slot)), bytes, 0));
@@ -1193,19 +1152,13 @@ struct Agent::Impl {
     void maintain() {
         std::unique_ptr<wire::Connection> md;
         std::uint64_t announcement = 0;
-        auto last_checkpoint = Clock::now() - std::chrono::seconds(2);
-        auto last_announce = last_checkpoint;
+        auto last_announce = Clock::now() - std::chrono::seconds(2);
         while (!stopping.load()) {
             std::vector<std::shared_ptr<Peer>> known;
             { std::lock_guard lock(peers_mutex); for (auto &[_, p] : peers) known.push_back(p); }
             for (auto &peer : known) { if (stopping.load()) break; connect_peer(peer); }
             reclaim_quarantines();
             auto now = Clock::now();
-            if (now - last_checkpoint >= std::chrono::seconds(1)) {
-                auto start = Clock::now();
-                for (auto &disk : disks) if (disk->checkpoint() != Status::success) count("checkpoint_errors");
-                elapsed("metadata_checkpoint_ns", start); last_checkpoint = now;
-            }
             if (config.metadata_endpoint) {
                 try {
                     if (!md || !md->usable()) {
@@ -1217,8 +1170,9 @@ struct Agent::Impl {
                         auto ep = server->endpoint(); w.str(ep.host); w.u32(ep.port);
                         if (md_call(*md, w) != Status::success) throw std::runtime_error("metadata registration rejected");
                         std::vector<std::string> keys;
-                        for (auto &disk : disks) {
-                            auto snapshot = disk->snapshot_keys(); keys.insert(keys.end(), snapshot.begin(), snapshot.end());
+                        {
+                            std::lock_guard lock(directory_mutex);
+                            for (const auto &[key, identity] : directory) { (void) identity; keys.push_back(key); }
                         }
                         for (std::size_t i = 0; i < keys.size(); i += batch_limit) {
                             wire::Writer a; a.u8(wire::announce); a.str(config.name); a.str(identity);
@@ -1280,18 +1234,21 @@ struct Agent::Impl {
             maintenance_wake.wait_for(lock, std::chrono::milliseconds(100), [this] { return stopping.load(); });
         }
     }
-    std::vector<bool> exists(const std::vector<std::string> &keys, const std::vector<std::string> &owners) {
+    std::vector<bool> exists(const std::vector<std::string> &keys, const std::vector<std::string> &owners,
+                             const std::string &instance) {
         if (keys.size() > batch_limit || (!owners.empty() && keys.size() != owners.size()))
             throw std::invalid_argument("invalid exists batch");
         if (stopping.load()) throw std::runtime_error("agent closing");
         const auto deadline = Clock::now() + std::chrono::milliseconds(config.timeout_ms);
+        auto &d = domain(instance);
         std::vector<bool> results(keys.size(), false);
         std::map<std::string, std::vector<std::size_t>> groups;
         for (std::size_t i = 0; i < keys.size(); ++i) {
-            if (keys[i].empty() || keys[i].size() > key_limit) throw std::invalid_argument("invalid key");
-            for (auto &disk : disks) results[i] = results[i] || disk->exists(keys[i]);
+            if (keys[i].empty() || keys[i].size() > 32) throw std::invalid_argument("invalid key");
+            results[i] = d.layer && d.layer->exists(keys[i]);
             if (results[i]) continue;
-            Object object; object.key = keys[i]; if (!owners.empty()) object.hint = owners[i];
+            Object object; object.key = keys[i]; object.g3_instance = instance;
+            if (!owners.empty()) object.hint = owners[i];
             auto owner = owner_hint(object);
             if (!owner.empty() && owner != config.name) groups[owner].push_back(i);
         }
@@ -1302,7 +1259,7 @@ struct Agent::Impl {
             if (!lock.owns_lock() || !peer->channel || !peer->channel->usable()) continue;
             try {
                 wire::Writer w; w.u8(wire::exists); w.str(peer->identity); w.u32(indices.size());
-                for (auto i : indices) w.str(keys[i]);
+                for (auto i : indices) w.str(qualified_key(d.namespace_id, keys[i]));
                 const auto start = Clock::now();
                 Finally timed{[this, start] { elapsed("exists_control_ns", start); }};
                 const auto remaining = std::max<std::int64_t>(1,
@@ -1316,7 +1273,7 @@ struct Agent::Impl {
         }
         return results;
     }
-    void close() {
+    void close(CloseMode mode = CloseMode::clean) {
         std::lock_guard closing(close_mutex);
         if (closed.load()) return;
         stopping.store(true); work.notify_all(); maintenance_wake.notify_all();
@@ -1330,19 +1287,27 @@ struct Agent::Impl {
             if (!quarantines.empty() || !direct_quarantines.empty())
                 throw std::runtime_error("remote I/O not quiescent; registered destinations retained");
         }
-        for (auto &disk : disks) if (disk->checkpoint() != Status::success) count("checkpoint_errors");
+        bool failed = false;
+        for (auto &d : domains) if (d.layer) {
+            auto result = d.layer->close(mode);
+            if (mode == CloseMode::clean && !result.clean) failed = true;
+            for (const auto &device : result.devices) if (device.status != Status::success) {
+                count("close_errors"); failed = true;
+            }
+        }
         closed.store(true);
+        if (failed) throw std::runtime_error("G3 close failed; failed devices remain DIRTY");
     }
 };
 
 Agent::Agent(const AgentConfig &config) : impl_(std::make_unique<Impl>(config)) {}
 Agent::~Agent() {
     if (!impl_) return;
-    try { impl_->close(); }
+    try { impl_->close(CloseMode::discard); }
     catch (...) {
         // Unconfirmed remote writes may still hold this destination address.
         // A bounded retained pool is safer than freeing/reusing registered memory.
-        (void) impl_.release();
+        if (!impl_->closed.load()) (void) impl_.release();
     }
 }
 std::uint64_t Agent::register_memory(std::uintptr_t address, std::size_t bytes) {
@@ -1351,22 +1316,33 @@ std::uint64_t Agent::register_memory(std::uintptr_t address, std::size_t bytes) 
     std::lock_guard lock(impl_->mutex);
     if (impl_->stopping.load()) throw std::runtime_error("agent closing");
     if (impl_->registrations.size() >= 65536) throw std::runtime_error("registration limit reached");
-    if (impl_->config.direct_receive) for (const auto &[existing, registration] : impl_->registrations)
+    for (const auto &[existing, registration] : impl_->registrations)
         if (address < registration.address + registration.bytes && registration.address < address + bytes)
             throw std::invalid_argument("native DRAM registrations overlap");
     auto token = impl_->next_token++;
     if (!token) throw std::overflow_error("registration sequence exhausted");
     std::unique_ptr<nixl_reg_dlist_t> descriptor;
-    if (impl_->config.direct_receive) {
+    {
         descriptor = std::make_unique<nixl_reg_dlist_t>(DRAM_SEG);
         descriptor->addDesc(nixlBlobDesc(address, bytes, 0, ""));
         require_nixl(impl_->native->registerMem(*descriptor, &impl_->dram_options), "caller DRAM registration");
     }
-    impl_->registrations.emplace(token, Impl::Registration{address, bytes, 0, std::move(descriptor)});
+    Impl::Registration registration{address, bytes, 0, std::move(descriptor), {}};
+    try {
+        for (auto &d : impl_->domains) if (d.layer)
+            registration.g3_registrations.emplace_back(d.layer.get(),
+                d.layer->borrow_registered_memory({{address, bytes}}));
+        impl_->registrations.emplace(token, std::move(registration));
+    } catch (...) {
+        for (auto &[layer, handle] : registration.g3_registrations) layer->deregister_memory(handle);
+        if (registration.native_desc) impl_->native->deregisterMem(*registration.native_desc, &impl_->dram_options);
+        throw;
+    }
     if (impl_->config.direct_receive) {
         try { impl_->caller_metadata = impl_->export_caller_metadata(); }
         catch (...) {
             auto &registration = impl_->registrations.at(token);
+            for (auto &[layer, handle] : registration.g3_registrations) layer->deregister_memory(handle);
             impl_->native->deregisterMem(*registration.native_desc, &impl_->dram_options);
             impl_->registrations.erase(token); throw;
         }
@@ -1378,6 +1354,8 @@ void Agent::deregister_memory(std::uint64_t token) {
     auto it = impl_->registrations.find(token);
     if (it == impl_->registrations.end()) throw std::invalid_argument("unknown registration");
     if (it->second.refs) throw std::runtime_error("registration belongs to unreleased transfers");
+    if (!impl_->closed.load()) for (auto &[layer, handle] : it->second.g3_registrations)
+        if (layer->deregister_memory(handle) != Status::success) throw std::runtime_error("G3 registration did not drain");
     if (it->second.native_desc) {
         auto metadata = impl_->export_caller_metadata(token);
         require_nixl(impl_->native->deregisterMem(*it->second.native_desc, &impl_->dram_options), "caller DRAM deregistration");
@@ -1434,14 +1412,17 @@ void Agent::release(std::uint64_t handle) {
     for (const auto &o : batch->objects) for (const auto &s : o.segments)
         --impl_->registrations.at(s.registration).refs;
 }
-std::vector<bool> Agent::batch_exists(const std::vector<std::string> &keys, const std::vector<std::string> &hints) {
-    return impl_->exists(keys, hints);
+std::vector<bool> Agent::batch_exists(const std::vector<std::string> &keys, const std::vector<std::string> &hints,
+                                     const std::string &g3_instance) {
+    return impl_->exists(keys, hints, g3_instance);
 }
 Status Agent::checkpoint() {
     if (impl_->stopping.load()) return Status::not_ready;
     Status result = Status::success;
     auto start = Clock::now();
-    for (auto &disk : impl_->disks) { auto s = disk->checkpoint(); if (s != Status::success) result = s; }
+    for (auto &d : impl_->domains) if (d.layer) {
+        auto s = d.layer->checkpoint(); if (s != Status::success) result = s;
+    }
     impl_->elapsed("metadata_checkpoint_ns", start); return result;
 }
 Endpoint Agent::endpoint() const { return impl_->server->endpoint(); }
@@ -1454,5 +1435,5 @@ std::map<std::string, std::uint64_t> Agent::stats() const {
       result["direct_quarantined_handles"] = p->direct_quarantines.size(); }
     return result;
 }
-void Agent::close() { impl_->close(); }
+void Agent::close(CloseMode mode) { impl_->close(mode); }
 } // namespace nixlshard

@@ -9,6 +9,29 @@ start the clock; final response time is recorded separately. Token events,
 their client timestamps, generated IDs/text, cache-source details, metric
 snapshots and every preparation step remain in raw artifacts.
 
+Authoritative-G3 cohorts require the new native capability and connector. The
+connector binds one exact canonical model/layout schema to the selected G3
+instance before opening SSDs, uses the unchanged 32-byte HiCache page digest,
+and propagates explicit `agent.numa_node` to both staged and direct operations.
+Record the resolved per-page geometry and exact schema alongside source pins.
+Historical pre-G3-format cohorts remain historical; use fresh media and matched
+staged/direct controls on one implementation/hardware cohort.
+
+Allocation-record/header bytes and wall durations are reported separately from
+payload POSIX bytes. Successful local and remote trace envelopes carry
+`owner_metadata_ns`/`owner_metadata_bytes`, with payload-only `owner_posix_ns`;
+remote RPCs additionally carry `owner_ucx_ns`. Full envelopes compose these
+serial child durations once and retain the residual; clipped/overlapping
+envelopes remain raw or Other rather than manufacturing owner timestamps.
+`owner_staging_copy_ns`/`owner_staging_copy_bytes` describe G3's own fallback
+gather/scatter within that envelope: the remote owner's sender-side work, or
+the local requester's receiver work. A remote sender copy is separate from the
+positive receiver zero-copy proof. Local logical bytes count cache values;
+`owner_read_bytes` records physical payload padding for the SDK service rate.
+Metadata service windows have their own record-count pattern and no payload
+fio/UCX bandwidth comparison. Full-generation counters may include background
+stores; per-request positive direct trace spans establish the receiver path.
+
 Use the pinned source SGLang branch, `--enable-metrics`, `--stream-interval 1`,
 TP1, BF16 KV, 64-token pages and write-through storage. For the configured
 GB200 model, stage `Qwen/Qwen3-32B-FP8` revision

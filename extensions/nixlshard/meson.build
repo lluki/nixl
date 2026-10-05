@@ -7,7 +7,7 @@ endif
 
 nixlshard_inc = include_directories('include')
 nixlshard_lib = shared_library('nixlshard',
-  ['src/storage.cpp', 'src/agent.cpp', 'src/wire.cpp', 'src/metadata.cpp'],
+  ['src/storage.cpp', 'src/g3.cpp', 'src/agent.cpp', 'src/wire.cpp', 'src/metadata.cpp'],
   include_directories: nixlshard_inc,
   dependencies: [nixl_dep, nixl_infra, thread_dep],
   install: true,
@@ -15,11 +15,11 @@ nixlshard_lib = shared_library('nixlshard',
 nixlshard_dep = declare_dependency(
   link_with: nixlshard_lib,
   include_directories: nixlshard_inc,
-  dependencies: thread_dep)
+  dependencies: [thread_dep, nixl_dep])
 
 install_headers(
   'include/nixlshard/types.h', 'include/nixlshard/storage.h',
-  'include/nixlshard/agent.h', 'include/nixlshard/wire.h',
+  'include/nixlshard/agent.h', 'include/nixlshard/g3.h', 'include/nixlshard/wire.h',
   subdir: 'nixlshard')
 import('pkgconfig').generate(nixlshard_lib,
   name: 'NIXLShard', description: 'NIXL distributed cache extension',
@@ -44,11 +44,15 @@ if get_option('build_tests')
   nixlshard_test_env.set('NIXL_PLUGIN_DIR',
     join_paths(get_option('prefix'), get_option('libdir'), 'plugins'))
   nixlshard_test_env.set('UCX_TLS', 'tcp,self,cuda_copy')
-  foreach name : ['storage', 'agent', 'metadata', 'remote', 'timeout', 'admission', 'direct_receive']
+  foreach name : ['storage', 'g3', 'agent', 'metadata', 'remote', 'timeout', 'admission', 'direct_receive']
     extra_test_deps = []
     extra_test_links = []
     if name == 'remote'
       extra_test_deps = [dl_dep]
+      extra_test_links = ['-Wl,--export-dynamic']
+    endif
+    if name == 'g3'
+      extra_test_deps = [nixl_infra, dl_dep]
       extra_test_links = ['-Wl,--export-dynamic']
     endif
     exe = executable('nixlshard-' + name + '-test', 'tests/' + name + '_test.cpp',

@@ -1,234 +1,188 @@
-/* SPDX-License-Identifier: Apache-2.0 */
-#include "nixlshard/agent.h"
+#include "nixlshard/storage.h"
+
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cerrno>
-#include <chrono>
-#include <cstring>
-#include <dlfcn.h>
+#include <fcntl.h>
 #include <filesystem>
-#include <functional>
 #include <iostream>
-#include <memory>
-#include <pthread.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include <limits>
+#include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <unistd.h>
+
 using namespace nixlshard;
+#define CHECK(x) do { if (!(x)) throw std::runtime_error(std::string("check failed: ") + #x + " line " + std::to_string(__LINE__)); } while (false)
 namespace {
-using Clock = std::chrono::steady_clock;
-std::atomic<int> fault{0};
-std::atomic<bool> entered{false}, resume{false};
-std::atomic<pthread_t> maintenance_thread{};
-std::atomic<unsigned> injected_errors{0};
-ino_t target_inode = 0;
-dev_t target_device = 0;
-#define CHECK(x) do { if (!(x)) throw std::runtime_error("check failed: " #x); } while (false)
-void eventually(const std::function<bool()> &predicate) {
-    auto deadline = Clock::now() + std::chrono::seconds(10);
-    while (!predicate()) {
-        CHECK(Clock::now() < deadline);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-std::vector<Status> wait(Agent &agent, std::uint64_t handle) {
-    std::optional<std::vector<Status>> result;
-    eventually([&] { result = agent.poll(handle); return result.has_value(); });
-    return *result;
-}
-struct File {
-    std::string path;
-    File() {
-        auto pattern = (std::filesystem::temp_directory_path() / "nixlshard-reclaim-XXXXXX").string();
+constexpr size_t unit = 512;
+struct Fixture {
+    std::string path; DiskConfig config;
+    std::atomic<size_t> reads{0}, writes{0}, written_bytes{0}, barriers{0};
+    MetadataIO hook; PersistenceBarrier sync_hook;
+    explicit Fixture(size_t count = 8) {
+        auto pattern = (std::filesystem::temp_directory_path() / "nixlshard-reclaimer-v2-XXXXXX").string();
         std::vector<char> name(pattern.begin(), pattern.end()); name.push_back('\0');
         int fd = ::mkstemp(name.data()); CHECK(fd >= 0); ::close(fd); path = name.data();
+        config.path = path; config.capacity_bytes = 4096 + count * 1024;
+        config.unit_bytes = unit; config.metadata_alignment = unit;
+        config.min_object_bytes = 1; config.max_object_bytes = unit * 4; config.create = true;
     }
-    ~File() { ::unlink(path.c_str()); }
-};
-struct Fixture {
-    File first, second;
-    std::unique_ptr<Agent> agent;
-    void *source = MAP_FAILED;
-    std::uint64_t token = 0;
-    std::vector<std::uint64_t> handles;
-    explicit Fixture(bool two_disks = false, std::uint32_t timeout_ms = 1000,
-                     std::size_t staging_bytes = 4096) {
-        AgentConfig cfg; cfg.name = "reclamation-" + std::to_string(Clock::now().time_since_epoch().count());
-        cfg.workers = 1; cfg.staging_slots = 1; cfg.staging_slot_bytes = staging_bytes;
-        cfg.timeout_ms = timeout_ms;
-        cfg.disks = {{first.path, 16384 + 4096, 4096, 16384, true}};
-        if (two_disks) cfg.disks.push_back({second.path, 16384 + 4096, 4096, 16384, true});
-        agent = std::make_unique<Agent>(cfg);
-        source = ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        CHECK(source != MAP_FAILED); std::memset(source, 31, 4096);
-        token = agent->register_memory(reinterpret_cast<std::uintptr_t>(source), 4096);
-        struct stat st{}; CHECK(::stat(first.path.c_str(), &st) == 0);
-        target_inode = st.st_ino; target_device = st.st_dev;
-    }
-    ~Fixture() {
-        fault.store(0); resume.store(true);
-        if (source != MAP_FAILED) ::mprotect(source, 4096, PROT_READ | PROT_WRITE);
-        if (agent) {
-            for (auto handle : handles) agent->release(handle);
-            agent->deregister_memory(token); agent->close();
+    ~Fixture() { ::unlink(path.c_str()); }
+    MetadataIO io() { return [&](int fd, bool write, uint64_t offset, void *buffer, size_t bytes) {
+        if (write) { ++writes; written_bytes += bytes; } else ++reads;
+        if (hook) { auto result = hook(fd, write, offset, buffer, bytes); if (result != Status::success) return result; }
+        size_t done = 0;
+        while (done < bytes) {
+            ssize_t n = write ? ::pwrite(fd, static_cast<char *>(buffer) + done, bytes - done, offset + done)
+                              : ::pread(fd, static_cast<char *>(buffer) + done, bytes - done, offset + done);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return Status::io_error;
+            done += static_cast<size_t>(n);
         }
-        if (source != MAP_FAILED) ::munmap(source, 4096);
-    }
-    Object object(const std::string &key) { return {key, {{token, 0, 4096}}, {}}; }
-    std::uint64_t submit_object(const Object &value) {
-        auto handle = agent->batch_store({value}); handles.push_back(handle); return handle;
-    }
-    std::uint64_t submit(const std::string &key) { return submit_object(object(key)); }
-    void release(std::uint64_t handle) {
-        agent->release(handle);
-        handles.erase(std::find(handles.begin(), handles.end(), handle));
-    }
-    void seed(const std::string &key) {
-        auto handle = submit(key);
-        CHECK(wait(*agent, handle) == std::vector<Status>{Status::success}); release(handle);
-        eventually([&] { return agent->checkpoint() == Status::success; });
-    }
-    void identify_maintenance() {
-        // Only maintenance checkpoints this idle fixture: identify it so EIO
-        // is injected solely into the store worker's eviction commit.
-        const auto before = agent->stats()["metadata_checkpoint_ns"];
-        maintenance_thread.store(pthread_t{}); injected_errors.store(0); fault.store(3);
-        eventually([] { return maintenance_thread.load() != pthread_t{}; });
-        // Its completed timer is recorded after releasing the commit lock. The
-        // error test needs a worker eviction, rather than healthy-disk fallback
-        // during this identification checkpoint's remaining sync barriers.
-        eventually([&] { return agent->stats()["metadata_checkpoint_ns"] > before; });
-        fault.store(0);
-    }
+        return Status::success;
+    }; }
+    PersistenceBarrier sync() { return [&](int fd) {
+        ++barriers; if (sync_hook) return sync_hook(fd);
+        return ::fdatasync(fd) ? Status::io_error : Status::success;
+    }; }
 };
-struct BlockedCheckpoint {
-    std::thread thread;
-    Status status = Status::busy;
-    explicit BlockedCheckpoint(Agent &agent) {
-        entered.store(false); resume.store(false); fault.store(1);
-        thread = std::thread([this, &agent] {
-            do { status = agent.checkpoint(); } while (status == Status::busy);
-        });
-        try { eventually([] { return entered.load(); }); }
-        catch (...) { unblock(); throw; }
+Allocation add(DiskIndex &disk, const std::string &key, size_t bytes = unit) {
+    Allocation a; CHECK(disk.reserve(key, bytes, a) == Status::success && disk.publish(a) == Status::success); return a;
+}
+void whole_object_and_dual_resources() {
+    Fixture f(4); DiskIndex disk(f.config, f.io(), f.sync());
+    auto big = add(disk, "big", unit * 3); add(disk, "small");
+    CHECK(disk.free_slots() == 0 && disk.free_records() == 2);
+    CHECK(disk.evict_one() == Status::success);
+    CHECK(!disk.exists("big") && disk.exists("small"));
+    CHECK(disk.free_slots() == 3 && disk.free_records() == 3);
+    Allocation old; CHECK(disk.pin("big", old, big.id) == Status::not_found);
+    auto replacement = add(disk, "big", unit * 3);
+    CHECK(replacement.id != big.id && disk.abort(big) == Status::not_found);
+    CHECK(disk.free_slots() == 0);
+}
+void pinned_candidate_defers_and_old_identity_is_stale() {
+    Fixture f; DiskIndex disk(f.config, f.io(), f.sync());
+    auto first = add(disk, "first"); auto second = add(disk, "second");
+    Allocation pinned; CHECK(disk.pin("first", pinned) == Status::success);
+    CHECK(disk.evict_one() == Status::success);
+    CHECK(disk.exists("first") && !disk.exists("second"));
+    CHECK(disk.evict_one() == Status::busy);
+    CHECK(disk.unpin(pinned) == Status::success && disk.evict_one() == Status::success);
+    CHECK(!disk.exists("first"));
+    auto newer = add(disk, "first");
+    CHECK(newer.id != first.id && newer.id != second.id);
+    CHECK(disk.pin("first", pinned, first.id) == Status::not_found);
+}
+void retirement_hides_lookup_but_holds_both_ledgers() {
+    Fixture f(1); DiskIndex disk(f.config, f.io(), f.sync()); auto a = add(disk, "a");
+    std::mutex mutex; std::condition_variable cv; bool entered = false, resume = false;
+    f.hook = [&](int, bool write, uint64_t offset, void *, size_t) {
+        if (write && offset == disk.record_offset(a.record)) {
+            CHECK(!disk.exists("a")); // callback runs without index locks
+            std::unique_lock guard(mutex); entered = true; cv.notify_all(); cv.wait(guard, [&] { return resume; });
+        } return Status::success;
+    };
+    Status result = Status::io_error;
+    std::thread thread([&] { result = disk.evict_one(); });
+    { std::unique_lock guard(mutex); cv.wait(guard, [&] { return entered; }); }
+    CHECK(!disk.exists("a") && disk.free_slots() == 0 && disk.free_records() == 0);
+    Allocation replacement; CHECK(disk.reserve("a", unit, replacement) == Status::no_space);
+    CHECK(disk.pin("a", replacement) == Status::not_found);
+    CHECK(disk.close(CloseMode::discard) == Status::busy);
+    { std::lock_guard guard(mutex); resume = true; } cv.notify_all(); thread.join();
+    CHECK(result == Status::success && disk.free_slots() == 1 && disk.free_records() == 1);
+    CHECK(disk.reserve("a", unit, replacement) == Status::success);
+    CHECK(replacement.id != a.id && replacement.record == a.record && replacement.slots == a.slots);
+    CHECK(disk.abort(replacement) == Status::success);
+}
+void invalidation_failure_never_reuses_and_dirty_recovery_discards() {
+    Fixture f(2); uint64_t generation;
+    {
+        DiskIndex disk(f.config, f.io(), f.sync()); auto a = add(disk, "a"); add(disk, "healthy");
+        generation = disk.generation();
+        f.hook = [&](int, bool write, uint64_t offset, void *, size_t) {
+            return write && offset == disk.record_offset(a.record) ? Status::io_error : Status::success;
+        };
+        CHECK(disk.evict_one() == Status::io_error && disk.state() == DeviceState::failed);
+        CHECK(!disk.exists("a") && !disk.exists("healthy"));
+        CHECK(disk.free_slots() == 0 && disk.free_records() == 0);
+        Allocation b; CHECK(disk.reserve("b", unit, b) == Status::io_error);
+        CHECK(disk.close(CloseMode::clean) == Status::io_error);
+        CHECK(disk.close(CloseMode::discard) == Status::success);
     }
-    void unblock() { resume.store(true); if (thread.joinable()) thread.join(); fault.store(0); }
-    ~BlockedCheckpoint() { unblock(); }
-};
-std::string disk_zero_key(const std::string &prefix) {
-    for (unsigned i = 0;; ++i) {
-        auto key = prefix + std::to_string(i);
-        if (std::hash<std::string>{}(key) % 2 == 0) return key;
-    }
+    f.hook = {}; auto config = f.config; config.create = false;
+    DiskIndex recovered(config, f.io(), f.sync());
+    CHECK(recovered.generation() != generation && recovered.enumerate().empty());
+    CHECK(recovered.free_slots() == 2 && recovered.free_records() == 2);
 }
-void oversized_empty_disk_declines_without_packing() {
-    Fixture f(false, 1000, 8192);
-    CHECK(::mprotect(f.source, 4096, PROT_NONE) == 0);
-    // Logical size fits staging and each segment fits the registration, but
-    // two units cannot fit this empty disk's one-unit payload allocation.
-    auto handle = f.submit_object({"oversized", {{f.token, 0, 4096}, {f.token, 0, 4096}}, {}});
-    CHECK(wait(*f.agent, handle) == std::vector<Status>{Status::no_space});
-    f.release(handle);
-    CHECK(f.agent->stats()["staging_copy_bytes"] == 0);
-    CHECK(!f.agent->batch_exists({"oversized"})[0]);
-    CHECK(::mprotect(f.source, 4096, PROT_READ | PROT_WRITE) == 0);
+void eviction_cost_is_per_record_without_eager_barriers() {
+    Fixture f(16); DiskIndex disk(f.config, f.io(), f.sync());
+    for (int i = 0; i < 12; ++i) add(disk, std::to_string(i));
+    auto reads = f.reads.load(), writes = f.writes.load(), bytes = f.written_bytes.load(), barriers = f.barriers.load();
+    for (int i = 0; i < 8; ++i) CHECK(disk.evict_one() == Status::success);
+    CHECK(f.reads == reads + 8 && f.writes == writes + 8);
+    CHECK(f.written_bytes == bytes + 8 * disk.metadata_record_bytes());
+    CHECK(f.barriers == barriers);
+    CHECK(disk.enumerate().size() == 4);
+    CHECK(disk.close(CloseMode::clean) == Status::success);
 }
-void contention_retries() {
-    Fixture f;
-    f.seed("old");
-    BlockedCheckpoint checkpoint(*f.agent);
-    auto handle = f.submit("replacement");
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    CHECK(!f.agent->poll(handle)); // Transient lock contention is not no_space.
-    checkpoint.unblock(); CHECK(checkpoint.status == Status::success);
-    CHECK(wait(*f.agent, handle) == std::vector<Status>{Status::success});
-    f.release(handle);
-    CHECK(f.agent->batch_exists({"replacement", "old"}) == (std::vector<bool>{true, false}));
+void held_checkpoint_does_not_hold_allocator_or_index_lock() {
+    Fixture f; DiskIndex disk(f.config, f.io(), f.sync()); add(disk, "a");
+    std::mutex mutex; std::condition_variable cv; bool entered = false, resume = false;
+    f.sync_hook = [&](int) {
+        std::unique_lock guard(mutex); entered = true; cv.notify_all(); cv.wait(guard, [&] { return resume; });
+        return Status::success;
+    };
+    Status checkpoint = Status::io_error;
+    std::thread thread([&] { checkpoint = disk.checkpoint(); });
+    { std::unique_lock guard(mutex); cv.wait(guard, [&] { return entered; }); }
+    Allocation pending; CHECK(disk.reserve("b", unit, pending) == Status::success);
+    CHECK(disk.publish(pending) == Status::success && disk.exists("b"));
+    CHECK(disk.evict_one() == Status::busy); // bounded contention status, not capacity loss
+    { std::lock_guard guard(mutex); resume = true; } cv.notify_all(); thread.join();
+    CHECK(checkpoint == Status::success && disk.evict_one() == Status::success);
 }
-void healthy_disk_wins_before_contended_disk_unblocks() {
-    Fixture f(true);
-    f.seed(disk_zero_key("old"));
-    BlockedCheckpoint checkpoint(*f.agent);
-    auto key = disk_zero_key("replacement");
-    auto handle = f.submit(key);
-    CHECK(wait(*f.agent, handle) == std::vector<Status>{Status::success});
-    f.release(handle);
-    CHECK(!resume.load()); // Acceptance used disk two while disk one stays busy.
-    CHECK(f.agent->batch_exists({key, disk_zero_key("old")}) == (std::vector<bool>{true, true}));
-    checkpoint.unblock();
-}
-void contention_keeps_deadline_and_cancel_gate() {
-    Fixture f(false, 150);
-    f.seed("old");
-    BlockedCheckpoint checkpoint(*f.agent);
-    auto handle = f.submit("replacement");
-    CHECK(wait(*f.agent, handle) == std::vector<Status>{Status::timeout});
-    // Deliberately make the retained source inaccessible as a packing-gate fault
-    // probe. Ordinary callers keep their source alive through handle release.
-    CHECK(::mprotect(f.source, 4096, PROT_NONE) == 0);
-    const auto start = Clock::now();
-    f.release(handle);
-    CHECK(Clock::now() - start < std::chrono::seconds(1));
-    CHECK(!resume.load()); // Worker finished while checkpoint still owns the lock.
-    checkpoint.unblock();
-    CHECK(::mprotect(f.source, 4096, PROT_READ | PROT_WRITE) == 0);
-    CHECK(f.agent->batch_exists({"old", "replacement"}) == (std::vector<bool>{true, false}));
-}
-void eviction_error_preserved() {
-    Fixture f;
-    f.seed("old");
-    f.identify_maintenance();
-    fault.store(2);
-    auto handle = f.submit("replacement");
-    CHECK(wait(*f.agent, handle) == std::vector<Status>{Status::io_error});
-    CHECK(injected_errors.load() > 0);
-    f.release(handle); fault.store(0);
-    CHECK(!f.agent->batch_exists({"replacement"})[0]);
-}
-void healthy_disk_wins_after_error() {
-    Fixture f(true);
-    f.seed(disk_zero_key("old"));
-    f.identify_maintenance();
-    fault.store(2);
-    auto key = disk_zero_key("replacement");
-    auto handle = f.submit(key);
-    CHECK(wait(*f.agent, handle) == std::vector<Status>{Status::success});
-    CHECK(injected_errors.load() > 0);
-    f.release(handle); fault.store(0);
-    CHECK(f.agent->batch_exists({key})[0]);
-}
-}
-extern "C" int fdatasync(int fd) {
-    using Fn = int (*)(int);
-    static auto actual = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "fdatasync"));
-    if (!actual) std::abort();
-    auto mode = fault.load();
-    if (mode) {
-        struct stat st{};
-        if (!::fstat(fd, &st) && st.st_ino == target_inode && st.st_dev == target_device) {
-            if (mode == 3) { maintenance_thread.store(::pthread_self()); return actual(fd); }
-            if (mode == 2 && ::pthread_equal(::pthread_self(), maintenance_thread.load()))
-                return actual(fd);
-            entered.store(true);
-            if (mode == 2) { ++injected_errors; errno = EIO; return -1; }
-            while (!resume.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+void stale_policy_and_drain_without_pressure() {
+    struct Policy : EvictionPolicy {
+        std::vector<uint64_t> candidates{std::numeric_limits<uint64_t>::max()};
+        std::vector<Status> results;
+        void on_block_added(const AllocationIdentity &id, size_t) noexcept override { candidates.push_back(id.id); }
+        void on_block_read(uint64_t) noexcept override {}
+        uint64_t nominate_eviction_candidate(uint64_t) noexcept override { return candidates.empty() ? 0 : candidates.front(); }
+        void on_eviction_result(uint64_t id, Status result) noexcept override {
+            results.push_back(result);
+            candidates.erase(std::remove(candidates.begin(), candidates.end(), id), candidates.end());
+            if (result == Status::busy) candidates.push_back(id);
         }
-    }
-    return actual(fd);
+        void on_device_retired(uint64_t) noexcept override { candidates.clear(); }
+    };
+    Fixture f; auto policy = std::make_shared<Policy>();
+    DiskIndex disk(f.config, f.io(), f.sync(), {}, policy);
+    policy->candidates.push_back(std::numeric_limits<uint64_t>::max());
+    add(disk, "a"); add(disk, "b");
+    CHECK(disk.set_state(DeviceState::draining) == Status::success);
+    Allocation denied; CHECK(disk.reserve("new", unit, denied) == Status::busy);
+    CHECK(disk.evict_one() == Status::success && disk.enumerate().size() == 1);
+    CHECK(policy->results.size() == 2 && policy->results[0] == Status::not_found &&
+          policy->results[1] == Status::success);
+    CHECK(disk.evict_one() == Status::success && disk.enumerate().empty());
+    CHECK(disk.close(CloseMode::clean) == Status::success);
+}
 }
 int main() {
-    try {
-        contention_retries();
-        healthy_disk_wins_before_contended_disk_unblocks();
-        contention_keeps_deadline_and_cancel_gate();
-        eviction_error_preserved();
-        healthy_disk_wins_after_error();
-        oversized_empty_disk_declines_without_packing();
-        std::cout << "reclamation contention, deadlines, errors and healthy-disk fallback passed\n";
-        return 0;
-    } catch (const std::exception &error) {
-        resume.store(true); fault.store(0);
-        std::cerr << error.what() << '\n'; return 1;
-    }
+    const std::pair<const char *, void (*)()> tests[] = {
+        {"whole object and dual resources", whole_object_and_dual_resources},
+        {"pinned candidate and stale lifetime", pinned_candidate_defers_and_old_identity_is_stale},
+        {"RETIRING visibility and reuse fencing", retirement_hides_lookup_but_holds_both_ledgers},
+        {"metadata invalidation failure", invalidation_failure_never_reuses_and_dirty_recovery_discards},
+        {"per-record IO without eager durability", eviction_cost_is_per_record_without_eager_barriers},
+        {"checkpoint contention remains bounded", held_checkpoint_does_not_hold_allocator_or_index_lock},
+        {"stale policy and demand-free drain", stale_policy_and_drain_without_pressure},
+    };
+    try { for (const auto &[name, test] : tests) { test(); std::cout << "PASS " << name << '\n'; } }
+    catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
+    return 0;
 }

@@ -17,6 +17,8 @@ int main(int argc, char **argv) {
                 std::cout << "nixlshard-agent --name NAME [--listen-host HOST] [--listen-port PORT]\n"
                              "  [--disk PATH ...] [--capacity-bytes N] [--unit-bytes N]\n"
                              "  [--metadata-bytes N] [--create] [--direct-io]\n"
+                             "  [--namespace SCHEMA] [--numa-node N] [--min-object-bytes N --max-object-bytes N]\n"
+                             "  [--key-bytes N] [--metadata-alignment N] [--reset] [--registration-mode EXPLICIT|AUTOMATIC]\n"
                              "  [--metadata-host HOST --metadata-port PORT] [--peer NAME HOST PORT]\n"
                              "  [--staging-slots N] [--staging-slot-bytes N] [--workers N]\n"
                              "  [--max-inflight N] [--timeout-ms N]\n";
@@ -29,6 +31,19 @@ int main(int argc, char **argv) {
             else if (arg == "--capacity-bytes") disk.capacity_bytes = cli::integer<std::uint64_t>(cli::value(i, argc, argv));
             else if (arg == "--unit-bytes") disk.unit_bytes = cli::integer<std::size_t>(cli::value(i, argc, argv));
             else if (arg == "--metadata-bytes") disk.metadata_bytes = cli::integer<std::size_t>(cli::value(i, argc, argv));
+            else if (arg == "--namespace") cfg.namespace_id = cli::value(i, argc, argv);
+            else if (arg == "--numa-node") cfg.numa_node = cli::integer<unsigned>(cli::value(i, argc, argv));
+            else if (arg == "--min-object-bytes") disk.min_object_bytes = cli::integer<std::size_t>(cli::value(i, argc, argv));
+            else if (arg == "--max-object-bytes") disk.max_object_bytes = cli::integer<std::size_t>(cli::value(i, argc, argv));
+            else if (arg == "--key-bytes") disk.key_bytes = cli::integer<std::size_t>(cli::value(i, argc, argv));
+            else if (arg == "--metadata-alignment") disk.metadata_alignment = cli::integer<std::size_t>(cli::value(i, argc, argv));
+            else if (arg == "--reset") disk.reset = true;
+            else if (arg == "--registration-mode") {
+                auto mode = cli::value(i, argc, argv);
+                if (mode == "EXPLICIT") cfg.registration_mode = MemoryMode::explicit_registration;
+                else if (mode == "AUTOMATIC") cfg.registration_mode = MemoryMode::automatic;
+                else throw std::invalid_argument("invalid registration mode");
+            }
             else if (arg == "--create") disk.create = true;
             else if (arg == "--direct-io") cfg.direct_io = true;
             else if (arg == "--metadata-host") { metadata.host = cli::value(i, argc, argv); have_metadata = true; }
