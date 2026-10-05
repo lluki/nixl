@@ -107,7 +107,8 @@ with its children and residual when constructing a stack. Remote owner copies
 are distinct from requester fallback copies; never add parent and child times.
 Tracing requires matching instrumented endpoints and uses the measured group
 envelope even for a single remote object. It is off by default and introduces
-small diagnostic overhead; it preserves owned staging and timeout quarantine.
+diagnostic overhead; its cost requires a matched on/off measurement. It preserves
+owned staging and timeout quarantine.
 
 ## Remote loads and metadata
 
@@ -158,6 +159,12 @@ ledgers: fixed aligned metadata records and payload slots. Geometry derives from
 `metadata_bytes` is a deprecated compatibility field. RAM retains key/identity/
 record-location/claims; every read fetches its ordered slots and actual length
 from the SSD under a claim. FIFO policy reclaims complete unclaimed objects.
+
+Batched reads fetch at most eight exact allocation records per NIXL metadata
+request. Large record geometries split requests to keep metadata scratch within
+128 MiB; claims remain held through payload completion. CLEAN close combines
+contiguous FREE records into writes of at most 1 MiB, or one record when larger,
+while preserving LIVE records and the persistence barriers below.
 
 Recognized CLEAN media restores the exact live set. DIRTY or invalid recovery
 state starts empty, and DIRTY is durably persisted before admission. Evictions

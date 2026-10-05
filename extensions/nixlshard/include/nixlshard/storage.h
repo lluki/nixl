@@ -50,6 +50,12 @@ using IndexEventSink = std::function<void(const IndexEvent &)>;
 using MetadataIO = std::function<Status(int fd, bool write, uint64_t offset,
                                         void *aligned_buffer, size_t bytes)>;
 using PersistenceBarrier = std::function<Status(int fd)>;
+struct MetadataRead { uint64_t offset; void *buffer; size_t bytes; };
+// One device, at most eight aligned ranges. Return only after ALL submitted
+// operations are quiescent, including failure/cancellation paths.
+using MetadataReadBatch = std::function<Status(int fd, const std::vector<MetadataRead> &)>;
+struct PinQuery { std::string key; uint64_t expected_id = 0; };
+struct PinResult { Status status = Status::not_found; Allocation allocation; };
 // Called before every descriptor close, including failed construction. A failed
 // retirement keeps the descriptor open; the integration retains backend ownership.
 using DescriptorRetirement = std::function<Status(int fd)>;
@@ -71,7 +77,8 @@ class DiskIndex {
 public:
     explicit DiskIndex(const DiskConfig &, MetadataIO,
                        PersistenceBarrier = {}, IndexEventSink = {},
-                       std::shared_ptr<EvictionPolicy> = {}, DescriptorRetirement = {});
+                       std::shared_ptr<EvictionPolicy> = {}, DescriptorRetirement = {},
+                       MetadataReadBatch = {});
     ~DiskIndex();
     DiskIndex(const DiskIndex &) = delete;
     DiskIndex &operator=(const DiskIndex &) = delete;
@@ -93,6 +100,12 @@ public:
     Status abort(uint64_t id);
     Status abort(const Allocation &);
     Status pin(const std::string &key, Allocation &out, uint64_t expected_id = 0);
+    // At most eight queries; claims precede fresh SSD record reads. One claim
+    // per successful result (including duplicate keys) remains until unpin.
+    // Scratch is bounded to 128 MiB by chunking unusually large records.
+    // Shared I/O/validation errors release all participating claims only after
+    // callback quiescence; independent missing/stale-ID outcomes remain misses.
+    std::vector<PinResult> pin_many(const std::vector<PinQuery> &);
     Status unpin(uint64_t id);
     Status unpin(const Allocation &);
     bool exists(const std::string &key) const;

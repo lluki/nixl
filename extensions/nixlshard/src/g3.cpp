@@ -210,6 +210,29 @@ struct G3TransferLayer::Impl {
             return Status::io_error;
         }
     }
+    Status metadata_batch(int fd,const std::vector<MetadataRead> &ranges) {
+        if(ranges.empty())return Status::success;
+        const auto start=Clock::now();size_t bytes=0;
+        try {
+            if(ranges.size()>8)throw std::invalid_argument("too many G3 metadata ranges");
+            auto base=reinterpret_cast<uintptr_t>(ranges.front().buffer);
+            for(const auto &range:ranges) {
+                if(reinterpret_cast<uintptr_t>(range.buffer)!=base+bytes || range.bytes>128*1024*1024-bytes)
+                    throw std::invalid_argument("G3 metadata batch scratch is not bounded contiguous memory");
+                bytes+=range.bytes;
+            }
+            file_registration(fd);
+            Temporary registration(*this,reinterpret_cast<void*>(base),bytes);
+            nixl_xfer_dlist_t memory(DRAM_SEG),file(FILE_SEG);
+            for(const auto &range:ranges) {
+                memory.addDesc(nixlBasicDesc(reinterpret_cast<uintptr_t>(range.buffer),range.bytes,0));
+                file.addDesc(nixlBasicDesc(range.offset,range.bytes,fd));
+            }
+            auto result=transfer(false,memory,file,deadline(metric_owner==this?metric_deadline:G3Deadline::max()));
+            metadata_account(false,start,bytes,result==Status::success);
+            return result;
+        } catch(...) { metadata_account(false,start,bytes,false);return Status::io_error; }
+    }
     explicit Impl(G3Config cfg,G3Context ctx):config(std::move(cfg)),context(std::move(ctx)) {
         if(config.instance_id.empty() || config.instance_id.size()>512 || config.devices.empty() || config.devices.size()>128 ||
            !config.max_active || !config.staging_bytes || !config.timeout_ms ||
@@ -236,7 +259,8 @@ struct G3TransferLayer::Impl {
                     [](int fd) {
                         int rc;do { rc=::fdatasync(fd); }while(rc<0 && errno==EINTR);
                         return rc==0?Status::success:Status::io_error;
-                    },config.events,nullptr,[this](int fd){return retire_file(fd);});
+                    },config.events,nullptr,[this](int fd){return retire_file(fd);},
+                    [this](int fd,const std::vector<MetadataRead>&ranges){return metadata_batch(fd,ranges);});
             } catch(const std::exception &e) {
                 d.error=e.what();std::cerr<<"G3 excluded "<<dc.disk.path<<": "<<d.error<<"\n";
             }
@@ -496,7 +520,7 @@ G3BatchResult G3TransferLayer::read_batch(const std::vector<G3Read>&reads,int nu
     if(reads.empty() || reads.size()>8 || numa<0)return batch;
     until=i.deadline(until);
     struct Plan {
-        Allocation allocation;size_t disk=0;bool claimed=false;
+        Allocation allocation;size_t disk=0;bool claimed=false,selected=false;
         std::unique_ptr<Aligned> stage;std::unique_ptr<Impl::Temporary> registration;
     };
     std::vector<Plan> plans(reads.size());
@@ -521,23 +545,43 @@ G3BatchResult G3TransferLayer::read_batch(const std::vector<G3Read>&reads,int nu
         r.status=i.lease(query.buffers,leases,temporaries);
         if(r.status!=Status::success)continue;
         r.status=Status::not_found;
-        {
-            MetricScope metrics(&i,r.metrics,until);
-            for(size_t d=0;d<i.devices.size();++d) {
-                auto &disk=i.devices[d];
-                if(!disk.index || !disk.index->exists(query.key))continue;
-                r.status=disk.index->pin(query.key,p.allocation,query.expected_allocation_id);
-                if(r.status==Status::success){p.disk=d;p.claimed=true;break;}
-                if(r.status!=Status::not_found)break;
-            }
+        for(size_t d=0;d<i.devices.size();++d) {
+            auto &disk=i.devices[d];
+            if(disk.index && disk.index->exists(query.key)){p.disk=d;p.selected=true;break;}
         }
-        batch.metrics.metadata_ns+=r.metrics.metadata_ns;
-        batch.metrics.metadata_bytes+=r.metrics.metadata_bytes;
-        batch.metrics.metadata_read_ns+=r.metrics.metadata_read_ns;
-        batch.metrics.metadata_read_bytes+=r.metrics.metadata_read_bytes;
-        batch.metrics.metadata_write_ns+=r.metrics.metadata_write_ns;
-        batch.metrics.metadata_write_bytes+=r.metrics.metadata_write_bytes;
+    }
+    for(size_t d=0;d<i.devices.size();++d) {
+        std::vector<PinQuery> queries;std::vector<size_t> positions;
+        for(size_t n=0;n<reads.size();++n)if(plans[n].selected && plans[n].disk==d) {
+            queries.push_back({reads[n].key,reads[n].expected_allocation_id});positions.push_back(n);
+        }
+        if(queries.empty())continue;
+        G3Metrics metrics;
+        std::vector<PinResult> pinned;
+        {MetricScope scope(&i,metrics,until);pinned=i.devices[d].index->pin_many(queries);}
+        // A shared metadata request has one elapsed interval, attributed to its
+        // leader object for scalar read compatibility and once to batch totals.
+        batch.objects[positions.front()].metrics=metrics;
+        batch.metrics.metadata_ns+=metrics.metadata_ns;
+        batch.metrics.metadata_bytes+=metrics.metadata_bytes;
+        batch.metrics.metadata_read_ns+=metrics.metadata_read_ns;
+        batch.metrics.metadata_read_bytes+=metrics.metadata_read_bytes;
+        batch.metrics.metadata_write_ns+=metrics.metadata_write_ns;
+        batch.metrics.metadata_write_bytes+=metrics.metadata_write_bytes;
+        for(size_t k=0;k<positions.size();++k) {
+            auto n=positions[k];batch.objects[n].status=pinned[k].status;
+            if(pinned[k].status==Status::success){plans[n].allocation=std::move(pinned[k].allocation);plans[n].claimed=true;}
+        }
+    }
+    for(size_t n=0;n<reads.size();++n) {
+        auto &r=batch.objects[n];auto &p=plans[n];const auto &query=reads[n];
         if(!p.claimed)continue;
+        bool alias=false;auto accepted=destinations;
+        for(const auto &b:query.buffers) {
+            for(const auto &a:accepted)if(a.address<b.address+b.bytes && b.address<a.address+a.bytes)alias=true;
+            accepted.push_back(b);
+        }
+        if(alias){r.status=Status::invalid_input;continue;}
         auto &disk=i.devices[p.disk];r.device_index=p.disk;r.identity=identity(p.allocation);
         if(r.bytes!=p.allocation.bytes){r.status=Status::invalid_input;continue;}
         r.direct=i.eligible(disk,p.allocation,query.buffers);

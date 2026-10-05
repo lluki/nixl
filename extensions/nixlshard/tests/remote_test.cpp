@@ -10,6 +10,7 @@
 #include <chrono>
 #include <functional>
 #include <filesystem>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -19,9 +20,14 @@
 namespace {
 std::atomic<bool> fail_group_read{false};
 std::atomic<unsigned> injected_read_errors{0};
+std::atomic<uint64_t> payload_boundary{UINT64_MAX};
 }
 extern "C" int io_submit(io_context_t ctx, long nr, struct iocb **ios) {
-    if (fail_group_read.load() && nr > 1 && ios[0]->aio_lio_opcode == IO_CMD_PREAD) {
+    bool payload = fail_group_read.load() && nr > 0;
+    for (long i = 0; i < nr && payload; ++i)
+        payload = ios[i]->aio_lio_opcode == IO_CMD_PREAD &&
+                  uint64_t(ios[i]->u.c.offset) >= payload_boundary.load();
+    if (payload) {
         ++injected_read_errors; return -EIO;
     }
     // POSIX plugins load libaio locally; RTLD_NEXT from this executable cannot
@@ -72,6 +78,15 @@ Status load(Agent &agent, Object object) {
 }
 std::string storage_key(const std::string &key) {
     wire::Writer w; w.str("nixlshard.generic.v2"); w.str(key); return w.data;
+}
+uint64_t file_payload_base(const std::string &path) {
+    int fd = ::open(path.c_str(), O_RDONLY); CHECK(fd >= 0);
+    std::array<unsigned char, 8> bytes{};
+    const auto count = ::pread(fd, bytes.data(), bytes.size(), 88); ::close(fd);
+    CHECK(count == 8); // authoritative header's payload_base, never metadata count
+    uint64_t value = 0;
+    for (size_t i = 0; i < bytes.size(); ++i) value |= uint64_t(bytes[i]) << (8 * i);
+    CHECK(value >= 4096); return value;
 }
 std::string peer_identity(const Endpoint &endpoint) {
     wire::Connection connection(endpoint, 1000);
@@ -175,10 +190,12 @@ void grouped_loads_preserve_layout_and_statuses(bool tracing = false) {
     // measured group envelope so owner durations are available for tails too.
     CHECK(load(reader, {"one", {{dst, 5000, 64}}, owner_cfg.name}) == Status::success);
     CHECK(reader.stats()["remote_load_batch_requests"] == (tracing ? 3 : 2));
-    // Inject failure into the shared payload request (metadata reads each submit
-    // one descriptor). Every participating page fails and no UCX write occurs.
+    // Metadata is batched too: descriptor count no longer distinguishes it.
+    // Inject only PREADs at/after the fixture's actual on-media payload_base.
+    payload_boundary = file_payload_base(file.path);
     const auto write_before = owner.stats()["ucx_write_bytes"];
     const auto read_before = owner.stats()["posix_read_bytes"];
+    const auto metadata_before = owner.stats()["metadata_read_bytes"];
     destination.fill(201); fail_group_read.store(true);
     get = reader.batch_load({{"one", {{dst, 0, 64}}, owner_cfg.name},
                              {"two", {{dst, 512, 3000}}, owner_cfg.name}});
@@ -189,6 +206,7 @@ void grouped_loads_preserve_layout_and_statuses(bool tracing = false) {
     CHECK(std::all_of(destination.begin(), destination.end(), [](uint8_t x) { return x == 201; }));
     CHECK(owner.stats()["ucx_write_bytes"] == write_before);
     CHECK(owner.stats()["posix_read_bytes"] == read_before);
+    CHECK(owner.stats()["metadata_read_bytes"] == metadata_before + 2 * 4096);
     CHECK(!owner.batch_exists({"one", "two"})[0]); // failed-device mappings retire
     bool close_failed = false;
     try { owner.close(); } catch (const std::runtime_error &) { close_failed = true; }

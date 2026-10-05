@@ -1,10 +1,13 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "nixlshard/g3.h"
 #include <atomic>
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
+#include <fcntl.h>
 #include <future>
 #include <iostream>
 #include <libaio.h>
@@ -17,6 +20,30 @@ using namespace nixlshard;
 using namespace std::chrono_literals;
 namespace {
 std::atomic<bool> block_io=false,entered_io=false,fail_barrier=false;
+std::atomic<bool> capture_metadata=false,block_metadata=false,entered_metadata=false,fail_metadata=false;
+std::atomic<uint64_t> payload_boundary=0;
+struct MetadataRequest { std::vector<uint64_t> offsets,bytes; };
+std::mutex metadata_mutex;
+std::vector<MetadataRequest> metadata_requests;
+uint64_t header_word(const std::string &path,off_t offset) {
+ int fd=::open(path.c_str(),O_RDONLY);std::array<unsigned char,8> bytes{};
+ if(fd<0)throw std::runtime_error("open geometry witness");
+ auto count=::pread(fd,bytes.data(),bytes.size(),offset);::close(fd);
+ if(count!=8)throw std::runtime_error("read geometry witness");
+ uint64_t value=0;for(size_t n=0;n<8;++n)value|=uint64_t(bytes[n])<<(8*n);return value;
+}
+void arm_metadata(const std::string &path) {
+ payload_boundary=header_word(path,88); // authoritative header payload_base
+ std::lock_guard lock(metadata_mutex);metadata_requests.clear();capture_metadata=true;
+}
+std::vector<uint64_t> record_spans(const MetadataRequest &request) {
+ std::vector<uint64_t> result;
+ for(size_t n=0;n<request.offsets.size();++n) {
+  if(request.offsets[n]%4096 || request.bytes[n]%4096)throw std::runtime_error("unaligned metadata request");
+  for(uint64_t pos=0;pos<request.bytes[n];pos+=4096)result.push_back(request.offsets[n]+pos);
+ }
+ std::sort(result.begin(),result.end());return result;
+}
 void check(bool condition,const char *message){if(!condition)throw std::runtime_error(message);}
 struct Buffer {
  void *p=nullptr;size_t bytes;
@@ -61,9 +88,21 @@ void automatic_batch_and_recovery(Fixture &f) {
   std::vector<G3Read> reads;
   for(unsigned n=1;n<=8;++n)reads.push_back({key(n),{{reinterpret_cast<uintptr_t>(target.p)+(n-1)*8192,4096},
         {reinterpret_cast<uintptr_t>(target.p)+(n-1)*8192+4096,4096}},identities[n-1].id});
+  arm_metadata(cfg.devices[0].disk.path);
   auto read=layer.read_batch(reads,0);
+  capture_metadata=false;
   check(read.objects.size()==8 && read.metrics.payload_bytes==65536 &&
-        read.metrics.metadata_bytes>=8*4096 && read.metrics.payload_ns>0,"batched authoritative metadata and payload");
+        read.metrics.metadata_read_bytes==8*4096 && read.metrics.metadata_write_bytes==0 &&
+        read.metrics.payload_ns>0 && read.metrics.copy_bytes==0,"batched authoritative metadata and payload");
+  {
+   std::lock_guard lock(metadata_mutex);
+   check(metadata_requests.size()==1,"one actual NIXL metadata submission for eight allocation records");
+   std::vector<uint64_t> expected;for(auto &id:identities)expected.push_back(4096+id.record*4096);
+   std::sort(expected.begin(),expected.end());
+   check(record_spans(metadata_requests[0])==expected,"exact record spans; no enclosing gap reads or duplicates");
+  }
+  uint64_t object_metadata=0;for(auto &r:read.objects)object_metadata+=r.metrics.metadata_read_bytes;
+  check(object_metadata==read.metrics.metadata_read_bytes,"shared metadata counted once, not per object");
   for(auto &r:read.objects)check(r.status==Status::success && r.direct && r.metrics.copy_bytes==0,"batched status");
   for(size_t n=0;n<target.bytes;++n)check(static_cast<unsigned char*>(target.p)[n]==0x51,"scatter bytes");
   auto miss=layer.read(key(1),source.whole(),0,G3Deadline::max(),identities[0].id+100);
@@ -133,6 +172,61 @@ void startup_and_failures(Fixture &f) {
  fail_barrier=true;auto failure=failing.close(CloseMode::clean);fail_barrier=false;
  check(!failure.clean && failure.devices[0].status==Status::io_error,"clean barrier failure visible");
  std::cout<<"partial startup, strict topology, close failures PASS\n";
+}
+void batched_metadata_claims_and_failure(Fixture &f) {
+ auto cfg=f.config("batch-claims.bin",MemoryMode::explicit_registration);
+ auto &disk=cfg.devices[0].disk;disk.capacity_bytes=13*8192;
+ disk.unit_bytes=disk.min_object_bytes=disk.max_object_bytes=8192;
+ G3TransferLayer layer(cfg,f.context);Buffer source(8192),target(8*8192);
+ auto src=layer.register_memory(source.whole()),dst=layer.register_memory(target.whole());
+ std::vector<G3Read> reads;
+ for(unsigned n=1;n<=8;++n) {
+  std::memset(source.p,0x50+n,source.bytes);
+  auto put=layer.write(key(n),source.whole(),0);check(put.status==Status::success,"full eight-record fixture seed");
+  reads.push_back({key(n),{{reinterpret_cast<uintptr_t>(target.p)+(n-1)*8192,4096},
+     {reinterpret_cast<uintptr_t>(target.p)+(n-1)*8192+4096,4096}},put.identity.id});
+ }
+ arm_metadata(disk.path);entered_metadata=false;block_metadata=true;
+ auto pending=std::async(std::launch::async,[&]{return layer.read_batch(reads,0);});
+ auto until=std::chrono::steady_clock::now()+5s;
+ while(!entered_metadata && std::chrono::steady_clock::now()<until)std::this_thread::sleep_for(1ms);
+ if(!entered_metadata){block_metadata=false;pending.wait();throw std::runtime_error("batched metadata AIO hook missing");}
+ // Full-device pressure needs no SDK call: every eviction candidate was claimed
+ // before the currently blocked metadata submission.
+ auto pressure=layer.write(key(90),source.whole(),0);
+ auto retire=std::async(std::launch::async,[&]{return layer.deregister_memory(dst);});
+ const bool held=retire.wait_for(30ms)==std::future_status::timeout;
+ block_metadata=false;auto result=pending.get();auto retired=retire.get();capture_metadata=false;
+ check(pressure.status==Status::busy,"all eight metadata claims prevent eviction while I/O is pending");
+ check(held && retired==Status::success,"batched target registration retires only after quiescence");
+ check(result.metrics.metadata_read_bytes==32768 && result.metrics.payload_bytes==65536 &&
+       result.metrics.copy_bytes==0,"claimed direct batch completes with exact bytes and no receiver copy");
+ for(size_t n=0;n<target.bytes;++n)
+  check(static_cast<unsigned char*>(target.p)[n]==0x51+n/8192,"protected per-object immutable payload");
+ check(layer.write(key(90),source.whole(),0).status==Status::success,"claims released after terminal batch; reclamation resumes");
+ check(layer.deregister_memory(src)==Status::success,"source registration retirement");
+ layer.close(CloseMode::discard);
+
+ auto failure_cfg=f.config("batch-metadata-error.bin");G3TransferLayer failed(failure_cfg,f.context);
+ reads.clear();std::memset(target.p,0xcc,target.bytes);
+ for(unsigned n=1;n<=6;++n) {
+  auto put=failed.write(key(n),source.whole(),0);check(put.status==Status::success,"metadata failure seed");
+  reads.push_back({key(n),{{reinterpret_cast<uintptr_t>(target.p)+(n-1)*8192,8192}},put.identity.id});
+ }
+ reads.push_back({key(88),{{reinterpret_cast<uintptr_t>(target.p)+6*8192,8192}},0});
+ reads.push_back({key(1),{{reinterpret_cast<uintptr_t>(target.p)+7*8192,8192}},UINT64_MAX});
+ arm_metadata(failure_cfg.devices[0].disk.path);fail_metadata=true;
+ auto error=failed.read_batch(reads,0);fail_metadata=false;capture_metadata=false;
+ for(size_t n=0;n<6;++n)check(error.objects[n].status==Status::io_error,"shared metadata error fails participating objects");
+ check(error.objects[6].status==Status::not_found && error.objects[7].status==Status::not_found,
+       "shared metadata error preserves independent missing/stale outcomes");
+ check(error.metrics.metadata_read_ns>0 && error.metrics.metadata_read_bytes==0 &&
+       error.metrics.payload_bytes==0 && error.metrics.copy_bytes==0,"failed metadata request counts elapsed time but no completed bytes/payload/copy");
+ for(size_t n=0;n<target.bytes;++n)check(static_cast<unsigned char*>(target.p)[n]==0xcc,"metadata failure never publishes destination bytes");
+ {std::lock_guard lock(metadata_mutex);check(metadata_requests.size()==1 && record_spans(metadata_requests[0]).size()==6,
+    "one failed actual metadata submission for six eligible records");}
+ failed.close(CloseMode::discard);
+ std::cout<<"actual batched metadata claims, exact request geometry, quiescence and shared EIO PASS\n";
 }
 void registration_drain(Fixture &f) {
  auto cfg=f.config("drain.bin",MemoryMode::explicit_registration);
@@ -240,6 +334,16 @@ void bounded_async(Fixture &f) {
 }
 }
 extern "C" int io_submit(io_context_t context,long count,struct iocb **blocks) {
+ bool metadata=capture_metadata && count>0;
+ for(long n=0;n<count && metadata;++n)metadata=blocks[n]->aio_lio_opcode==IO_CMD_PREAD &&
+     blocks[n]->u.c.offset>=4096 && uint64_t(blocks[n]->u.c.offset)<payload_boundary;
+ if(metadata) {
+  MetadataRequest request;
+  for(long n=0;n<count;++n){request.offsets.push_back(blocks[n]->u.c.offset);request.bytes.push_back(blocks[n]->u.c.nbytes);}
+  {std::lock_guard lock(metadata_mutex);metadata_requests.push_back(std::move(request));}
+  if(block_metadata){entered_metadata=true;while(block_metadata)std::this_thread::sleep_for(1ms);}
+  if(fail_metadata)return -EIO;
+ }
  if(block_io){entered_io=true;while(block_io)std::this_thread::sleep_for(1ms);}
  const auto result=syscall(SYS_io_submit,context,count,blocks);
  return result<0?-errno:static_cast<int>(result);
@@ -255,11 +359,12 @@ int main() {
   explicit_and_padding(fixture);
   startup_and_failures(fixture);
   registration_drain(fixture);
+  batched_metadata_claims_and_failure(fixture);
   instance_identity_and_direction(fixture);
   async_registration_admission(fixture);
   bounded_async(fixture);
   return 0;
  } catch(const std::exception &e) {
-  block_io=false;std::cerr<<"G3 test: "<<e.what()<<"\n";return 1;
+  block_io=false;block_metadata=false;fail_metadata=false;std::cerr<<"G3 test: "<<e.what()<<"\n";return 1;
  }
 }

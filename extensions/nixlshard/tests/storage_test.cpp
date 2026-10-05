@@ -269,6 +269,148 @@ void marker_failures_namespace_and_unknown_media() {
         DiskIndex disk(f.reopen(), f.io(), f.barrier()); CHECK(!disk.exists("a"));
     }
 }
+void clean_close_batches_free_records_and_preserves_live() {
+    File f(4500); Allocation b, d;
+    {
+        DiskIndex disk(f.config, f.io(), f.barrier());
+        add(disk, "a"); b = add(disk, "b"); add(disk, "c"); d = add(disk, "d");
+        Allocation pinned; CHECK(disk.pin("b", pinned) == Status::success);
+        CHECK(disk.evict_one() == Status::success && disk.evict_one() == Status::success);
+        CHECK(disk.unpin(pinned) == Status::success);
+        const auto record_bytes = disk.metadata_record_bytes();
+        const auto records = disk.metadata_record_count();
+        const auto before_syncs = f.syncs.load();
+        std::vector<bool> written(records, false);
+        size_t transfers = 0, total_bytes = 0;
+        auto live_bytes = [&](const Allocation &a) {
+            std::vector<unsigned char> bytes(record_bytes);
+            CHECK(::pread(disk.fd(), bytes.data(), bytes.size(), disk.record_offset(a.record)) ==
+                  static_cast<ssize_t>(bytes.size()));
+            return bytes;
+        };
+        const auto before_b = live_bytes(b), before_d = live_bytes(d);
+        f.hook = [&](int, bool write, uint64_t offset, void *data, size_t bytes) {
+            if (!write) return Status::success;
+            if (!offset) {
+                CHECK(read64(static_cast<unsigned char *>(data), 112) == 0x434c45414e473302ULL);
+                CHECK(f.syncs == before_syncs + 1);
+                CHECK(total_bytes == (records - 2) * record_bytes);
+                return Status::success;
+            }
+            CHECK(offset >= disk.metadata_base() && offset + bytes <= disk.payload_base());
+            CHECK(bytes <= 1024 * 1024 && bytes % record_bytes == 0);
+            ++transfers; total_bytes += bytes;
+            const auto first = (offset - disk.metadata_base()) / record_bytes;
+            for (size_t n = 0; n < bytes / record_bytes; ++n) {
+                const auto at = first + n;
+                CHECK(at != b.record && at != d.record && !written.at(at));
+                written.at(at) = true;
+            }
+            return Status::success;
+        };
+        CHECK(disk.close(CloseMode::clean) == Status::success);
+        CHECK(transfers < 10 && f.syncs == before_syncs + 2);
+        CHECK(live_bytes(b) == before_b && live_bytes(d) == before_d);
+        for (size_t n = 0; n < records; ++n) CHECK(written[n] == (n != b.record && n != d.record));
+        f.hook = {};
+    }
+    DiskIndex restored(f.reopen(), f.io(), f.barrier());
+    CHECK(restored.snapshot_keys().size() == 2 && restored.exists("b") && restored.exists("d"));
+    Allocation read;
+    CHECK(restored.pin("b", read) == Status::success && read.id == b.id && read.slots == b.slots);
+    CHECK(restored.unpin(read) == Status::success);
+    CHECK(restored.pin("d", read) == Status::success && read.id == d.id && read.slots == d.slots);
+    CHECK(restored.unpin(read) == Status::success);
+}
+void clean_close_batch_failures_leave_dirty() {
+    for (bool fail_barrier : {false, true}) {
+        File f(16); bool interrupted = false, clean_written = false;
+        {
+            DiskIndex disk(f.config, f.io(), f.barrier()); add(disk, "live");
+            const auto before_syncs = f.syncs.load();
+            f.hook = [&](int fd, bool write, uint64_t offset, void *data, size_t bytes) {
+                if (!write) return Status::success;
+                if (!offset) clean_written = read64(static_cast<unsigned char *>(data), 112) == 0x434c45414e473302ULL;
+                else if (!fail_barrier) {
+                    CHECK(bytes > disk.metadata_record_bytes());
+                    CHECK(::pwrite(fd, data, disk.metadata_record_bytes(), offset) ==
+                          static_cast<ssize_t>(disk.metadata_record_bytes()));
+                    interrupted = true; return Status::io_error;
+                }
+                return Status::success;
+            };
+            if (fail_barrier) f.sync_hook = [&](int) { interrupted = true; return Status::io_error; };
+            CHECK(disk.close(CloseMode::clean) == Status::io_error);
+            CHECK(interrupted && !clean_written && disk.state() == DeviceState::failed);
+            CHECK(f.syncs == before_syncs + (fail_barrier ? 1 : 0));
+        }
+        f.hook = {}; f.sync_hook = {};
+        DiskIndex restored(f.reopen(), f.io(), f.barrier());
+        CHECK(restored.snapshot_keys().empty() && restored.free_records() == 16);
+    }
+}
+void pin_many_claims_mixed_identity_and_one_callback() {
+    File f(2); std::mutex mutex; std::condition_variable cv;
+    bool entered = false, proceed = false; size_t calls = 0, range_count = 0;
+    auto batch = [&](int fd, const std::vector<MetadataRead> &ranges) {
+        { std::unique_lock guard(mutex); ++calls; range_count = ranges.size();
+          entered = true; cv.notify_all(); cv.wait(guard, [&] { return proceed; }); }
+        auto io = f.io();
+        for (const auto &range : ranges) {
+            auto status = io(fd, false, range.offset, range.buffer, range.bytes);
+            if (status != Status::success) return status;
+        }
+        return Status::success;
+    };
+    Allocation a, b;
+    {
+    DiskIndex disk(f.config, f.io(), f.barrier(), {}, {}, {}, batch);
+    a = add(disk, "a"); b = add(disk, "b");
+    CHECK(disk.pin_many({}).empty());
+    expect_throw([&] { disk.pin_many(std::vector<PinQuery>(9)); });
+    std::vector<PinResult> result;
+    std::thread reader([&] { result = disk.pin_many({{"a", a.id}, {"absent"}, {"b", b.id}, {"a", a.id + 99}}); });
+    { std::unique_lock guard(mutex); CHECK(cv.wait_for(guard, std::chrono::seconds(2), [&] { return entered; })); }
+    CHECK(disk.evict_one() == Status::busy);
+    CHECK(disk.close(CloseMode::clean) == Status::busy);
+    { std::lock_guard guard(mutex); proceed = true; } cv.notify_all(); reader.join();
+    CHECK(calls == 1 && range_count == 2 && result.size() == 4);
+    CHECK(result[0].status == Status::success && result[0].allocation.id == a.id && result[0].allocation.slots == a.slots);
+    CHECK(result[2].status == Status::success && result[2].allocation.id == b.id && result[2].allocation.slots == b.slots);
+    CHECK(result[1].status == Status::not_found && result[3].status == Status::not_found);
+    CHECK(disk.unpin(result[0].allocation) == Status::success && disk.unpin(result[2].allocation) == Status::success);
+    CHECK(disk.close(CloseMode::clean) == Status::success);
+    }
+    DiskIndex restored(f.reopen(), f.io(), f.barrier());
+    auto scalar = restored.pin_many({{"b", b.id}, {"a", a.id}});
+    CHECK(scalar[0].status == Status::success && scalar[1].status == Status::success);
+    CHECK(restored.unpin(scalar[0].allocation) == Status::success && restored.unpin(scalar[1].allocation) == Status::success);
+}
+void pin_many_shared_failure_and_corruption_release_all_claims() {
+    for (int mode = 0; mode < 3; ++mode) {
+        File f(2); size_t calls = 0;
+        auto batch = [&](int fd, const std::vector<MetadataRead> &ranges) {
+            ++calls; CHECK(ranges.size() == 2);
+            auto io = f.io();
+            // A partial successful read still cannot publish any handle before
+            // the shared callback confirms completion of the complete request.
+            CHECK(io(fd, false, ranges[0].offset, ranges[0].buffer, ranges[0].bytes) == Status::success);
+            if (mode == 0) return Status::io_error;
+            if (mode == 1) throw std::runtime_error("injected quiescent callback exception");
+            CHECK(io(fd, false, ranges[1].offset, ranges[1].buffer, ranges[1].bytes) == Status::success);
+            static_cast<unsigned char *>(ranges[1].buffer)[0] ^= 1;
+            return Status::success;
+        };
+        DiskIndex disk(f.config, f.io(), f.barrier(), {}, {}, {}, batch);
+        auto a = add(disk, "a"), b = add(disk, "b");
+        auto results = disk.pin_many({{"a", a.id}, {"not-found"}, {"b", b.id}});
+        CHECK(calls == 1 && disk.state() == DeviceState::failed);
+        CHECK(results[0].status == Status::io_error && results[2].status == Status::io_error && results[1].status == Status::not_found);
+        CHECK(!results[0].allocation.id && !results[2].allocation.id);
+        CHECK(disk.unpin(a.id) == Status::invalid_input && disk.unpin(b.id) == Status::invalid_input);
+        CHECK(disk.close(CloseMode::discard) == Status::success);
+    }
+}
 void bounds_drain_and_descriptor_retirement() {
     File f; DiskIndex disk(f.config, f.io(), f.barrier()); Allocation a;
     CHECK(disk.reserve(std::string(33, 'x'), unit, a) == Status::invalid_input);
@@ -361,6 +503,10 @@ int main() {
         {"metadata claim before I/O", metadata_fetch_claim_blocks_reuse_and_close},
         {"metadata failures and validation", metadata_write_failure_and_record_validation},
         {"marker/namespace/media failures", marker_failures_namespace_and_unknown_media},
+        {"bounded CLEAN batches preserve LIVE records", clean_close_batches_free_records_and_preserves_live},
+        {"CLEAN batch failures retain DIRTY recovery", clean_close_batch_failures_leave_dirty},
+        {"pin_many claims, mixed identities and one callback", pin_many_claims_mixed_identity_and_one_callback},
+        {"pin_many shared failure and corruption release claims", pin_many_shared_failure_and_corruption_release_all_claims},
         {"bounds/drain/descriptor retirement", bounds_drain_and_descriptor_retirement},
         {"identity events and pluggable policy", identity_bound_events_and_policy},
         {"ordered events under concurrent replacement", ordered_events_during_concurrent_replacement},

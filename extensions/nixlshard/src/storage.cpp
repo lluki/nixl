@@ -105,6 +105,7 @@ struct DiskIndex::Impl {
     };
     DiskConfig config;
     MetadataIO io;
+    MetadataReadBatch read_batch;
     PersistenceBarrier barrier;
     DescriptorRetirement retire_descriptor;
     IndexEventSink sink;
@@ -125,8 +126,9 @@ struct DiskIndex::Impl {
     std::vector<uint64_t> free_payload, free_metadata;
 
     Impl(const DiskConfig &cfg, MetadataIO callback, PersistenceBarrier sync,
-         IndexEventSink events, std::shared_ptr<EvictionPolicy> eviction, DescriptorRetirement retirement)
-        : config(cfg), io(std::move(callback)), barrier(std::move(sync)),
+         IndexEventSink events, std::shared_ptr<EvictionPolicy> eviction, DescriptorRetirement retirement,
+         MetadataReadBatch batch)
+        : config(cfg), io(std::move(callback)), read_batch(std::move(batch)), barrier(std::move(sync)),
           retire_descriptor(std::move(retirement)), sink(std::move(events)), policy(std::move(eviction)) {
         if (!io) throw std::invalid_argument("G3 requires metadata transfer callback");
         if (!barrier) barrier = durable;
@@ -247,17 +249,17 @@ struct DiskIndex::Impl {
         }
         return Status::success;
     }
-    Status decode(uint64_t record, const Buffer &buffer, Allocation &out, bool restoring = false) {
-        const auto *data = buffer.data;
-        if (std::all_of(data, data + buffer.bytes, [](unsigned char c) { return c == 0; })) return Status::not_found;
+    Status decode_record(uint64_t record, const unsigned char *data, size_t record_size,
+                         Allocation &out, bool restoring = false) {
+        if (std::all_of(data, data + record_size, [](unsigned char c) { return c == 0; })) return Status::not_found;
         if (read64(data, 0) != record_magic || read64(data, 8) != version ||
-            read64(data, 16) != 1 || read64(data, buffer.bytes - 8) != digest(data, buffer.bytes - 8))
+            read64(data, 16) != 1 || read64(data, record_size - 8) != digest(data, record_size - 8))
             return Status::io_error;
         uint64_t id = read64(data, 24), bytes = read64(data, 32), key_size = read64(data, 40);
         uint64_t count = read64(data, 48);
         if (!id || (restoring && id >= next_id) || bytes < min_bytes || bytes > max_bytes ||
             !key_size || key_size > config.key_bytes || count != 1 + (bytes - 1) / config.unit_bytes ||
-            count > (buffer.bytes - fields - config.key_bytes - 8) / 8) return Status::io_error;
+            count > (record_size - fields - config.key_bytes - 8) / 8) return Status::io_error;
         Allocation allocation; allocation.id = id; allocation.generation = device_generation;
         allocation.record = record; allocation.bytes = static_cast<size_t>(bytes);
         allocation.key.assign(reinterpret_cast<const char *>(data + fields), static_cast<size_t>(key_size));
@@ -268,6 +270,9 @@ struct DiskIndex::Impl {
             allocation.slots.push_back(slot);
         }
         out = std::move(allocation); return Status::success;
+    }
+    Status decode(uint64_t record, const Buffer &buffer, Allocation &out, bool restoring = false) {
+        return decode_record(record, buffer.data, buffer.bytes, out, restoring);
     }
     Status read_allocation(const AllocationIdentity &identity, Allocation &out) {
         Buffer data(config.metadata_alignment, record_bytes);
@@ -385,8 +390,8 @@ struct DiskIndex::Impl {
 
 DiskIndex::DiskIndex(const DiskConfig &c, MetadataIO io, PersistenceBarrier barrier,
                      IndexEventSink sink, std::shared_ptr<EvictionPolicy> policy,
-                     DescriptorRetirement retirement)
-    : impl_(new Impl(c, std::move(io), std::move(barrier), std::move(sink), std::move(policy), std::move(retirement))) {}
+                     DescriptorRetirement retirement, MetadataReadBatch batch)
+    : impl_(new Impl(c, std::move(io), std::move(barrier), std::move(sink), std::move(policy), std::move(retirement), std::move(batch))) {}
 DiskIndex::~DiskIndex() = default;
 int DiskIndex::fd() const { return impl_->descriptor; }
 size_t DiskIndex::unit_bytes() const { return impl_->config.unit_bytes; }
@@ -510,6 +515,83 @@ Status DiskIndex::pin(const std::string &key, Allocation &out, uint64_t expected
     }
     return Status::success;
 }
+std::vector<PinResult> DiskIndex::pin_many(const std::vector<PinQuery> &queries) {
+    if (queries.size() > 8) throw std::invalid_argument("G3 metadata batch exceeds eight records");
+    std::vector<PinResult> results(queries.size());
+    std::vector<AllocationIdentity> identities(queries.size());
+    std::vector<size_t> claimed; claimed.reserve(queries.size());
+    auto release_claims = [&] {
+        for (auto n : claimed) unpin(identities[n].id);
+        claimed.clear();
+    };
+    try {
+        {
+            std::lock_guard policy_guard(impl_->policy_mutex);
+            std::lock_guard guard(impl_->mutex);
+            for (size_t n = 0; n < queries.size(); ++n) {
+                auto &result = results[n]; const auto &query = queries[n];
+                if (impl_->device_state == DeviceState::failed) { result.status = Status::io_error; continue; }
+                if (impl_->closing || impl_->device_state == DeviceState::offline || impl_->device_state == DeviceState::closed) {
+                    result.status = Status::not_ready; continue;
+                }
+                auto found = impl_->directory.find(query.key);
+                if (found == impl_->directory.end()) continue;
+                auto &entry = impl_->entries.at(found->second);
+                if (entry.state != Impl::Ownership::live || (query.expected_id && query.expected_id != entry.identity.id)) continue;
+                if (entry.claims == std::numeric_limits<size_t>::max()) { result.status = Status::busy; continue; }
+                identities[n] = entry.identity; // potentially throwing string copy precedes claim increment
+                claimed.push_back(n); ++entry.claims;
+                impl_->policy->on_block_read(entry.identity.id);
+                result.status = Status::success;
+            }
+        }
+        // Bound scratch to 128 MiB. Unusually large records use smaller chunks;
+        // all identities remain claimed until the complete operation is quiescent.
+        const size_t per_chunk = std::min<size_t>(8, std::max<size_t>(1, (128 * 1024 * 1024) / impl_->record_bytes));
+        for (size_t begin = 0; begin < claimed.size(); begin += per_chunk) {
+            const size_t count = std::min(per_chunk, claimed.size() - begin);
+            Buffer data(impl_->config.metadata_alignment, count * impl_->record_bytes);
+            std::vector<MetadataRead> ranges; ranges.reserve(count);
+            for (size_t k = 0; k < count; ++k) {
+                const auto n = claimed[begin + k];
+                ranges.push_back({impl_->offset(identities[n].record), data.data + k * impl_->record_bytes, impl_->record_bytes});
+            }
+            Status status = Status::success;
+            if (impl_->read_batch) {
+                try { status = impl_->read_batch(fd(), ranges); } catch (...) { status = Status::io_error; }
+            } else {
+                for (const auto &range : ranges) {
+                    try { status = impl_->io(fd(), false, range.offset, range.buffer, range.bytes); }
+                    catch (...) { status = Status::io_error; }
+                    if (status != Status::success) break;
+                }
+            }
+            if (status != Status::success) {
+                for (auto n : claimed) { results[n].status = status; results[n].allocation = {}; }
+                release_claims(); impl_->fail(); return results;
+            }
+            for (size_t k = 0; k < count; ++k) {
+                const auto n = claimed[begin + k]; const auto &id = identities[n];
+                auto &allocation = results[n].allocation;
+                status = impl_->decode_record(id.record, data.data + k * impl_->record_bytes, impl_->record_bytes, allocation);
+                if (status == Status::success && (allocation.id != id.id || allocation.key != id.key)) status = Status::io_error;
+                if (status == Status::success) {
+                    std::lock_guard guard(impl_->mutex);
+                    for (auto slot : allocation.slots)
+                        if (impl_->slots[slot].owner != id.id || impl_->slots[slot].state != Impl::Ownership::live) status = Status::io_error;
+                }
+                if (status != Status::success) {
+                    for (auto m : claimed) { results[m].status = Status::io_error; results[m].allocation = {}; }
+                    release_claims(); impl_->fail(); return results;
+                }
+            }
+        }
+        claimed.clear(); // successful results now own the claims through payload completion
+        return results;
+    } catch (...) {
+        release_claims(); throw;
+    }
+}
 Status DiskIndex::unpin(const Allocation &a) {
     if (a.generation != generation()) return Status::not_found;
     return unpin(a.id);
@@ -620,14 +702,20 @@ Status DiskIndex::close(CloseMode mode) {
     }
     if (mode == CloseMode::clean) {
         // With admissions stopped and no claims/reservations, finalize every FREE
-        // record. Payload/records are flushed before the clean marker is written.
-        for (size_t i = 0; i < impl_->record_count; ++i) {
-            if (!impl_->records[i].owner) {
-                Buffer invalid(impl_->config.metadata_alignment, impl_->record_bytes);
-                if (impl_->transfer(true, record_offset(i), invalid) != Status::success) {
-                    impl_->fail(); return Status::io_error;
-                }
+        // record. Bound each contiguous FREE run to 1 MiB, or one record when
+        // the configured record itself is larger. Never cross a LIVE record.
+        // Payload/records are flushed before the clean marker is written.
+        const size_t max_records = std::max<size_t>(1, (1024 * 1024) / impl_->record_bytes);
+        for (size_t i = 0; i < impl_->record_count;) {
+            if (impl_->records[i].owner) { ++i; continue; }
+            size_t count = 1;
+            while (count < max_records && i + count < impl_->record_count &&
+                   !impl_->records[i + count].owner) ++count;
+            Buffer invalid(impl_->config.metadata_alignment, count * impl_->record_bytes);
+            if (impl_->transfer(true, record_offset(i), invalid) != Status::success) {
+                impl_->fail(); return Status::io_error;
             }
+            i += count;
         }
         if (impl_->sync() != Status::success || impl_->write_header(true) != Status::success || impl_->sync() != Status::success) {
             impl_->fail(); return Status::io_error;
