@@ -28,6 +28,7 @@
 
 #include <optional>
 #include <string.h>
+#include <sys/mman.h>
 #include "absl/strings/str_split.h"
 
 namespace {
@@ -117,6 +118,16 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params, size_t nu
     auto &worker = workers_.front();
     workerAddr = worker->epAddr();
     worker->regAmCallback(nixl::ucx::am_cb_op_t::NOTIF_STR, notifAmCb, this);
+
+    // POC mem pool for notifications: allocated + registered once.
+    void *pool = mmap(nullptr, notifPoolSize_, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pool != MAP_FAILED) {
+        notifPool_ = pool;
+        if (uc->memReg(notifPool_, notifPoolSize_, notifPoolMem_, DRAM_SEG) == 0) {
+            notifPoolRegistered_ = true;
+        }
+    }
 }
 
 nixl_mem_list_t nixlUcxEngine::getSupportedMems () const {
@@ -135,6 +146,12 @@ tlsSharedWorkerMap() {
 // Through parent destructor the unregister will be called.
 nixlUcxEngine::~nixlUcxEngine() {
     tlsSharedWorkerMap().erase(this);
+    if (notifPoolRegistered_) {
+        uc->memDereg(notifPoolMem_);
+    }
+    if (notifPool_ != nullptr) {
+        munmap(notifPool_, notifPoolSize_);
+    }
 }
 
 /****************************************
@@ -702,6 +719,39 @@ nixlUcxEngine::notifSendPriv(const std::string &remote_agent,
                              const std::string &msg,
                              const nixlUcxEp &ep,
                              nixlUcxReq *req) const {
+    if (notifPoolRegistered_) {
+        const size_t slot = notifNextSlot_.fetch_add(1) % notifSlots_;
+        if (!notifSlotBusy_[slot].exchange(true)) {
+            nixlSerDes ser_des;
+            ser_des.addStr("name", localAgent);
+            ser_des.addStr("msg", msg);
+            const std::string data = ser_des.exportStr();
+            if (data.size() <= notifSlotSize_) {
+                char *buf = static_cast<char *>(notifPool_) + slot * notifSlotSize_;
+                memcpy(buf, data.data(), data.size());
+                auto cleanup = [this, slot, req](void *completed_request, void *) {
+                    notifSlotBusy_[slot].store(false);
+                    if ((req == nullptr) && (completed_request != nullptr)) {
+                        ucp_request_free(completed_request);
+                    }
+                };
+                const nixl_status_t st = ep.sendAm(nixl::ucx::am_cb_op_t::NOTIF_STR,
+                                                   nullptr,
+                                                   0,
+                                                   buf,
+                                                   data.size(),
+                                                   UCP_AM_SEND_FLAG_EAGER,
+                                                   req,
+                                                   std::move(cleanup),
+                                                   notifPoolMem_.getMemh());
+                if (st != NIXL_IN_PROG && st != NIXL_SUCCESS) {
+                    notifSlotBusy_[slot].store(false);
+                }
+                return st;
+            }
+            notifSlotBusy_[slot].store(false);
+        }
+    }
     return sendNotif(buildNotif(msg), ep, req);
 }
 

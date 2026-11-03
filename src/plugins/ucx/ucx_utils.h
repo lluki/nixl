@@ -85,7 +85,8 @@ public:
            size_t len,
            uint32_t flags,
            nixlUcxReq *req = nullptr,
-           am_cleanup_t &&cleanup = nullptr) const;
+           am_cleanup_t &&cleanup = nullptr,
+           ucp_mem_h memh = nullptr) const;
 
     /* Data access */
     [[nodiscard]] nixl_status_t

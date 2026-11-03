@@ -223,7 +223,8 @@ nixlUcxEp::sendAm(nixl::ucx::am_cb_op_t msg_id,
                   size_t len,
                   uint32_t flags,
                   nixlUcxReq *req,
-                  am_cleanup_t &&cleanup) const {
+                  am_cleanup_t &&cleanup,
+                  ucp_mem_h memh) const {
     const nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         // The endpoint is already in a failed state (e.g. the peer disconnected),
@@ -239,6 +240,10 @@ nixlUcxEp::sendAm(nixl::ucx::am_cb_op_t msg_id,
     param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS | UCP_OP_ATTR_FIELD_MEMORY_TYPE;
     param.flags = flags;
     param.memory_type = UCS_MEMORY_TYPE_HOST;
+    if (memh != nullptr) {
+        param.op_attr_mask |= UCP_OP_ATTR_FIELD_MEMH;
+        param.memh = memh;
+    }
 
     nixl_ucx_am_cb_ctx_ptr_t ctx;
     if (cleanup) {

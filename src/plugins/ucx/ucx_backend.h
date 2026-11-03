@@ -22,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <poll.h>
 #include <optional>
@@ -266,6 +267,18 @@ private:
                   const std::string &msg,
                   const nixlUcxEp &ep,
                   nixlUcxReq *req = nullptr) const;
+
+    // POC: single pre-registered notification buffer (anonymous mmap + ucp_mem_map).
+    // Split into slots used round-robin; a slot is busy until its send completes. If the next slot
+    // is still busy (or the message does not fit) we fall back to the heap path.
+    static constexpr size_t notifSlotSize_ = 4 * 1024;
+    static constexpr size_t notifSlots_ = 16;
+    static constexpr size_t notifPoolSize_ = notifSlotSize_ * notifSlots_;
+    mutable std::atomic<size_t> notifNextSlot_{0};
+    void *notifPool_ = nullptr;
+    nixlUcxMem notifPoolMem_{};
+    bool notifPoolRegistered_ = false;
+    mutable std::array<std::atomic<bool>, notifSlots_> notifSlotBusy_{};
 
     ucx_connection_ptr_t
     getConnection(const std::string &remote_agent) const;
