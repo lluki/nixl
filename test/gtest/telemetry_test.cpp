@@ -1081,7 +1081,7 @@ TEST_F(telemetryXferTest, ReleaseDoesNotPollSoReleasedSubmittedTransferIsNotCoun
     EXPECT_EQ(agent_->postXferReq(abandoned), NIXL_IN_PROG);
     EXPECT_EQ(agent_->getXferStatus(completed), NIXL_SUCCESS);
     EXPECT_EQ(agent_->releaseXferReq(completed), NIXL_SUCCESS);
-    EXPECT_EQ(agent_->releaseXferReq(abandoned), NIXL_SUCCESS);
+    EXPECT_EQ(agent_->releaseXferReq(abandoned), NIXL_ERR_NOT_ALLOWED);
 
     const auto events = flushedEvents();
     EXPECT_EQ(finishes(events), 1);

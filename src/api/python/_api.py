@@ -91,8 +91,9 @@ class nixl_xfer_handle:
     Use release() to explicitly free resources. release() only frees the request, it never
     cancels or waits, and calling it more than once is a no-op. It must only be used on a request
     that was not posted yet, or whose state was polled to a terminal status (anything but "PROC").
-    Releasing a request that is still in progress is a client error: NIXL logs an error and leaks
-    the backend resources. To abandon an active transfer, call nixl_agent.cancel_xfer_handle(),
+    Releasing a request that is still in progress is a client error: NIXL logs an error, leaks
+    the request and release() raises (the handle is then marked released and queued for
+    re-release at agent destruction). To abandon an active transfer, call nixl_agent.cancel_xfer_handle(),
     poll check_xfer_state() until it is no longer "PROC", then release.
     __del__ calls release() and if it fails, it logs the failure and defers release by queuing
     the handle in leaked xfer handles list, which will be re-released during agent destruction

@@ -75,40 +75,43 @@ public:
         return status == NIXL_IN_PROG;
     }
 
-    // Must not throw, poll or block. If the request is still submitted the backend handle is
-    // deliberately leaked: the backend may still use it, so freeing it would risk a use-after-free.
-    // Returns false in that case.
-    bool
+    // Logs the client error for releasing a request that is still submitted.
+    void
+    logReleaseWhileSubmitted() const noexcept {
+        NIXL_ERROR << "\n"
+                      "################################################################\n"
+                      "# NIXL CLIENT ERROR: transfer request released while still in progress\n"
+                      "# (submitted state, backend '"
+                   << (engine ? engine->getType() : std::string("?"))
+                   << "').\n"
+                      "# The backend request handle is LEAKED and the user buffers may still\n"
+                      "# be read or overwritten by the transfer. Call cancelXferReq() if the\n"
+                      "# transfer has to be abandoned, and poll getXferStatus() until it is\n"
+                      "# not NIXL_IN_PROG before releasing the request.\n"
+                      "################################################################";
+    }
+
+    // Must not throw, poll or block. Only called from the destructor and for requests that are
+    // not submitted; a submitted request has its backend handle leaked on purpose (the backend
+    // may still use it, so freeing it would risk a use-after-free).
+    void
     releaseBackendHandle() noexcept {
-        if (engine == nullptr) {
-            return true;
+        if (engine == nullptr || backendHandle == nullptr) {
+            return;
         }
         if (isSubmitted()) {
-            NIXL_ERROR << "\n"
-                          "################################################################\n"
-                          "# NIXL CLIENT ERROR: transfer request released while still in progress"
-                          " (submitted state, backend '"
-                       << engine->getType()
-                       << "').\n"
-                          "# The backend request handle is LEAKED and the user buffers may still\n"
-                          "# be read or overwritten by the transfer. Call cancelXferReq() if the\n"
-                          "# transfer has to be abandoned, and poll getXferStatus() until it is\n"
-                          "# not NIXL_IN_PROG before releasing the request.\n"
-                          "################################################################";
+            logReleaseWhileSubmitted();
             backendHandle = nullptr; // leaked on purpose, never touched again
-            return false;
+            return;
         }
-        if (backendHandle != nullptr) {
-            try {
-                engine->releaseReqH(backendHandle);
-            }
-            catch (...) {
-                NIXL_ERROR << "backend '" << engine->getType()
-                           << "' threw while releasing a transfer request handle";
-            }
-            backendHandle = nullptr; // never release the handle a second time
+        try {
+            engine->releaseReqH(backendHandle);
         }
-        return true;
+        catch (...) {
+            NIXL_ERROR << "backend '" << engine->getType()
+                       << "' threw while releasing a transfer request handle";
+        }
+        backendHandle = nullptr; // never release the handle a second time
     }
 
     ~nixlXferReqH() {
@@ -162,7 +165,7 @@ private:
     const nixl_xfer_op_t backendOp;
     nixl_status_t status = NIXL_ERR_NOT_POSTED;
     // True once cancelXferReq() succeeded for the current submission; reset on every post.
-    bool cancelRequested = false;
+    std::atomic<bool> cancelRequested = false;
 
     nixl_xfer_telem_t telemetry;
     nixlTime::nixlDuration timer;

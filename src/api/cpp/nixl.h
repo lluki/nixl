@@ -408,6 +408,9 @@ class nixlAgent {
          *                       NIXL_ERR_NOT_ALLOWED if the request is not in the submitted state,
          *                       NIXL_ERR_NOT_SUPPORTED if the backend cannot cancel transfers,
          *                       NIXL_ERR_INVALID_PARAM for a null handle, or a backend error.
+         *
+         *         Thread safety: calls on the same handle must be externally serialized, as for
+         *         postXferReq() and getXferStatus().
          */
         nixl_status_t
         cancelXferReq(nixlXferReqH *req_hndl) const;
@@ -420,14 +423,22 @@ class nixlAgent {
          *         NIXL_IN_PROG, then release.
          *
          *         Releasing a submitted request is a client error: a prominent error is logged,
-         *         the backend request handle is deliberately leaked (the backend may still use
-         *         it, and the transfer may still access the user buffers), and the request is
-         *         freed on the agent side. NIXL_SUCCESS is still returned. Releasing an already
-         *         released handle is undefined behavior.
+         *         the whole request (backend handle and agent-side descriptors, which the backend
+         *         may still reference) is deliberately leaked and NOT freed, since the transfer
+         *         may still access it and the user buffers. NIXL_ERR_NOT_ALLOWED is returned and
+         *         the handle stays valid; once getXferStatus() reports a terminal status a later
+         *         release succeeds, but do not rely on this. If a request object is destroyed
+         *         implicitly while submitted (nixlXferReqH destructor, e.g. agent teardown), the
+         *         backend handle is leaked the same way. Releasing an already released handle is
+         *         undefined behavior.
+         *         Note: a getXferStatus() that fails with NIXL_ERR_NOT_FOUND because the remote
+         *         agent was invalidated or re-registered does not change the request state; the
+         *         request stays submitted, and the backend transfer may still be running.
          *
          * @param  req_hndl      Transfer request handle to be released
-         * @return nixl_status_t NIXL_SUCCESS once the handle is freed, or an error code
-         *                       (NIXL_ERR_INVALID_PARAM) for a null handle
+         * @return nixl_status_t NIXL_SUCCESS once the handle is freed,
+         *                       NIXL_ERR_NOT_ALLOWED if the request is still submitted (logged,
+         *                       leaked), NIXL_ERR_INVALID_PARAM for a null handle
          */
         nixl_status_t
         releaseXferReq (nixlXferReqH* req_hndl) const;

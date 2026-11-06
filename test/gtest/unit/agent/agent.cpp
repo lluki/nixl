@@ -552,7 +552,7 @@ namespace agent {
         ASSERT_EQ(agent_helper_->createSelfXferReq(setup_, req), NIXL_SUCCESS);
 
         EXPECT_EQ(agent->postXferReq(req), NIXL_IN_PROG);
-        EXPECT_EQ(agent->releaseXferReq(req), NIXL_SUCCESS);
+        EXPECT_EQ(agent->releaseXferReq(req), NIXL_ERR_NOT_ALLOWED);
         EXPECT_TRUE(completionMarks().empty());
     }
 
@@ -768,7 +768,7 @@ namespace agent {
         EXPECT_THAT(records("nixl::releaseXferReq"), testing::ElementsAre(release));
     }
 
-    TEST_F(recorderTracingAgentFixture, ReleaseOfSubmittedRecordsAClientErrorWithoutPolling) {
+    TEST_F(recorderTracingAgentFixture, ReleaseOfSubmittedIsRejectedWithoutPolling) {
         nixlAgent *agent = agent_helper_->getAgent();
         const auto &engine = agent_helper_->getGMockEngine();
         EXPECT_CALL(engine, postXfer).WillOnce(testing::Return(NIXL_IN_PROG));
@@ -776,11 +776,12 @@ namespace agent {
         EXPECT_CALL(engine, releaseReqH).Times(0);
         nixlXferReqH *req = nullptr;
         ASSERT_EQ(agent_helper_->createSelfXferReq(setup_, req), NIXL_SUCCESS);
-        const auto cancel = testing::AllOf(postedAs(req, 1), withStatus(NIXL_ERR_CANCELED));
+        const auto rejected = testing::AllOf(postedAs(req, 1), withStatus(NIXL_ERR_NOT_ALLOWED));
 
         EXPECT_EQ(agent->postXferReq(req), NIXL_IN_PROG);
-        EXPECT_EQ(agent->releaseXferReq(req), NIXL_SUCCESS);
-        EXPECT_THAT(records("nixl::xfer.error"), testing::ElementsAre(cancel));
+        EXPECT_EQ(agent->releaseXferReq(req), NIXL_ERR_NOT_ALLOWED);
+        EXPECT_THAT(records("nixl::releaseXferReq"), testing::ElementsAre(rejected));
+        EXPECT_THAT(records("nixl::xfer.error"), testing::IsEmpty());
         EXPECT_TRUE(completionMarks().empty());
     }
 
@@ -1584,16 +1585,21 @@ namespace agent {
         createXfer(x);
         auto &engine = local_agent_helper_->getGMockEngine();
         EXPECT_CALL(engine, postXfer).WillOnce(testing::Return(NIXL_IN_PROG));
-        EXPECT_CALL(engine, checkXfer).Times(0);
+        EXPECT_CALL(engine, checkXfer).WillOnce(testing::Return(NIXL_SUCCESS));
         EXPECT_CALL(engine, cancelXfer).Times(0);
-        EXPECT_CALL(engine, releaseReqH).Times(0);
+        EXPECT_CALL(engine, releaseReqH).Times(1);
 
         EXPECT_EQ(local_agent_->postXferReq(x.req), NIXL_IN_PROG);
         testing::internal::CaptureStderr();
-        EXPECT_EQ(local_agent_->releaseXferReq(x.req), NIXL_SUCCESS);
+        // Nothing is polled, cancelled or released, and the request object is not freed.
+        EXPECT_EQ(local_agent_->releaseXferReq(x.req), NIXL_ERR_NOT_ALLOWED);
         const std::string log = testing::internal::GetCapturedStderr();
         EXPECT_THAT(log, testing::HasSubstr("NIXL CLIENT ERROR"));
         EXPECT_THAT(log, testing::HasSubstr("LEAKED"));
+
+        // The leaked request is still alive: once terminal it can be released cleanly.
+        EXPECT_EQ(local_agent_->getXferStatus(x.req), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->releaseXferReq(x.req), NIXL_SUCCESS);
     }
 
     TEST_F(dualAgentBridgeFixture, ReleaseAfterRepostLeavesTerminalStateReleasable) {

@@ -1581,11 +1581,16 @@ nixlAgent::releaseXferReq(nixlXferReqH *req_hndl) const {
         trace_span, "nixl.xfer_execution", static_cast<std::int64_t>(req_hndl->traceExecution()));
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
-    // No polling and no cancellation here. In the submitted state the backend handle is leaked
-    // (see nixlXferReqH::releaseBackendHandle), which is a client error that gets logged.
-    // The agent-side request object is freed in any case, so the handle must not be used again.
+    // No polling and no cancellation here.
     if (req_hndl->isSubmitted()) {
-        traceXferError(data->tracer_.get(), *req_hndl, NIXL_ERR_CANCELED);
+        // Client error. The whole request object, including the descriptor lists the backend
+        // handle may still reference, is leaked on purpose (not freed) so that nothing the
+        // backend might still touch becomes dangling. The handle stays valid and could still
+        // be polled; once it reached a terminal status a later release succeeds.
+        req_hndl->logReleaseWhileSubmitted();
+        data->addErrorTelemetry(NIXL_ERR_NOT_ALLOWED);
+        NIXL_TRACE_ATTR(trace_span, "nixl.status", static_cast<std::int64_t>(NIXL_ERR_NOT_ALLOWED));
+        return NIXL_ERR_NOT_ALLOWED;
     }
     req_hndl->releaseBackendHandle();
     NIXL_TRACE_ATTR(trace_span, "nixl.status", static_cast<std::int64_t>(NIXL_SUCCESS));
@@ -1604,6 +1609,11 @@ nixlAgent::cancelXferReq(nixlXferReqH *req_hndl) const {
     if (!req_hndl->isSubmitted()) {
         NIXL_ERROR_FUNC << "only a submitted (in progress) transfer request can be canceled";
         return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    if (req_hndl->engine == nullptr || req_hndl->backendHandle == nullptr) {
+        NIXL_ERROR_FUNC << "invalid request handle: no backend handle";
+        return NIXL_ERR_INVALID_PARAM;
     }
 
     if (req_hndl->cancelRequested) {
