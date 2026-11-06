@@ -172,6 +172,11 @@ class nixlBackendH {
             return engine->supportsNotif();
         }
 
+        bool
+        supportsXferCancel() const {
+            return engine->supportsXferCancel();
+        }
+
     friend class nixlAgentData;
     friend class nixlAgent;
 };

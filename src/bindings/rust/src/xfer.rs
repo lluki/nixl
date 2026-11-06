@@ -120,6 +120,9 @@ unsafe impl Send for XferRequest {}
 // SAFETY: XferRequest can be shared between threads safely
 unsafe impl Sync for XferRequest {}
 
+// Release is only exposed through Drop. The request must be in the created or terminal state;
+// dropping one that is still in progress logs an error in NIXL and leaks the backend handle (use
+// `Agent::cancel_xfer_req` and poll `Agent::get_xfer_status` before dropping to abort a transfer).
 impl Drop for XferRequest {
     fn drop(&mut self) {
         unsafe {

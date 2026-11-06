@@ -918,6 +918,14 @@ PYBIND11_MODULE(_bindings, m) {
                  throw_nixl_exception(agent.queryXferBackend((nixlXferReqH *)reqh, backend));
                  return (uintptr_t)backend;
              })
+        .def(
+            "cancelXferReq",
+            [](nixlAgent &agent, uintptr_t reqh) -> nixl_status_t {
+                nixl_status_t ret = agent.cancelXferReq((nixlXferReqH *)reqh);
+                throw_nixl_exception(ret);
+                return ret;
+            },
+            py::arg("reqh"))
         .def("releaseXferReq",
              [](nixlAgent &agent, uintptr_t reqh) -> nixl_status_t {
                  nixl_status_t ret = agent.releaseXferReq((nixlXferReqH *)reqh);

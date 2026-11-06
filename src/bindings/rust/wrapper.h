@@ -34,6 +34,8 @@ typedef enum {
     NIXL_CAPI_IN_PROG = 1,
     NIXL_CAPI_ERROR_NO_TELEMETRY = -5,
     NIXL_CAPI_ERROR_NOT_FOUND = -6, ///< Agent metadata not loaded, or no backend serves the request
+    NIXL_CAPI_ERROR_NOT_ALLOWED = -7, ///< Operation not valid in the current request state
+    NIXL_CAPI_ERROR_NOT_SUPPORTED = -8, ///< The backend does not support the operation
 } nixl_capi_status_t;
 
 // Memory types enum (matching nixl's memory types)
@@ -315,6 +317,20 @@ nixl_capi_query_xfer_backend(nixl_capi_agent_t agent,
                              nixl_capi_xfer_req_t req_hndl,
                              nixl_capi_backend_t *backend);
 
+/**
+ * Asynchronously request cancellation of a submitted transfer request. Nothing is freed; keep
+ * polling nixl_capi_get_xfer_status() until it is not NIXL_CAPI_IN_PROG.
+ * Returns NIXL_CAPI_SUCCESS (initiated), NIXL_CAPI_IN_PROG (already requested),
+ * NIXL_CAPI_ERROR_NOT_ALLOWED (request not submitted), NIXL_CAPI_ERROR_NOT_SUPPORTED (backend
+ * cannot cancel) or another error.
+ */
+nixl_capi_status_t
+nixl_capi_cancel_xfer_req(nixl_capi_agent_t agent, nixl_capi_xfer_req_t req);
+
+/**
+ * Frees the request. Must only be used on a request that was not posted or reached a terminal
+ * status; releasing an in-progress request logs an error and leaks the backend handle.
+ */
 nixl_capi_status_t nixl_capi_release_xfer_req(nixl_capi_agent_t agent, nixl_capi_xfer_req_t req);
 
 nixl_capi_status_t nixl_capi_destroy_xfer_req(nixl_capi_xfer_req_t req);

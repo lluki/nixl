@@ -346,7 +346,9 @@ class nixlAgent {
                      const nixl_opt_args_t* extra_params = nullptr) const;
 
         /**
-         * @brief  Check the status of transfer request `req_hndl`
+         * @brief  Check the status of transfer request `req_hndl`. A request stays submitted
+         *         until this returns NIXL_SUCCESS or a negative terminal status, also after
+         *         cancelXferReq(); only then are the buffers owned by the caller again.
          *
          * @param  req_hndl      Transfer request handle after postXferReq
          * @return nixl_status_t NIXL_IN_PROG or error code if call was not successful
@@ -389,11 +391,43 @@ class nixlAgent {
                           nixlBackendH* &backend) const;
 
         /**
-         * @brief  Release the transfer request `req_hndl`. If the transfer is active,
-         *         it will be canceled, or return an error if the transfer cannot be aborted.
+         * @brief  Asynchronously request cancellation of the submitted transfer request
+         *         `req_hndl`. Nothing is freed and buffer ownership does not change: the request
+         *         stays submitted until getXferStatus() returns a terminal status (success if the
+         *         transfer won the race, otherwise an error such as NIXL_ERR_CANCELED). The caller
+         *         must keep polling getXferStatus() and may only reuse the buffers, or call
+         *         releaseXferReq(), after that. The return value says nothing about buffer safety.
+         *
+         *         Request states: created (createXferReq/makeXferReq done, not posted), submitted
+         *         (postXferReq returned NIXL_IN_PROG and getXferStatus() has not yet returned a
+         *         terminal status), terminal (success or an error reported and not reposted).
+         *
+         * @param  req_hndl      Transfer request handle
+         * @return nixl_status_t NIXL_SUCCESS if cancellation was initiated,
+         *                       NIXL_IN_PROG if cancellation was already requested,
+         *                       NIXL_ERR_NOT_ALLOWED if the request is not in the submitted state,
+         *                       NIXL_ERR_NOT_SUPPORTED if the backend cannot cancel transfers,
+         *                       NIXL_ERR_INVALID_PARAM for a null handle, or a backend error.
+         */
+        nixl_status_t
+        cancelXferReq(nixlXferReqH *req_hndl) const;
+
+        /**
+         * @brief  Release the transfer request `req_hndl`. This only frees resources; it does
+         *         not cancel, poll or wait, never blocks, and is O(1). It must only be called for
+         *         a request in the created or terminal state (see cancelXferReq()). To abandon
+         *         an active transfer call cancelXferReq(), poll getXferStatus() until it is not
+         *         NIXL_IN_PROG, then release.
+         *
+         *         Releasing a submitted request is a client error: a prominent error is logged,
+         *         the backend request handle is deliberately leaked (the backend may still use
+         *         it, and the transfer may still access the user buffers), and the request is
+         *         freed on the agent side. NIXL_SUCCESS is still returned. Releasing an already
+         *         released handle is undefined behavior.
          *
          * @param  req_hndl      Transfer request handle to be released
-         * @return nixl_status_t Error code if call was not successful
+         * @return nixl_status_t NIXL_SUCCESS once the handle is freed, or an error code
+         *                       (NIXL_ERR_INVALID_PARAM) for a null handle
          */
         nixl_status_t
         releaseXferReq (nixlXferReqH* req_hndl) const;

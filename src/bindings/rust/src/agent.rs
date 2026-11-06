@@ -1100,6 +1100,42 @@ impl Agent {
         }
     }
 
+    /// Asynchronously requests cancellation of a posted (in progress) transfer request.
+    ///
+    /// Nothing is freed and the buffers stay owned by the transfer: keep polling
+    /// [`Agent::get_xfer_status`] until it no longer reports `InProgress` (an error indicates
+    /// the cancellation took effect, success that the transfer finished first). Dropping an
+    /// `XferRequest` that is still in progress is a client error: NIXL logs an error and leaks
+    /// the backend resources.
+    ///
+    /// Returns `Ok(true)` if the cancellation was initiated and `Ok(false)` if it was already
+    /// requested.
+    ///
+    /// # Errors
+    /// * `NotAllowed` - The request is not in progress
+    /// * `NotSupported` - The backend does not support cancelling transfers
+    pub fn cancel_xfer_req(&self, req: &XferRequest) -> Result<bool, NixlError> {
+        let status = unsafe {
+            bindings::nixl_capi_cancel_xfer_req(
+                self.inner.write().unwrap().handle.as_ptr(),
+                req.handle(),
+            )
+        };
+
+        match status {
+            NIXL_CAPI_SUCCESS => Ok(true),
+            NIXL_CAPI_IN_PROG => Ok(false),
+            NIXL_CAPI_ERROR_INVALID_PARAM => Err(NixlError::InvalidParam),
+            s if s == bindings::nixl_capi_status_t_NIXL_CAPI_ERROR_NOT_ALLOWED => {
+                Err(NixlError::NotAllowed)
+            }
+            s if s == bindings::nixl_capi_status_t_NIXL_CAPI_ERROR_NOT_SUPPORTED => {
+                Err(NixlError::NotSupported)
+            }
+            _ => Err(NixlError::BackendError),
+        }
+    }
+
     /// Queries the backend for a transfer request
     ///
     /// # Arguments

@@ -938,3 +938,59 @@ def test_leaked_xfer_handle_is_queued_on_the_agent(one_empty_agent, monkeypatch)
         # 0xDEAD is not a real request, so the agent's destructor must not
         # hand it to the native release once the real agent is back.
         one_empty_agent._leaked_xfer_handles.clear()
+
+
+def test_release_xfer_handle_has_double_call_protection(one_empty_agent, monkeypatch):
+    """Releasing twice (explicitly or via __del__) must reach the native release once."""
+
+    class CountingNative:
+        released = []
+
+        def createXferReq(self, *args):
+            return 0xBEEF
+
+        def releaseXferReq(self, handle):
+            self.released.append(handle)
+
+    native = CountingNative()
+    monkeypatch.setattr(one_empty_agent, "agent", native)
+    handle = one_empty_agent.initialize_xfer("WRITE", None, None, "peer")
+    one_empty_agent.release_xfer_handle(handle)
+    one_empty_agent.release_xfer_handle(handle)
+    del handle
+    gc.collect()
+
+    assert native.released == [0xBEEF]
+
+
+def test_cancel_xfer_handle_reports_whether_cancellation_was_initiated(
+    one_empty_agent, monkeypatch
+):
+    class CancelNative:
+        statuses = [bindings.NIXL_SUCCESS, bindings.NIXL_IN_PROG]
+
+        def createXferReq(self, *args):
+            return 0xCAFE
+
+        def cancelXferReq(self, handle):
+            assert handle == 0xCAFE
+            return self.statuses.pop(0)
+
+        def releaseXferReq(self, handle):
+            pass
+
+    monkeypatch.setattr(one_empty_agent, "agent", CancelNative())
+    handle = one_empty_agent.initialize_xfer("WRITE", None, None, "peer")
+
+    assert one_empty_agent.cancel_xfer_handle(handle) is True
+    assert one_empty_agent.cancel_xfer_handle(handle) is False
+
+
+def test_cancel_xfer_handle_of_finished_transfer_is_rejected(backend_name):
+    """Cancel is only valid on a submitted transfer; a polled-to-done one is terminal."""
+    with _xfer_handle(backend_name) as (agent, handle):
+        with pytest.raises(bindings.nixlNotAllowedError):
+            agent.cancel_xfer_handle(handle)  # created, not posted yet
+        _post_to_done(agent, handle)
+        with pytest.raises(bindings.nixlNotAllowedError):
+            agent.cancel_xfer_handle(handle)  # terminal

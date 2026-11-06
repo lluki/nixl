@@ -1652,6 +1652,20 @@ nixl_capi_destroy_xfer_req(nixl_capi_xfer_req_t req)
 }
 
 nixl_capi_status_t
+nixl_capi_cancel_xfer_req(nixl_capi_agent_t agent, nixl_capi_xfer_req_t req) {
+    if (!agent || !req || !req->req) {
+        return NIXL_CAPI_ERROR_INVALID_PARAM;
+    }
+
+    try {
+        return nixl_capi_status_from_nixl_status(agent->inner->cancelXferReq(req->req));
+    }
+    catch (...) {
+        return NIXL_CAPI_ERROR_BACKEND;
+    }
+}
+
+nixl_capi_status_t
 nixl_capi_release_xfer_req(nixl_capi_agent_t agent, nixl_capi_xfer_req_t req)
 {
   if (!agent || !req || !req->req) {
@@ -2079,13 +2093,15 @@ nixl_capi_status_from_nixl_status(nixl_status_t status) {
         return NIXL_CAPI_ERROR_INVALID_PARAM;
     case NIXL_ERR_NOT_FOUND:
         return NIXL_CAPI_ERROR_NOT_FOUND;
+    case NIXL_ERR_NOT_ALLOWED:
+        return NIXL_CAPI_ERROR_NOT_ALLOWED;
+    case NIXL_ERR_NOT_SUPPORTED:
+        return NIXL_CAPI_ERROR_NOT_SUPPORTED;
     case NIXL_ERR_NOT_POSTED:
     case NIXL_ERR_BACKEND:
     case NIXL_ERR_MISMATCH:
-    case NIXL_ERR_NOT_ALLOWED:
     case NIXL_ERR_REPOST_ACTIVE:
     case NIXL_ERR_UNKNOWN:
-    case NIXL_ERR_NOT_SUPPORTED:
     case NIXL_ERR_REMOTE_DISCONNECT:
     case NIXL_ERR_CANCELED:
         return NIXL_CAPI_ERROR_BACKEND;

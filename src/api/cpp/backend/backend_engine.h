@@ -151,8 +151,33 @@ class nixlBackendEngine {
         // Use a handle to progress backend engine and see if a transfer is completed or not
         virtual nixl_status_t checkXfer(nixlBackendReqH* handle) const = 0;
 
-        //Backend aborts the transfer if necessary, and destructs the relevant objects
+        // Synchronously frees the backend request handle. It must be O(1), must not poll or wait
+        // for I/O, and does not cancel anything. The agent only calls it for a handle in the
+        // created state (prepXfer done, no postXfer yet) or in a terminal state (checkXfer/postXfer
+        // reported success or an error and the handle was not reposted); it is never called while
+        // a transfer or a cancellation is in flight, and at most once per handle. It need not be
+        // idempotent (freeing the pointer is a valid implementation). A handle whose owner
+        // released it while the transfer was still in flight is never passed to this method: the
+        // agent logs an error and leaks it.
         virtual nixl_status_t releaseReqH(nixlBackendReqH* handle) const = 0;
+
+        // Determines if a backend implements cancelXfer(). Default: no.
+        [[nodiscard]] virtual bool
+        supportsXferCancel() const noexcept {
+            return false;
+        }
+
+        // Asynchronously requests cancellation of an in-flight transfer previously started with
+        // postXfer() that returned NIXL_IN_PROG. Must not block, poll, or free the handle; the
+        // buffers stay owned by the transfer until checkXfer() reports a terminal status (typically
+        // an error such as NIXL_ERR_CANCELED, or success if the transfer won the race). Return
+        // NIXL_SUCCESS if the cancellation was initiated, NIXL_IN_PROG if it had already been
+        // requested, or an error. The agent only calls it if supportsXferCancel() is true.
+        // Default: not supported.
+        virtual nixl_status_t
+        cancelXfer(nixlBackendReqH *handle) const {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
 
         // Prepare a memory view for remote buffers
         virtual nixl_status_t

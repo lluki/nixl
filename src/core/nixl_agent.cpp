@@ -1438,6 +1438,7 @@ nixlAgent::postXferReq(nixlXferReqH *req_hndl,
     }
 
     // If status is not NIXL_IN_PROG we can repost,
+    req_hndl->cancelRequested = false;
     req_hndl->status = req_hndl->engine->postXfer(req_hndl->backendOp,
                                                   req_hndl->initiatorDescs,
                                                   req_hndl->targetDescs,
@@ -1566,6 +1567,11 @@ nixlAgent::queryXferBackend(const nixlXferReqH* req_hndl,
 
 nixl_status_t
 nixlAgent::releaseXferReq(nixlXferReqH *req_hndl) const {
+    if (!req_hndl) {
+        NIXL_ERROR_FUNC << "transfer request handle is null";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
     NIXL_TRACE_CORRELATION_SCOPE(
         data->tracer_.get(), req_hndl->tracePostContext(), req_hndl->traceRequestId());
     NIXL_TRACE_SCOPE(
@@ -1575,44 +1581,49 @@ nixlAgent::releaseXferReq(nixlXferReqH *req_hndl) const {
         trace_span, "nixl.xfer_execution", static_cast<std::int64_t>(req_hndl->traceExecution()));
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
-    //attempt to cancel request
-    if(req_hndl->status == NIXL_IN_PROG) {
-        req_hndl->status = req_hndl->engine->checkXfer(
-                                     req_hndl->backendHandle);
-        if (req_hndl->status == NIXL_SUCCESS) {
-            traceXferComplete(data->tracer_.get(), *req_hndl);
-            if (data->telemetry_) {
-                req_hndl->updateRequestStats(data->telemetry_.get(), NIXL_TELEMETRY_FINISH);
-            }
-        } else if (req_hndl->status < 0) {
-            traceXferError(data->tracer_.get(), *req_hndl, req_hndl->status);
-            data->addErrorTelemetry(req_hndl->status);
-        }
-
-        if(req_hndl->status == NIXL_IN_PROG) {
-
-            const nixl_status_t release_status =
-                req_hndl->engine->releaseReqH(req_hndl->backendHandle);
-
-            if (release_status < 0) {
-                NIXL_ERROR_FUNC << "backend '" << req_hndl->engine->getType()
-                                << "' could not release transfer request and returned error status "
-                                << release_status;
-                data->addErrorTelemetry(NIXL_ERR_REPOST_ACTIVE);
-                NIXL_TRACE_ATTR(
-                    trace_span, "nixl.status", static_cast<std::int64_t>(NIXL_ERR_REPOST_ACTIVE));
-                return NIXL_ERR_REPOST_ACTIVE; // Might need renaming
-            }
-            traceXferError(data->tracer_.get(), *req_hndl, NIXL_ERR_CANCELED);
-            req_hndl->status = release_status;
-            // just in case the backend doesn't set to NULL on success
-            // this will prevent calling releaseReqH again in destructor
-            req_hndl->backendHandle = nullptr;
-        }
+    // No polling and no cancellation here. In the submitted state the backend handle is leaked
+    // (see nixlXferReqH::releaseBackendHandle), which is a client error that gets logged.
+    // The agent-side request object is freed in any case, so the handle must not be used again.
+    if (req_hndl->isSubmitted()) {
+        traceXferError(data->tracer_.get(), *req_hndl, NIXL_ERR_CANCELED);
     }
+    req_hndl->releaseBackendHandle();
     NIXL_TRACE_ATTR(trace_span, "nixl.status", static_cast<std::int64_t>(NIXL_SUCCESS));
     delete req_hndl;
     return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::cancelXferReq(nixlXferReqH *req_hndl) const {
+    if (!req_hndl) {
+        NIXL_ERROR_FUNC << "transfer request handle is null";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    if (!req_hndl->isSubmitted()) {
+        NIXL_ERROR_FUNC << "only a submitted (in progress) transfer request can be canceled";
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    if (req_hndl->cancelRequested) {
+        return NIXL_IN_PROG;
+    }
+
+    if (!req_hndl->engine->supportsXferCancel()) {
+        NIXL_ERROR_FUNC << "backend '" << req_hndl->engine->getType()
+                        << "' does not support canceling transfer requests";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    const nixl_status_t ret = req_hndl->engine->cancelXfer(req_hndl->backendHandle);
+    if (ret == NIXL_SUCCESS || ret == NIXL_IN_PROG) {
+        req_hndl->cancelRequested = true;
+    } else {
+        NIXL_ERROR_FUNC << "backend '" << req_hndl->engine->getType()
+                        << "' failed to cancel the transfer request with status " << ret;
+    }
+    return ret;
 }
 
 nixl_status_t

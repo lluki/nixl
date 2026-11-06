@@ -29,8 +29,19 @@ class nixlUcxEngine;
 // Plugins must be compiled with the same C++ standard and a compatible
 // libstdc++ ABI as the NIXL core library. NIXL core currently requires C++20.
 
-// Define the plugin API version
-#define NIXL_PLUGIN_API_VERSION 3
+// Define the plugin API version.
+//
+// The loader requires an exact match. The version is bumped whenever the layout of
+// nixlBackendEngine (its vtable) or of nixlBackendPlugin changes, because a plugin built against
+// an older header would otherwise be dispatched through a vtable that lacks the new slots (UB).
+//
+// Version 4: nixlBackendEngine gained the virtuals supportsXferCancel() and cancelXfer(), and the
+// contract of releaseReqH() changed: it is a synchronous deallocator that the agent only invokes
+// for requests in the created or terminal state (never while a transfer is in flight). Plugins
+// built against version 3 are rejected at load time instead of being called through a mismatching
+// vtable; they must be rebuilt against these headers (no source change is required, both new
+// virtuals have defaults).
+#define NIXL_PLUGIN_API_VERSION 4
 
 // Define the plugin interface class
 class nixlBackendPlugin {

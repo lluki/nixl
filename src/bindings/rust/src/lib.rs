@@ -123,6 +123,10 @@ pub enum NixlError {
     NoTelemetry,
     #[error("Not found")]
     NotFound,
+    #[error("Operation not allowed in the current request state")]
+    NotAllowed,
+    #[error("Operation not supported by the backend")]
+    NotSupported,
 }
 
 /// A safe wrapper around NIXL memory list

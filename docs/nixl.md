@@ -132,6 +132,20 @@ for n iterations:
 
 ```
 
+### Request lifecycle, cancellation and release
+A transfer request is in one of these states:
+
+* **created**: `create_xfer_req` was called, but the request was not posted yet.
+* **submitted**: the post returned `IN_PROG`. The request stays submitted until `get_xfer_status` returns `SUCCESS` or a negative (terminal) status, even if the backend finished internally. The buffers belong to the transfer until then.
+* **terminal**: the post or `get_xfer_status` returned `SUCCESS` or an error, and the request was not reposted. Reposting makes it submitted again.
+* **freed**: `release_xfer_req` was called. Further use is invalid.
+
+`cancel_xfer_req` (`cancelXferReq` in C++) asynchronously asks the backend to abort a *submitted* request. It does not free anything and does not give the buffers back: keep polling `get_xfer_status` until it is not `IN_PROG` (it returns an error such as `ERR_CANCELED`, or `SUCCESS` if the transfer finished first). It returns `SUCCESS` if cancellation was initiated, `IN_PROG` if it was already requested, `ERR_NOT_ALLOWED` if the request is not submitted, and `ERR_NOT_SUPPORTED` if the backend cannot cancel (the default for all backends; then the transfer has to be polled to completion).
+
+`release_xfer_req` only frees a request in the created or terminal state; it never polls, cancels or blocks, and is safe to call from destructors. Releasing a *submitted* request is a client error: NIXL logs a prominent error, leaks the backend request handle (the transfer may still touch it and the user buffers) and does not call the backend release. Releasing at process shutdown is acceptable, the leak is irrelevant then.
+
+Migration: code that used `release_xfer_req` to abort an active transfer should call `cancel_xfer_req`, poll `get_xfer_status` until it is not `IN_PROG`, and then release. Code that never aborts should poll to completion before releasing.
+
 ## Adding/removing agents (dynamic scaling)
 Adding a new agent to a service involves creating the agent and exchanging its metadata with the existing agents in the service. To remove an agent or handle a failure, you can use one of the metadata invalidate APIs. This triggers disconnections for backends connected to the agent and purges the cached metadata values.
 

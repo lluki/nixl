@@ -88,8 +88,12 @@ class nixl_prepped_dlist_handle:
 
 class nixl_xfer_handle:
     """Opaque handle wrapper for a transfer request.
-    Use release() to explicitly free resources. If transfer was not complete, this will initiate
-    the abort process (if available) and will raise an exception.
+    Use release() to explicitly free resources. release() only frees the request, it never
+    cancels or waits, and calling it more than once is a no-op. It must only be used on a request
+    that was not posted yet, or whose state was polled to a terminal status (anything but "PROC").
+    Releasing a request that is still in progress is a client error: NIXL logs an error and leaks
+    the backend resources. To abandon an active transfer, call nixl_agent.cancel_xfer_handle(),
+    poll check_xfer_state() until it is no longer "PROC", then release.
     __del__ calls release() and if it fails, it logs the failure and defers release by queuing
     the handle in leaked xfer handles list, which will be re-released during agent destruction
 
@@ -110,11 +114,13 @@ class nixl_xfer_handle:
 
     def release(self):
         if not self._released:
-            self._agent.agent.releaseXferReq(self._handle)
+            # Mark first: a second releaseXferReq() on the same handle is a use after free.
             self._released = True
+            self._agent.agent.releaseXferReq(self._handle)
 
     def __del__(self):
         if not self._released:
+            self._released = True
             try:
                 self._agent.agent.releaseXferReq(self._handle)
             except Exception:
@@ -755,10 +761,32 @@ class nixl_agent:
             if backendH == b_handle
         )
 
+    def cancel_xfer_handle(self, handle: nixl_xfer_handle) -> bool:
+        """Asynchronously request cancellation of a transfer that is in progress.
+        Nothing is freed and the buffers are not given back: keep calling check_xfer_state()
+        until it no longer returns "PROC" (it then returns "ERR" if the cancellation took effect,
+        or "DONE" if the transfer finished first), and only then reuse the buffers and release
+        the handle.
+
+        Args:
+            handle: Handle to a posted transfer operation from initialize_xfer or make_xfer.
+
+        Returns:
+            True if the cancellation was initiated, False if it was already requested.
+
+        Raises:
+            nixlNotAllowedError: the transfer is not in progress.
+            nixlNotSupportedError: the backend does not support cancelling transfers.
+        """
+        return self.agent.cancelXferReq(handle._handle) == nixlBind.NIXL_SUCCESS
+
     def release_xfer_handle(self, handle: nixl_xfer_handle):
         """Releases a transfer handle, which internally frees the memory used for the handle.
-        If the transfer is active, NIXL will attempt to cancel it.
-        If it cannot be canceled, an error will be returned and the handle will not be freed.
+        This never cancels or waits for a transfer. Release only handles that were not posted
+        or whose transfer reached a terminal state (check_xfer_state() != "PROC"); use
+        cancel_xfer_handle() first to abort an active transfer. Releasing an active transfer
+        is a client error: NIXL logs an error and leaks the backend resources.
+        Calling it again on an already released handle is a no-op.
 
         Args:
             handle: Handle to the transfer operation from initialize_xfer or make_xfer.
