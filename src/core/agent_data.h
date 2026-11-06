@@ -17,6 +17,7 @@
 #ifndef NIXL_SRC_CORE_AGENT_DATA_H
 #define NIXL_SRC_CORE_AGENT_DATA_H
 
+#include "backend_plugin.h"
 #include "mem_section.h"
 #include "nixl_md_manager.h"
 #include "nixl_metadata_context.h"
@@ -145,8 +146,13 @@ class nixlBackendEngine;
 class nixlBackendH {
     private:
         nixlBackendEngine* engine;
+        // api_version of the plugin that created the engine. It is kept here, not in the engine,
+        // because the engine layout is part of the plugin ABI.
+        int pluginApiVersion;
 
-        explicit nixlBackendH(nixlBackendEngine *engine) noexcept : engine(engine) {}
+        nixlBackendH(nixlBackendEngine *engine, int plugin_api_version) noexcept
+            : engine(engine),
+              pluginApiVersion(plugin_api_version) {}
 
     public:
         ~nixlBackendH() = default;
@@ -174,7 +180,9 @@ class nixlBackendH {
 
         bool
         supportsXferCancel() const {
-            return engine->supportsXferCancel();
+            // The virtual does not exist in the vtable of a plugin older than API version 4.
+            return pluginApiVersion >= NIXL_PLUGIN_API_VERSION_XFER_CANCEL &&
+                   engine->supportsXferCancel();
         }
 
     friend class nixlAgentData;

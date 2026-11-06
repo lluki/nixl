@@ -624,7 +624,8 @@ nixlAgent::createBackend(const nixl_backend_t &type,
     }
 
     // TODO: Simplify, e.g. by making nixlBackendH's c'tor public?
-    std::unique_ptr<nixlBackendH> bknd_temp(new nixlBackendH(backend.get()));
+    std::unique_ptr<nixlBackendH> bknd_temp(
+        new nixlBackendH(backend.get(), plugin_handle->getApiVersion()));
     const auto [it, inserted] = data->backendHandles_.try_emplace(type, std::move(bknd_temp));
     NIXL_ASSERT(inserted);
     bknd_hndl = it->second.get();
@@ -1620,7 +1621,10 @@ nixlAgent::cancelXferReq(nixlXferReqH *req_hndl) const {
         return NIXL_IN_PROG;
     }
 
-    if (!req_hndl->engine->supportsXferCancel()) {
+    // Goes through nixlBackendH, which does not touch the engine's vtable for plugins older than
+    // API version 4 (their vtable has no cancellation slots).
+    const auto backend_it = data->backendHandles_.find(req_hndl->engine->getType());
+    if (backend_it == data->backendHandles_.end() || !backend_it->second->supportsXferCancel()) {
         NIXL_ERROR_FUNC << "backend '" << req_hndl->engine->getType()
                         << "' does not support canceling transfer requests";
         return NIXL_ERR_NOT_SUPPORTED;

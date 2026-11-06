@@ -111,11 +111,18 @@ backendLoader(void *handle, const std::string &plugin_path) {
     }
 
     // Check API version
-    if (plugin->api_version != NIXL_PLUGIN_API_VERSION) {
+    if (plugin->api_version < NIXL_PLUGIN_API_VERSION_MIN_COMPAT ||
+        plugin->api_version > NIXL_PLUGIN_API_VERSION) {
         NIXL_ERROR << "Plugin API version mismatch for " << plugin_path << ": expected "
-                   << NIXL_PLUGIN_API_VERSION << ", got " << plugin->api_version;
+                   << NIXL_PLUGIN_API_VERSION << " (or legacy "
+                   << NIXL_PLUGIN_API_VERSION_MIN_COMPAT << "), got " << plugin->api_version;
         dlclose(handle);
         return nullptr;
+    }
+    if (plugin->api_version < NIXL_PLUGIN_API_VERSION) {
+        NIXL_WARN << "Loaded legacy plugin API version " << plugin->api_version << " plugin "
+                  << plugin_path << " (current is " << NIXL_PLUGIN_API_VERSION
+                  << "): transfer cancellation is unavailable for it";
     }
 
     return std::make_shared<const nixlBackendPluginHandle>(handle, plugin);
@@ -789,6 +796,10 @@ nixlPluginManager::registerBackendStaticPlugin(const std::string &name,
     nixlBackendPlugin* plugin = info.createFunc();
     NIXL_INFO << "Loading static plugin: " << name;
     if (plugin) {
+        if (plugin->api_version < NIXL_PLUGIN_API_VERSION) {
+            NIXL_WARN << "Static plugin " << name << " uses legacy plugin API version "
+                      << plugin->api_version << ": transfer cancellation is unavailable for it";
+        }
         // Register the loaded plugin
         auto plugin_handle = std::make_shared<const nixlBackendPluginHandle>(nullptr, plugin);
         loaded_backend_plugins_[name] = plugin_handle;

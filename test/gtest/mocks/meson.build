@@ -27,6 +27,18 @@ run_command('sh', '-c',
                 check: true
             )
 
+mock_legacy_sources = ['gmock_engine.cpp', 'mock_legacy_plugin.cpp', 'mock_backend_engine.cpp']
+mock_legacy_plugin = shared_library('MOCK_LEGACY_BACKEND', mock_legacy_sources,
+               dependencies: [nixl_infra, nixl_common_dep, gmock_dep],
+               include_directories: [nixl_inc_dirs, utils_inc_dirs, gtest_inc_dirs],
+               name_prefix: 'libplugin_',
+               install: true,
+               install_dir: plugin_install_dir)
+run_command('sh', '-c',
+            'echo "MOCK_LEGACY_BACKEND=' + mock_legacy_plugin.full_path() + '" >> ' + plugin_build_dir + '/pluginlist',
+                check: true
+            )
+
 mock_stale_plugin = shared_library('MOCK_STALE_BACKEND', ['mock_stale_plugin.cpp'],
                dependencies: [nixl_infra, nixl_common_dep],
                include_directories: [nixl_inc_dirs, utils_inc_dirs, gtest_inc_dirs],

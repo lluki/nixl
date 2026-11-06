@@ -224,8 +224,17 @@ TEST_F(LoadedPluginTestFixture, StalePluginApiVersionIsRejected) {
     EXPECT_EQ(std::find(loaded.begin(), loaded.end(), "MOCK_STALE_BACKEND"), loaded.end());
 }
 
+TEST_F(LoadedPluginTestFixture, LegacyV3PluginApiVersionIsAccepted) {
+    EXPECT_EQ(NIXL_PLUGIN_API_VERSION_MIN_COMPAT, 3);
+    const auto handle = plugin_manager_.loadBackendPlugin(GetMockLegacyBackendName());
+    ASSERT_NE(handle, nullptr);
+    EXPECT_EQ(handle->getApiVersion(), 3);
+}
+
 TEST_F(LoadedPluginTestFixture, CurrentPluginApiVersionIsAccepted) {
-    EXPECT_TRUE(LoadPlugin(GetMockBackendName()));
+    const auto handle = plugin_manager_.loadBackendPlugin(GetMockBackendName());
+    ASSERT_NE(handle, nullptr);
+    EXPECT_EQ(handle->getApiVersion(), NIXL_PLUGIN_API_VERSION);
     EXPECT_EQ(NIXL_PLUGIN_API_VERSION, 4);
 }
 

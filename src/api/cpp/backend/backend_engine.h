@@ -161,24 +161,6 @@ class nixlBackendEngine {
         // agent logs an error and leaks it.
         virtual nixl_status_t releaseReqH(nixlBackendReqH* handle) const = 0;
 
-        // Determines if a backend implements cancelXfer(). Default: no.
-        [[nodiscard]] virtual bool
-        supportsXferCancel() const noexcept {
-            return false;
-        }
-
-        // Asynchronously requests cancellation of an in-flight transfer previously started with
-        // postXfer() that returned NIXL_IN_PROG. Must not block, poll, or free the handle; the
-        // buffers stay owned by the transfer until checkXfer() reports a terminal status (typically
-        // an error such as NIXL_ERR_CANCELED, or success if the transfer won the race). Return
-        // NIXL_SUCCESS if the cancellation was initiated, NIXL_IN_PROG if it had already been
-        // requested, or an error. The agent only calls it if supportsXferCancel() is true.
-        // Default: not supported.
-        virtual nixl_status_t
-        cancelXfer(nixlBackendReqH *handle) const {
-            return NIXL_ERR_NOT_SUPPORTED;
-        }
-
         // Prepare a memory view for remote buffers
         virtual nixl_status_t
         prepMemView(const nixl_remote_meta_dlist_t &,
@@ -278,6 +260,29 @@ class nixlBackendEngine {
         [[nodiscard]] virtual bool
         supportsTraceContext() const noexcept {
             return false;
+        }
+
+        // *** Plugin API version 4 virtuals *** //
+        // These MUST stay the last virtual declarations: a version 3 plugin's vtable is then an
+        // exact prefix of this class's vtable. The agent never calls them on an engine created
+        // by a plugin reporting an older api_version. Future versions must only append virtuals.
+
+        // Determines if a backend implements cancelXfer(). Default: no.
+        [[nodiscard]] virtual bool
+        supportsXferCancel() const noexcept {
+            return false;
+        }
+
+        // Asynchronously requests cancellation of an in-flight transfer previously started with
+        // postXfer() that returned NIXL_IN_PROG. Must not block, poll, or free the handle; the
+        // buffers stay owned by the transfer until checkXfer() reports a terminal status (typically
+        // an error such as NIXL_ERR_CANCELED, or success if the transfer won the race). Return
+        // NIXL_SUCCESS if the cancellation was initiated, NIXL_IN_PROG if it had already been
+        // requested, or an error. The agent only calls it if supportsXferCancel() is true.
+        // Default: not supported.
+        virtual nixl_status_t
+        cancelXfer(nixlBackendReqH *handle) const {
+            return NIXL_ERR_NOT_SUPPORTED;
         }
 };
 #endif

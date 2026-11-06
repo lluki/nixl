@@ -70,6 +70,13 @@ public:
     nixl_b_params_t getBackendOptions() const;
     nixl_mem_list_t getBackendMems() const;
 
+    // Plugin API version the plugin was built against (older than NIXL_PLUGIN_API_VERSION for
+    // legacy plugins loaded through the compatibility path).
+    int
+    getApiVersion() const noexcept {
+        return plugin_ ? plugin_->api_version : 0;
+    }
+
 private:
     nixlBackendPlugin *plugin_;
 };

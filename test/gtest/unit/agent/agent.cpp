@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include "agent_data.h"
 #include <unistd.h>
 #include <algorithm>
 #include <chrono>
@@ -117,9 +118,11 @@ namespace agent {
         }
 
         nixl_status_t
-        createBackendWithGMock(nixl_b_params_t &params, nixlBackendH *&backend) {
+        createBackendWithGMock(nixl_b_params_t &params,
+                               nixlBackendH *&backend,
+                               const char *backend_name = GetMockBackendName()) {
             gmock_engine_.SetToParams(params);
-            return agent_->createBackend(GetMockBackendName(), params, backend);
+            return agent_->createBackend(backend_name, params, backend);
         }
 
         nixl_status_t
@@ -1131,6 +1134,8 @@ namespace agent {
     protected:
         std::unique_ptr<agentHelper> local_agent_helper_, remote_agent_helper_;
         nixlAgent *local_agent_, *remote_agent_;
+        // Name of the mock plugin the backends are created from.
+        const char *backend_name_ = GetMockBackendName();
 
         void
         SetUp() override {
@@ -1160,10 +1165,12 @@ namespace agent {
 
         void
         setupDualAgent(DualAgentSetup &s, bool register_local = true, bool register_remote = true) {
-            EXPECT_EQ(local_agent_helper_->createBackendWithGMock(s.local_params, s.local_backend),
+            EXPECT_EQ(local_agent_helper_->createBackendWithGMock(
+                          s.local_params, s.local_backend, backend_name_),
                       NIXL_SUCCESS);
             EXPECT_EQ(
-                remote_agent_helper_->createBackendWithGMock(s.remote_params, s.remote_backend),
+                remote_agent_helper_->createBackendWithGMock(
+                    s.remote_params, s.remote_backend, backend_name_),
                 NIXL_SUCCESS);
             if (register_local) {
                 EXPECT_EQ(
@@ -1699,6 +1706,41 @@ namespace agent {
         EXPECT_EQ(local_agent_->cancelXferReq(x.req), NIXL_SUCCESS);
         EXPECT_EQ(local_agent_->getXferStatus(x.req), NIXL_SUCCESS);
         EXPECT_EQ(local_agent_->releaseXferReq(x.req), NIXL_SUCCESS);
+    }
+
+    // A plugin reporting API version 3 predates the cancellation virtuals: its vtable has no such
+    // slots, so the agent must neither query nor call them on its engine.
+    TEST_F(dualAgentBridgeFixture, LegacyV3PluginReportsNoCancelAndNeverCallsNewVirtuals) {
+        backend_name_ = GetMockLegacyBackendName();
+        xferState x;
+        createXfer(x);
+        auto &engine = local_agent_helper_->getGMockEngine();
+        // Would say yes if asked.
+        ON_CALL(engine, supportsXferCancel()).WillByDefault(testing::Return(true));
+        ON_CALL(engine, cancelXfer).WillByDefault(testing::Return(NIXL_SUCCESS));
+        EXPECT_CALL(engine, supportsXferCancel()).Times(0);
+        EXPECT_CALL(engine, cancelXfer).Times(0);
+        EXPECT_CALL(engine, postXfer).WillOnce(testing::Return(NIXL_IN_PROG));
+        EXPECT_CALL(engine, checkXfer)
+            .WillOnce(testing::Return(NIXL_IN_PROG))
+            .WillOnce(testing::Return(NIXL_SUCCESS));
+        EXPECT_CALL(engine, releaseReqH(&x.backend_request)).Times(1);
+
+        EXPECT_FALSE(x.setup.local_backend->supportsXferCancel());
+        EXPECT_EQ(local_agent_->postXferReq(x.req), NIXL_IN_PROG);
+        EXPECT_EQ(local_agent_->cancelXferReq(x.req), NIXL_ERR_NOT_SUPPORTED);
+        // Normal operation is unaffected.
+        EXPECT_EQ(local_agent_->getXferStatus(x.req), NIXL_IN_PROG);
+        EXPECT_EQ(local_agent_->getXferStatus(x.req), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->releaseXferReq(x.req), NIXL_SUCCESS);
+    }
+
+    TEST_F(dualAgentBridgeFixture, CurrentPluginReportsCancelSupportFromEngine) {
+        xferState x;
+        createXfer(x);
+        auto &engine = local_agent_helper_->getGMockEngine();
+        ON_CALL(engine, supportsXferCancel()).WillByDefault(testing::Return(true));
+        EXPECT_TRUE(x.setup.local_backend->supportsXferCancel());
     }
 
     TEST_F(dualAgentBridgeFixture, PrepMemViewRemoteDRAM) {

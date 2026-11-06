@@ -47,7 +47,7 @@ getBackendMems() {
     return nixl_mem_list_t();
 }
 
-nixlBackendPlugin plugin = {NIXL_PLUGIN_API_VERSION - 1,
+nixlBackendPlugin plugin = {NIXL_PLUGIN_API_VERSION_MIN_COMPAT - 1,
                             createEngine,
                             destroyEngine,
                             getName,
