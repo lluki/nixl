@@ -190,16 +190,18 @@ else
             section: 'Dependencies')
 endif
 
-# Search for Abseil dependencies in the system first
-absl_base_dep = dependency('absl_base', required: false)
-absl_log_dep = dependency('absl_log', required: false)
-absl_log_initialize_dep = dependency('absl_log_initialize', required: false)
-absl_flat_hash_map_dep = dependency('absl_flat_hash_map', required: false)
-absl_status_dep = dependency('absl_status', required: false)
-absl_statusor_dep = dependency('absl_statusor', required: false)
-absl_strings_dep = dependency('absl_strings', required: false)
-absl_synchronization_dep = dependency('absl_synchronization', required: false)
-absl_time_dep = dependency('absl_time', required: false)
+# Abseil: by default always the bundled one (private shared build, see subprojects/packagefiles/abseil-cpp-nixl-private-shared.patch).
+# -Duse_system_abseil=true searches the system first.
+use_system_abseil = get_option('use_system_abseil')
+absl_base_dep = use_system_abseil ? dependency('absl_base', required: false) : dependency('', required: false)
+absl_log_dep = use_system_abseil ? dependency('absl_log', required: false) : dependency('', required: false)
+absl_log_initialize_dep = use_system_abseil ? dependency('absl_log_initialize', required: false) : dependency('', required: false)
+absl_flat_hash_map_dep = use_system_abseil ? dependency('absl_flat_hash_map', required: false) : dependency('', required: false)
+absl_status_dep = use_system_abseil ? dependency('absl_status', required: false) : dependency('', required: false)
+absl_statusor_dep = use_system_abseil ? dependency('absl_statusor', required: false) : dependency('', required: false)
+absl_strings_dep = use_system_abseil ? dependency('absl_strings', required: false) : dependency('', required: false)
+absl_synchronization_dep = use_system_abseil ? dependency('absl_synchronization', required: false) : dependency('', required: false)
+absl_time_dep = use_system_abseil ? dependency('absl_time', required: false) : dependency('', required: false)
 
 if absl_base_dep.found() and not absl_log_dep.found()
   error('Your Abseil version is too old: found absl_base but missing support for absl_log. ' +
@@ -215,7 +217,7 @@ if not (absl_log_dep.found() and
         absl_strings_dep.found() and
         absl_synchronization_dep.found() and
         absl_time_dep.found())
-  message('System Abseil missing required components; using subproject fallback')
+  message(use_system_abseil ? 'System Abseil missing required components; using the bundled one' : 'Using the bundled private Abseil (nixl_absl_*)')
   abseil_proj = subproject('abseil-cpp')
   absl_log_dep = abseil_proj.get_variable('absl_log_dep')
   absl_log_initialize_dep = absl_log_dep
@@ -225,7 +227,9 @@ if not (absl_log_dep.found() and
   absl_strings_dep = abseil_proj.get_variable('absl_strings_dep')
   absl_synchronization_dep = abseil_proj.get_variable('absl_synchronization_dep')
   absl_time_dep = abseil_proj.get_variable('absl_time_dep')
-  summary({'Abseil source': 'subproject'}, section: 'Dependencies')
+  summary({'Abseil source': 'subproject (private shared)'}, section: 'Dependencies')
+  # The bundled Abseil is installed next to the NIXL libraries: find it from libs and plugins.
+  add_project_link_arguments('-Wl,-rpath,$ORIGIN', '-Wl,-rpath,$ORIGIN/..', language: 'cpp')
 else
   message('Using system Abseil dependencies')
   summary({'Abseil source': 'system'}, section: 'Dependencies')

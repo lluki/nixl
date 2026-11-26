@@ -1,0 +1,247 @@
+diff -ruN a/absl/base/options.h b/absl/base/options.h
+--- a/absl/base/options.h	2026-11-26 12:37:09.389145526 +0000
++++ b/absl/base/options.h	2026-11-26 12:39:22.165746397 +0000
+@@ -149,7 +149,7 @@
+ // allowed.
+ 
+ #define ABSL_OPTION_USE_INLINE_NAMESPACE 1
+-#define ABSL_OPTION_INLINE_NAMESPACE_NAME lts_20250814
++#define ABSL_OPTION_INLINE_NAMESPACE_NAME nixl_lts_20250814
+ 
+ // ABSL_OPTION_HARDENED
+ //
+diff -ruN a/meson.build b/meson.build
+--- a/meson.build	2026-11-26 12:37:09.441144196 +0000
++++ b/meson.build	2026-11-26 12:42:57.743217188 +0000
+@@ -90,6 +90,7 @@
+   'absl/base/internal/strerror.cc',
+   'absl/base/internal/sysinfo.cc',
+   'absl/base/internal/thread_identity.cc',
++  'absl/base/internal/tracing.cc',
+   'absl/base/internal/throw_delegate.cc',
+   'absl/base/internal/unscaledcycleclock.cc',
+   'absl/base/log_severity.cc',
+@@ -401,6 +402,7 @@
+   'absl/random/discrete_distribution.cc',
+   'absl/random/gaussian_distribution.cc',
+   'absl/random/internal/chi_square.cc',
++  'absl/random/internal/distribution_test_util.cc',
+   'absl/random/internal/entropy_pool.cc',
+   'absl/random/internal/randen.cc',
+   'absl/random/internal/randen_detect.cc',
+@@ -651,7 +653,7 @@
+ )
+ 
+ # Libraries
+-absl_base_lib = static_library(
++absl_base_static = static_library(
+   'absl_base',
+   absl_base_sources,
+   include_directories: absl_include_dir,
+@@ -660,69 +662,69 @@
+   dependencies: [dependency('threads'), libatomic],
+ )
+ 
+-absl_hash_lib = static_library(
++absl_hash_static = static_library(
+   'absl_hash',
+   absl_hash_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+ )
+ 
+-absl_numeric_lib = static_library(
++absl_numeric_static = static_library(
+   'absl_numeric',
+   absl_numeric_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+ )
+ 
+-absl_profiling_lib = static_library(
++absl_profiling_static = static_library(
+   'absl_profiling',
+   absl_profiling_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+ )
+ 
+-absl_crc_lib = static_library(
++absl_crc_static = static_library(
+   'absl_crc',
+   absl_crc_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+-  link_with: [absl_base_lib],
++  link_with: [absl_base_static],
+   dependencies: libatomic,
+ )
+ 
+-absl_strings_lib = static_library(
++absl_strings_static = static_library(
+   'absl_strings',
+   absl_strings_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+-  link_with: [absl_base_lib, absl_crc_lib, absl_numeric_lib, absl_profiling_lib],
++  link_with: [absl_base_static, absl_crc_static, absl_numeric_static, absl_profiling_static],
+ )
+ 
+-absl_debugging_lib = static_library(
++absl_debugging_static = static_library(
+   'absl_debugging',
+   absl_debugging_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+-  link_with: [absl_base_lib, absl_strings_lib],
++  link_with: [absl_base_static, absl_strings_static],
+   dependencies: libatomic,
+ )
+ 
+-absl_random_lib = static_library(
++absl_random_static = static_library(
+   'absl_random',
+   absl_random_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+   cpp_args: hw_flags,
+-  link_with: [absl_base_lib, absl_strings_lib],
++  link_with: [absl_base_static, absl_strings_static],
+   dependencies: libatomic,
+ )
+ 
+-absl_time_lib = static_library(
++absl_time_static = static_library(
+   'absl_time',
+   absl_time_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+-  link_with: [absl_base_lib, absl_numeric_lib, absl_strings_lib],
++  link_with: [absl_base_static, absl_numeric_static, absl_strings_static],
+   # macOS only, upstream: https://github.com/abseil/abseil-cpp/pull/280
+   dependencies: dependency(
+     'appleframeworks',
+@@ -731,62 +733,92 @@
+   ),
+ )
+ 
+-absl_synchronization_lib = static_library(
++absl_synchronization_static = static_library(
+   'absl_synchronization',
+   absl_synchronization_sources,
+   cpp_args: unscaled_cycleclock_flag,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+-  link_with: [absl_base_lib, absl_debugging_lib, absl_time_lib],
++  link_with: [absl_base_static, absl_debugging_static, absl_time_static],
+ )
+ 
+-absl_container_lib = static_library(
++absl_container_static = static_library(
+   'absl_container',
+   absl_container_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+   link_with: [
+-    absl_base_lib,
+-    absl_debugging_lib,
+-    absl_hash_lib,
+-    absl_synchronization_lib,
+-    absl_time_lib,
++    absl_base_static,
++    absl_debugging_static,
++    absl_hash_static,
++    absl_synchronization_static,
++    absl_time_static,
+   ],
+ )
+ 
+-absl_flags_lib = static_library(
++absl_flags_static = static_library(
+   'absl_flags',
+   absl_flags_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+   link_with: [
+-    absl_base_lib,
+-    absl_container_lib,
+-    absl_hash_lib,
+-    absl_strings_lib,
+-    absl_synchronization_lib,
++    absl_base_static,
++    absl_container_static,
++    absl_hash_static,
++    absl_strings_static,
++    absl_synchronization_static,
+   ],
+   dependencies: libatomic,
+ )
+ 
+-absl_status_lib = static_library(
++absl_status_static = static_library(
+   'absl_status',
+   absl_status_sources,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+-  link_with: [absl_base_lib, absl_strings_lib],
++  link_with: [absl_base_static, absl_strings_static],
+ )
+ 
+-absl_log_lib = static_library(
++absl_log_static = static_library(
+   'absl_log',
+   absl_log_sources,
+   cpp_args: unscaled_cycleclock_flag,
+   include_directories: absl_include_dir,
+   override_options: override_cpp,
+-  link_with: [absl_base_lib, absl_strings_lib, absl_flags_lib],
++  link_with: [absl_base_static, absl_strings_static, absl_flags_static],
+   dependencies: libatomic,
+ )
+ 
++# NIXL: one private, namespaced shared library (nixl_absl) instead of 14 static ones. Abseil's libraries
++# reference each other cyclically (strings <-> synchronization), which a split shared build cannot link, and a
++# static copy per consumer breaks absl::Mutex's deadlock detector (several copies in one process).
++absl_nixl_lib = shared_library(
++  'nixl_absl',
++  link_whole: [absl_base_static, absl_hash_static, absl_numeric_static, absl_profiling_static, absl_crc_static, absl_strings_static, absl_debugging_static, absl_random_static, absl_time_static, absl_synchronization_static, absl_container_static, absl_flags_static, absl_status_static, absl_log_static],
++  dependencies: [dependency('threads'), libatomic],
++  link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'nixl_absl.map'],
++  link_depends: files('nixl_absl.map'),
++  install: true,
++  install_rpath: '$ORIGIN',
++  version: '2508.0.0',
++  soversion: '2508',
++)
++
++absl_base_lib = absl_nixl_lib
++absl_hash_lib = absl_nixl_lib
++absl_numeric_lib = absl_nixl_lib
++absl_profiling_lib = absl_nixl_lib
++absl_crc_lib = absl_nixl_lib
++absl_strings_lib = absl_nixl_lib
++absl_debugging_lib = absl_nixl_lib
++absl_random_lib = absl_nixl_lib
++absl_time_lib = absl_nixl_lib
++absl_synchronization_lib = absl_nixl_lib
++absl_container_lib = absl_nixl_lib
++absl_flags_lib = absl_nixl_lib
++absl_status_lib = absl_nixl_lib
++absl_log_lib = absl_nixl_lib
++
+ # Dependencies
+ absl_base_dep = declare_dependency(
+   include_directories: absl_include_dir,
+diff -ruN a/nixl_absl.map b/nixl_absl.map
+--- a/nixl_absl.map	1970-01-01 00:00:00.000000000 +0000
++++ b/nixl_absl.map	2026-11-26 12:42:57.719217804 +0000
+@@ -0,0 +1,9 @@
++/* Keep the few symbols that are NOT inside Abseil's inline namespace out of the dynamic symbol table: ABSL_FLAG
++   variables (FLAGS_*) and their helpers live in the global namespace, so another Abseil in the same process
++   (same or other version) would interpose with them and abort with "Inconsistency between flag object and
++   registration". Everything else is in absl::nixl_lts_20250814. */
++{
++  local:
++    *FLAGS_*;
++    *AbslFlagDefaultGenFor*;
++};
