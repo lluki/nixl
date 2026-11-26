@@ -44,6 +44,9 @@ nixl_common_lib = shared_library('nixl_common',
     'nixl_duration.cpp',
     dependencies: nixl_common_deps,
     include_directories: [nixl_common_inc, nixl_inc_dirs],
+    # Do not re-export the statically linked (vendored) Abseil. Exported, it is interposed with the copy
+    # in libserdes.so and absl::Mutex's deadlock detector crashes (GraphCycles::Ptr) when callers bind to different copies.
+    link_args: ['-Wl,--exclude-libs,ALL'],
     cpp_args: [
         '-DNIXL_VERSION="' + meson.project_version() + '"',
         '-DNIXL_GIT_HASH="' + git_commit + '"'

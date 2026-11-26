@@ -16,6 +16,8 @@
 serdes_lib = library('serdes',
            'serdes.cpp', 'serdes.h',
            dependencies: [absl_log_dep],
+           # Do not re-export the statically linked (vendored) Abseil (see src/utils/common/meson.build).
+           link_args: ['-Wl,--exclude-libs,ALL'],
            include_directories: [nixl_inc_dirs, utils_inc_dirs],
            install: true)
 
