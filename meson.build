@@ -17,6 +17,11 @@ project('nixl', 'CPP', version: '1.6.0',
     default_options: ['buildtype=release',
                 'werror=true',
                 'cpp_std=c++20',
+                # NDEBUG in release builds, also for the vendored Abseil: without it absl::Mutex runs its
+                # debug-only deadlock detector (GraphCycles), whose per-copy state breaks when several copies of
+                # absl are loaded (libnixl_common, libserdes, plugins): SIGSEGV with several POSIX agents.
+                # Also compiles out NIXL's own assert()s in release builds.
+                'b_ndebug=if-release',
                 'prefix=/opt/nvidia/nvda_nixl'],
     meson_version: '>= 0.64.0'
 )
