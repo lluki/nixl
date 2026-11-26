@@ -88,6 +88,11 @@ thread_dep = dependency('threads')
 if get_option('buildtype') == 'release'
   abseil_flags = cpp.get_supported_arguments('-Wno-error=maybe-uninitialized', '-Wno-maybe-uninitialized')
   add_global_arguments(abseil_flags, language: 'cpp')
+
+  # NDEBUG for release builds. Used by Abseil to strip DCHECK assertions and DVLOG at compile time and to
+  # compile out absl::Mutex's debug-only deadlock detector. It must be global: add_project_arguments does not
+  # reach the bundled Abseil subproject, which then ran in debug mode (deadlock detector on) in release builds.
+  add_global_arguments('-DNDEBUG', language: 'cpp')
 endif
 
 # Sanitizer build, selected with -Dsanitizer=. Maps to -fsanitize and folds in
@@ -563,12 +568,6 @@ endif
 
 if get_option('disable_rocm_ais_backend')
     add_project_arguments('-DDISABLE_AIS_BACKEND', language: 'cpp')
-endif
-
-# Configure NDEBUG for release builds
-if get_option('buildtype') == 'release'
-    # Used by Abseil to strip DCHECK assertions and DVLOG at compile time
-    add_project_arguments('-DNDEBUG', language: 'cpp')
 endif
 
 # ---- Tracing (nixl::trace) -------------------------------------------------
