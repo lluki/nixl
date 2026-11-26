@@ -15,7 +15,9 @@
 
 serdes_lib = library('serdes',
            'serdes.cpp', 'serdes.h',
-           dependencies: [absl_log_dep],
+           # Take the vendored Abseil from libnixl_common instead of linking a second copy: two exported
+           # copies in one process are interposed and absl::Mutex's deadlock detector (GraphCycles) crashes.
+           dependencies: [nixl_common_dep],
            include_directories: [nixl_inc_dirs, utils_inc_dirs],
            install: true)
 
